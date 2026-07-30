@@ -25,6 +25,10 @@ final class AuthRefreshGuardTests: XCTestCase {
             "detail": ["code": "refresh_token_reused"],
             "http_status": 401,
         ]))
+        XCTAssertFalse(UsageService.shouldAttemptTokenRefresh([
+            "error": "token_revoked",
+            "http_status": 401,
+        ]))
     }
 
     func testNonAuthFailuresDoNotSpendRefreshGrant() {

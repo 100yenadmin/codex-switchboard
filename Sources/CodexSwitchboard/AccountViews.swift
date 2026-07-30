@@ -423,11 +423,11 @@ struct AccountCompactRow: View {
                         compactErrorStatus(width: layout.metricWidth * 2 + layout.spacing)
                     } else {
                         compactQuotaSlot(
-                            window: account.leadingQuotaWindow,
+                            window: account.primaryDisplayQuotaWindow,
                             width: layout.metricWidth
                         )
                         compactQuotaSlot(
-                            window: account.weeklyQuotaWindow,
+                            window: account.secondaryDisplayQuotaWindow,
                             width: layout.metricWidth
                         )
                     }
@@ -487,11 +487,11 @@ struct AccountCompactRow: View {
     private func sessionMetricGroup(layout: CompactRowLayout.Metrics) -> some View {
         HStack(spacing: 2) {
             compactQuotaSlot(
-                window: account.leadingQuotaWindow,
+                window: account.primaryDisplayQuotaWindow,
                 width: layout.metricWidth
             )
             quotaResetText(
-                window: account.leadingQuotaWindow,
+                window: account.primaryDisplayQuotaWindow,
                 width: layout.sessionResetWidth
             )
         }
@@ -501,7 +501,7 @@ struct AccountCompactRow: View {
     private func weeklyMetricGroup(layout: CompactRowLayout.Metrics) -> some View {
         HStack(spacing: 2) {
             compactQuotaSlot(
-                window: account.weeklyQuotaWindow,
+                window: account.secondaryDisplayQuotaWindow,
                 width: layout.metricWidth
             )
             weeklyResetText(width: layout.weeklyResetWidth)
@@ -559,7 +559,7 @@ struct AccountCompactRow: View {
 
     private func weeklyResetText(width: CGFloat) -> some View {
         Group {
-            if account.hasError || account.weeklyQuotaWindow != nil {
+            if account.hasError || account.secondaryDisplayQuotaWindow != nil {
                 HStack(spacing: 3) {
                     if account.hasError {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -582,7 +582,7 @@ struct AccountCompactRow: View {
                     account.hasError
                         ? (account.errorMessage ?? "Invalid account")
                         : ResetFormatter.fullTooltip(
-                            seconds: account.weeklyQuotaWindow?.resetSeconds ?? 0
+                            seconds: account.secondaryDisplayQuotaWindow?.resetSeconds ?? 0
                         )
                 )
             } else {
@@ -595,8 +595,8 @@ struct AccountCompactRow: View {
         if account.hasError {
             return account.errorMessage ?? "invalid"
         }
-        let resetSeconds = account.weeklyQuotaWindow?.resetSeconds ?? 0
-        let weeklyExhausted = (account.weeklyQuotaWindow?.freePercent ?? 100) <= 0.001
+        let resetSeconds = account.secondaryDisplayQuotaWindow?.resetSeconds ?? 0
+        let weeklyExhausted = (account.secondaryDisplayQuotaWindow?.freePercent ?? 100) <= 0.001
         return weeklyExhausted
             ? ResetFormatter.formatReset(seconds: resetSeconds)
             : ResetFormatter.format(seconds: resetSeconds)

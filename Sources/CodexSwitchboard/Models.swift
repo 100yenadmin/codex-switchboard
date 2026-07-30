@@ -146,6 +146,14 @@ struct Account: Identifiable, Equatable, Codable {
         effectiveQuotaWindows.first { $0.kind != .weekly }
     }
 
+    var primaryDisplayQuotaWindow: QuotaWindow? {
+        effectiveQuotaWindows.first
+    }
+
+    var secondaryDisplayQuotaWindow: QuotaWindow? {
+        effectiveQuotaWindows.dropFirst().first
+    }
+
     var weeklyQuotaWindow: QuotaWindow? {
         effectiveQuotaWindows.first { $0.kind == .weekly }
     }

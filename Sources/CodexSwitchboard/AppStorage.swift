@@ -83,6 +83,10 @@ struct AccountProfileCollection {
     var orderedKeys: [String]
 }
 
+enum AccountProfileTokenUpdateError: Error {
+    case profileChanged
+}
+
 enum AccountProfileStore {
     static func load() -> AccountProfileCollection {
         if let local = loadLocal(), !local.profiles.isEmpty {
@@ -146,11 +150,21 @@ enum AccountProfileStore {
         accessToken: String,
         refreshToken: String,
         idToken: String?,
-        expiresAt: Int
+        expiresAt: Int,
+        expectedRefreshToken: String? = nil
     ) throws {
         var root = accountsRoot()
         var profiles = root["profiles"] as? [String: Any] ?? [:]
-        var entry = profiles[profileKey] as? [String: Any] ?? [:]
+        guard var entry = profiles[profileKey] as? [String: Any] else {
+            if expectedRefreshToken != nil {
+                throw AccountProfileTokenUpdateError.profileChanged
+            }
+            return
+        }
+        if let expectedRefreshToken,
+           entry["refresh"] as? String != expectedRefreshToken {
+            throw AccountProfileTokenUpdateError.profileChanged
+        }
 
         entry["access"] = accessToken
         entry["refresh"] = refreshToken
@@ -172,14 +186,26 @@ enum AccountProfileStore {
 
     static func remove(profileKeys: Set<String>) throws {
         guard !profileKeys.isEmpty else { return }
-        var root = accountsRoot()
-        var profiles = root["profiles"] as? [String: Any] ?? [:]
-        for key in profileKeys {
-            profiles.removeValue(forKey: key)
-            removeProfileKey(in: &root, key: key)
+        try CodexAuthFileLock.withLock {
+            var root = accountsRoot()
+            var profiles = root["profiles"] as? [String: Any] ?? [:]
+            for key in profileKeys {
+                profiles.removeValue(forKey: key)
+                removeProfileKey(in: &root, key: key)
+            }
+            root["profiles"] = profiles
+            try AppStorage.writeJSON(root, to: AppStorage.accountsURL, permissions: 0o600)
         }
-        root["profiles"] = profiles
-        try AppStorage.writeJSON(root, to: AppStorage.accountsURL, permissions: 0o600)
+    }
+
+    static func canUpdateTokens(
+        profileKey: String,
+        expectedRefreshToken: String
+    ) -> Bool {
+        let root = accountsRoot()
+        let profiles = root["profiles"] as? [String: Any]
+        let entry = profiles?[profileKey] as? [String: Any]
+        return entry?["refresh"] as? String == expectedRefreshToken
     }
 
     private static func loadLocal() -> AccountProfileCollection? {

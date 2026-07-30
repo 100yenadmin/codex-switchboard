@@ -7,6 +7,7 @@ final class UsageService: @unchecked Sendable {
         _ profileKey: String,
         _ email: String,
         _ accountID: String,
+        _ expectedRefreshToken: String,
         _ accessToken: String,
         _ refreshToken: String,
         _ idToken: String?,
@@ -27,8 +28,14 @@ final class UsageService: @unchecked Sendable {
         session: URLSession = .shared,
         profileLoader: @escaping () -> AccountProfileCollection = AccountProfileStore.load,
         tokenUpdater: @escaping TokenUpdater = { profileKey, email, accountID,
-            accessToken, refreshToken, idToken, expiresAt in
+            expectedRefreshToken, accessToken, refreshToken, idToken, expiresAt in
             try CodexAuthFileLock.withLock {
+                guard AccountProfileStore.canUpdateTokens(
+                    profileKey: profileKey,
+                    expectedRefreshToken: expectedRefreshToken
+                ) else {
+                    throw AccountProfileTokenUpdateError.profileChanged
+                }
                 try ActiveCodexAuthStore.updateMatching(
                     email: email,
                     accountID: accountID,
@@ -43,7 +50,8 @@ final class UsageService: @unchecked Sendable {
                     accessToken: accessToken,
                     refreshToken: refreshToken,
                     idToken: idToken,
-                    expiresAt: expiresAt
+                    expiresAt: expiresAt,
+                    expectedRefreshToken: expectedRefreshToken
                 )
             }
         }
@@ -55,6 +63,7 @@ final class UsageService: @unchecked Sendable {
 
     private enum RefreshResult {
         case unavailable
+        case removed
         case transientFailure
         case failed
         case refreshed([String: Any])
@@ -115,6 +124,9 @@ final class UsageService: @unchecked Sendable {
             switch await refreshProfile(profileKey: key, profile: profile) {
             case .unavailable:
                 break
+            case .removed:
+                profiles.removeValue(forKey: key)
+                usages.removeValue(forKey: key)
             case .transientFailure:
                 usages[key] = ["error": Self.refreshTemporarilyUnavailableError]
             case .failed:
@@ -308,6 +320,7 @@ final class UsageService: @unchecked Sendable {
         let candidates: [Any?] = [
             (data["detail"] as? [String: Any])?["code"],
             (data["error"] as? [String: Any])?["code"],
+            data["error"],
             data["code"],
         ]
         for candidate in candidates {
@@ -380,6 +393,7 @@ final class UsageService: @unchecked Sendable {
                 profileKey,
                 email,
                 accountID,
+                refreshToken,
                 accessToken,
                 nextRefreshToken,
                 response.idToken,
@@ -391,6 +405,8 @@ final class UsageService: @unchecked Sendable {
             refreshedProfile["refresh"] = nextRefreshToken
             refreshedProfile["expires"] = expiresAt
             return .refreshed(refreshedProfile)
+        } catch AccountProfileTokenUpdateError.profileChanged {
+            return .removed
         } catch let error as URLError where Self.isTransientRefreshError(error) {
             return .transientFailure
         } catch {

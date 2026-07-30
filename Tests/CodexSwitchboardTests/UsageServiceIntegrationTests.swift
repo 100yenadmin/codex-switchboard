@@ -225,9 +225,39 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
+    func testProfileRemovedDuringRefreshIsNotRestoredInMemory() async throws {
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            if request.url?.path == "/oauth/token" {
+                return Self.response(request, json: [
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3_600,
+                ])
+            }
+            return Self.response(
+                request,
+                status: 401,
+                json: ["detail": ["code": "token_expired"]]
+            )
+        }
+
+        let service = makeService(
+            tokenUpdate: tokenUpdate,
+            tokenUpdater: { _, _, _, _, _, _, _, _ in
+                throw AccountProfileTokenUpdateError.profileChanged
+            }
+        )
+        let accounts = await service.loadAll()
+
+        XCTAssertTrue(accounts.isEmpty)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
     private func makeService(
         tokenUpdate: TokenUpdateRecorder,
-        accessToken: String? = "old-access"
+        accessToken: String? = "old-access",
+        tokenUpdater: UsageService.TokenUpdater? = nil
     ) -> UsageService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -251,7 +281,7 @@ final class UsageServiceIntegrationTests: XCTestCase {
         return UsageService(
             session: session,
             profileLoader: { collection },
-            tokenUpdater: { _, _, _, accessToken, refreshToken, _, expiresAt in
+            tokenUpdater: tokenUpdater ?? { _, _, _, _, accessToken, refreshToken, _, expiresAt in
                 tokenUpdate.record(
                     accessToken: accessToken,
                     refreshToken: refreshToken,

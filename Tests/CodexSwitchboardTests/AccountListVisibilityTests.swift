@@ -102,6 +102,41 @@ final class AccountListVisibilityTests: XCTestCase {
         XCTAssertEqual(windows.map(\.freePercent), [90, 75])
     }
 
+    func testDailyAndMonthlyWindowsBothOccupyDisplaySlots() {
+        let account = Account(
+            id: "quota@example.com|acc-quota",
+            profileKey: "quota-profile",
+            email: "quota@example.com",
+            workspace: "pro",
+            plan: "pro",
+            sessionFree: 100,
+            weeklyFree: 100,
+            sessionResetSeconds: 0,
+            weeklyResetSeconds: 0,
+            quotaWindows: [
+                QuotaWindow(
+                    kind: .daily,
+                    usedPercent: 10,
+                    resetSeconds: 1_000,
+                    durationSeconds: 86_400
+                ),
+                QuotaWindow(
+                    kind: .monthly,
+                    usedPercent: 100,
+                    resetSeconds: 2_000,
+                    durationSeconds: 2_592_000
+                ),
+            ],
+            planRenewalDate: nil,
+            hasError: false,
+            errorMessage: nil
+        )
+
+        XCTAssertEqual(account.primaryDisplayQuotaWindow?.kind, .daily)
+        XCTAssertEqual(account.secondaryDisplayQuotaWindow?.kind, .monthly)
+        XCTAssertEqual(account.secondaryDisplayQuotaWindow?.freePercent, 0)
+    }
+
     func testMissingQuotaWindowIsNotReportedAsFull() {
         let windows = UsageService.quotaWindows(from: [
             "rate_limit": [
