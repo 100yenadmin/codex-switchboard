@@ -1,13 +1,47 @@
 import Foundation
 
 /// Fetches best-effort Codex usage data from chatgpt.com.
-final class UsageService: Sendable {
+final class UsageService: @unchecked Sendable {
+
+    typealias TokenUpdater = (
+        _ profileKey: String,
+        _ email: String,
+        _ accountID: String,
+        _ accessToken: String,
+        _ refreshToken: String,
+        _ idToken: String?,
+        _ expiresAt: Int
+    ) throws -> Void
 
     private let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     private let oauthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
     private let refreshedAccessTokenKey = "__codex_switchboard_access_token"
+    private let session: URLSession
+    private let profileLoader: () -> AccountProfileCollection
+    private let tokenUpdater: TokenUpdater
     private static let refreshFailedError = "Refresh failed - re-login required"
+
+    init(
+        session: URLSession = .shared,
+        profileLoader: @escaping () -> AccountProfileCollection = AccountProfileStore.load,
+        tokenUpdater: @escaping TokenUpdater = { profileKey, email, accountID,
+            accessToken, refreshToken, idToken, expiresAt in
+            try AccountProfileStore.updateTokens(
+                profileKey: profileKey,
+                email: email,
+                accountID: accountID,
+                accessToken: accessToken,
+                refreshToken: refreshToken,
+                idToken: idToken,
+                expiresAt: expiresAt
+            )
+        }
+    ) {
+        self.session = session
+        self.profileLoader = profileLoader
+        self.tokenUpdater = tokenUpdater
+    }
 
     private enum RefreshResult {
         case unavailable
@@ -37,7 +71,7 @@ final class UsageService: Sendable {
     // MARK: - Public
 
     func loadAll() async -> [Account] {
-        let collection = AccountProfileStore.load()
+        let collection = profileLoader()
         var profiles = collection.profiles
         let validKeys = collection.orderedKeys.filter { profiles[$0] != nil }
 
@@ -309,7 +343,7 @@ final class UsageService: Sendable {
                 "grant_type": "refresh_token",
                 "refresh_token": refreshToken,
             ])
-            let (data, urlResponse) = try await URLSession.shared.data(for: request)
+            let (data, urlResponse) = try await session.data(for: request)
             let statusCode = (urlResponse as? HTTPURLResponse)?.statusCode ?? 0
             guard (200...299).contains(statusCode) else { return .failed }
 
@@ -326,14 +360,14 @@ final class UsageService: Sendable {
             )
             let email = profile["email"] as? String ?? ""
             let accountID = profile["accountId"] as? String ?? ""
-            try AccountProfileStore.updateTokens(
-                profileKey: profileKey,
-                email: email,
-                accountID: accountID,
-                accessToken: accessToken,
-                refreshToken: nextRefreshToken,
-                idToken: response.idToken,
-                expiresAt: expiresAt
+            try tokenUpdater(
+                profileKey,
+                email,
+                accountID,
+                accessToken,
+                nextRefreshToken,
+                response.idToken,
+                expiresAt
             )
 
             var refreshedProfile = profile
@@ -464,7 +498,7 @@ final class UsageService: Sendable {
             req.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
         }
         do {
-            let (data, response) = try await URLSession.shared.data(for: req)
+            let (data, response) = try await session.data(for: req)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             if var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 obj["http_status"] = statusCode

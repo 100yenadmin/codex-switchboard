@@ -2,10 +2,34 @@ import Foundation
 
 enum AppStorage {
     private static let fileManager = FileManager.default
+    private static let defaultNamespace = "CodexSwitchboard"
+
+    static var storageNamespace: String {
+        let environmentValue = ProcessInfo.processInfo.environment[
+            "CODEX_SWITCHBOARD_STORAGE_NAMESPACE"
+        ]
+        let bundleValue = Bundle.main.object(
+            forInfoDictionaryKey: "CodexSwitchboardStorageNamespace"
+        ) as? String
+        return normalizedStorageNamespace(environmentValue ?? bundleValue)
+    }
+
+    static func normalizedStorageNamespace(_ value: String?) -> String {
+        guard let value else { return defaultNamespace }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed != ".",
+              trimmed != "..",
+              !trimmed.contains("/"),
+              !trimmed.contains(":") else {
+            return defaultNamespace
+        }
+        return trimmed
+    }
 
     static var rootURL: URL {
         let url = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("CodexSwitchboard", isDirectory: true)
+            .appendingPathComponent(storageNamespace, isDirectory: true)
         try? ensureDirectory(url, permissions: 0o700)
         return url
     }

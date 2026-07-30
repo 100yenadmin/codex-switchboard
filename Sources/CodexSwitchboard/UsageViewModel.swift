@@ -61,7 +61,7 @@ final class UsageViewModel: ObservableObject {
 
     // MARK: - Init
 
-    init() {
+    init(skipCodexSurfaces: Bool = false) {
         if UserDefaults.standard.object(forKey: "groupByWorkspace") != nil {
             groupByWorkspace = UserDefaults.standard.bool(forKey: "groupByWorkspace")
         }
@@ -83,7 +83,9 @@ final class UsageViewModel: ObservableObject {
         }
         autoSwapPolicy = autoSwapPolicyStore.load()
         codexLoginStatus = CodexLoginStatusStore.load()
-        refreshCodexAvailability()
+        if !skipCodexSurfaces {
+            refreshCodexAvailability()
+        }
     }
 
     // MARK: - Derived Lists

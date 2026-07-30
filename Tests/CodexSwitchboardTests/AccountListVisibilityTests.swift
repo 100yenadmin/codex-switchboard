@@ -61,6 +61,24 @@ final class AccountListVisibilityTests: XCTestCase {
         XCTAssertEqual(windows.first?.freePercent, 100)
     }
 
+    func testMonthlyOnlyQuotaDoesNotInventFiveHourOrWeeklyWindow() {
+        let windows = UsageService.quotaWindows(from: [
+            "rate_limit": [
+                "primary_window": [
+                    "used_percent": 12.0,
+                    "reset_after_seconds": 2_000_000.0,
+                    "limit_window_seconds": 2_592_000.0,
+                ],
+            ],
+        ])
+
+        XCTAssertEqual(windows.count, 1)
+        XCTAssertEqual(windows.first?.kind, .monthly)
+        XCTAssertEqual(windows.first?.shortLabel, "M")
+        XCTAssertEqual(windows.first?.displayLabel, "Monthly")
+        XCTAssertEqual(windows.first?.freePercent, 88)
+    }
+
     func testFiveHourAndWeeklyWindowsAreClassifiedByDurationNotPosition() {
         let windows = UsageService.quotaWindows(from: [
             "rate_limit": [
