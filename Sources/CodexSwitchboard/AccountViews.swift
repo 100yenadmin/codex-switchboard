@@ -234,23 +234,15 @@ struct AccountRow: View {
             }
             .opacity(exhausted ? 0.5 : 1)
 
-            if !exhausted {
+            ForEach(account.effectiveQuotaWindows) { window in
                 BarRow(
-                    label: "Session",
-                    pct: account.sessionFree,
-                    resetSeconds: account.sessionResetSeconds,
-                    style: .normal,
-                    urgentReset: false
+                    label: window.displayLabel,
+                    pct: window.freePercent,
+                    resetSeconds: window.resetSeconds,
+                    style: window.freePercent <= 0.001 ? .weeklyExhausted : .normal,
+                    urgentReset: window.kind == .weekly && account.isWeeklyResetUrgent
                 )
             }
-
-            BarRow(
-                label: "Weekly",
-                pct: account.weeklyFree,
-                resetSeconds: account.weeklyResetSeconds,
-                style: exhausted ? .weeklyExhausted : .normal,
-                urgentReset: account.isWeeklyResetUrgent
-            )
         }
         .padding(.horizontal, 12)
         .padding(.vertical, exhausted ? 6 : 8)
@@ -430,17 +422,14 @@ struct AccountCompactRow: View {
                     } else if account.hasError {
                         compactErrorStatus(width: layout.metricWidth * 2 + layout.spacing)
                     } else {
-                        Group {
-                            if !exhausted {
-                                compactQuota(label: "S", pct: account.sessionFree, gray: false, width: layout.metricWidth)
-                            } else {
-                                Color.clear.frame(width: layout.metricWidth, height: 1)
-                            }
-                        }
-                        .opacity(exhausted ? 0.5 : 1)
-
-                        compactQuota(label: "W", pct: account.weeklyFree, gray: exhausted, width: layout.metricWidth)
-                            .opacity(exhausted ? 0.5 : 1)
+                        compactQuotaSlot(
+                            window: account.leadingQuotaWindow,
+                            width: layout.metricWidth
+                        )
+                        compactQuotaSlot(
+                            window: account.weeklyQuotaWindow,
+                            width: layout.metricWidth
+                        )
                     }
                 }
             }
@@ -497,44 +486,55 @@ struct AccountCompactRow: View {
     @ViewBuilder
     private func sessionMetricGroup(layout: CompactRowLayout.Metrics) -> some View {
         HStack(spacing: 2) {
-            Group {
-                if !exhausted {
-                    compactQuota(label: "S", pct: account.sessionFree, gray: false, width: layout.metricWidth)
-                } else {
-                    Color.clear.frame(width: layout.metricWidth, height: 1)
-                }
-            }
-            .opacity(exhausted ? 0.5 : 1)
-
-            sessionResetText(width: layout.sessionResetWidth)
+            compactQuotaSlot(
+                window: account.leadingQuotaWindow,
+                width: layout.metricWidth
+            )
+            quotaResetText(
+                window: account.leadingQuotaWindow,
+                width: layout.sessionResetWidth
+            )
         }
     }
 
     @ViewBuilder
     private func weeklyMetricGroup(layout: CompactRowLayout.Metrics) -> some View {
         HStack(spacing: 2) {
-            compactQuota(label: "W", pct: account.weeklyFree, gray: exhausted, width: layout.metricWidth)
-                .opacity(exhausted ? 0.5 : 1)
-
+            compactQuotaSlot(
+                window: account.weeklyQuotaWindow,
+                width: layout.metricWidth
+            )
             weeklyResetText(width: layout.weeklyResetWidth)
         }
     }
 
     @ViewBuilder
-    private func sessionResetText(width: CGFloat) -> some View {
-        Group {
-            if exhausted {
-                Color.clear.frame(width: width, height: 1)
-            } else {
-                Text(ResetFormatter.timeOnly(seconds: account.sessionResetSeconds))
-                    .font(.system(size: resetFontSize))
-                    .monospacedDigit()
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .frame(width: width, alignment: .trailing)
-                    .help(ResetFormatter.fullTooltip(seconds: account.sessionResetSeconds))
-            }
+    private func compactQuotaSlot(window: QuotaWindow?, width: CGFloat) -> some View {
+        if let window {
+            compactQuota(
+                label: window.shortLabel,
+                pct: window.freePercent,
+                gray: window.freePercent <= 0.001,
+                width: width
+            )
+        } else {
+            Color.clear.frame(width: width, height: 1)
+        }
+    }
+
+    @ViewBuilder
+    private func quotaResetText(window: QuotaWindow?, width: CGFloat) -> some View {
+        if let window {
+            Text(ResetFormatter.timeOnly(seconds: window.resetSeconds))
+                .font(.system(size: resetFontSize))
+                .monospacedDigit()
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(width: width, alignment: .trailing)
+                .help(ResetFormatter.fullTooltip(seconds: window.resetSeconds))
+        } else {
+            Color.clear.frame(width: width, height: 1)
         }
     }
 
@@ -558,32 +558,48 @@ struct AccountCompactRow: View {
     }
 
     private func weeklyResetText(width: CGFloat) -> some View {
-        HStack(spacing: 3) {
-            if account.hasError {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 8))
-                    .foregroundColor(Color(hex: "FF453A"))
-            } else if account.isWeeklyResetUrgent && !exhausted {
-                Image(systemName: "clock")
-                    .font(.system(size: 9))
-                    .foregroundColor(Color(hex: "FF9F0A"))
+        Group {
+            if account.hasError || account.weeklyQuotaWindow != nil {
+                HStack(spacing: 3) {
+                    if account.hasError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 8))
+                            .foregroundColor(Color(hex: "FF453A"))
+                    } else if account.isWeeklyResetUrgent && !exhausted {
+                        Image(systemName: "clock")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color(hex: "FF9F0A"))
+                    }
+                    Text(weeklyStatusText)
+                        .font(.system(size: resetFontSize))
+                        .foregroundColor(weeklyStatusColor)
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .frame(width: width, alignment: .trailing)
+                .multilineTextAlignment(.trailing)
+                .help(
+                    account.hasError
+                        ? (account.errorMessage ?? "Invalid account")
+                        : ResetFormatter.fullTooltip(
+                            seconds: account.weeklyQuotaWindow?.resetSeconds ?? 0
+                        )
+                )
+            } else {
+                Color.clear.frame(width: width, height: 1)
             }
-            Text(weeklyStatusText)
-                .font(.system(size: resetFontSize))
-                .foregroundColor(weeklyStatusColor)
         }
-        .lineLimit(1)
-        .minimumScaleFactor(0.85)
-        .frame(width: width, alignment: .trailing)
-        .multilineTextAlignment(.trailing)
-        .help(account.hasError ? (account.errorMessage ?? "Invalid account") : ResetFormatter.fullTooltip(seconds: account.weeklyResetSeconds))
     }
 
     private var weeklyStatusText: String {
         if account.hasError {
             return account.errorMessage ?? "invalid"
         }
-        return exhausted ? ResetFormatter.formatReset(seconds: account.weeklyResetSeconds) : ResetFormatter.format(seconds: account.weeklyResetSeconds)
+        let resetSeconds = account.weeklyQuotaWindow?.resetSeconds ?? 0
+        let weeklyExhausted = (account.weeklyQuotaWindow?.freePercent ?? 100) <= 0.001
+        return weeklyExhausted
+            ? ResetFormatter.formatReset(seconds: resetSeconds)
+            : ResetFormatter.format(seconds: resetSeconds)
     }
 
     private var weeklyStatusColor: Color {

@@ -1158,8 +1158,34 @@ private struct SnapshotAccount: Decodable {
     let weeklyFree: Double
     let sessionResetSeconds: Double
     let weeklyResetSeconds: Double
+    let quotaWindows: [SnapshotQuotaWindow]?
     let hasError: Bool
     let errorMessage: String?
+}
+
+private struct SnapshotQuotaWindow: Decodable {
+    let kind: String
+    let usedPercent: Double
+    let resetSeconds: Double
+    let durationSeconds: Double?
+
+    var freePercent: Double {
+        max(0, min(100, 100 - usedPercent))
+    }
+}
+
+private struct QuotaWindowPayload: Codable {
+    let kind: String
+    let freePercent: Double
+    let resetSeconds: Double
+    let durationSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case freePercent = "free_percent"
+        case resetSeconds = "reset_seconds"
+        case durationSeconds = "duration_seconds"
+    }
 }
 
 private struct AccountPayload: Codable {
@@ -1169,6 +1195,7 @@ private struct AccountPayload: Codable {
     let plan: String
     let sessionFreePercent: Double
     let weeklyFreePercent: Double
+    let quotaWindows: [QuotaWindowPayload]
     let usableForCodex: Bool
     let needsRelogin: Bool
     let nextResetAt: Date?
@@ -1182,6 +1209,7 @@ private struct AccountPayload: Codable {
         case plan
         case sessionFreePercent = "session_free_percent"
         case weeklyFreePercent = "weekly_free_percent"
+        case quotaWindows = "quota_windows"
         case usableForCodex = "usable_for_codex"
         case needsRelogin = "needs_relogin"
         case nextResetAt = "next_reset_at"
@@ -1196,6 +1224,7 @@ private struct AccountPayload: Codable {
         plan: String,
         sessionFreePercent: Double,
         weeklyFreePercent: Double,
+        quotaWindows: [QuotaWindowPayload] = [],
         usableForCodex: Bool,
         needsRelogin: Bool,
         nextResetAt: Date?,
@@ -1208,6 +1237,7 @@ private struct AccountPayload: Codable {
         self.plan = plan
         self.sessionFreePercent = sessionFreePercent
         self.weeklyFreePercent = weeklyFreePercent
+        self.quotaWindows = quotaWindows
         self.usableForCodex = usableForCodex
         self.needsRelogin = needsRelogin
         self.nextResetAt = nextResetAt
@@ -1221,20 +1251,27 @@ private struct AccountPayload: Codable {
         hasCapturedAuth: Bool
     ) {
         guard let profileKey = snapshot.profileKey, !profileKey.isEmpty else { return nil }
-        let usable = !snapshot.hasError
-            && snapshot.sessionFree > 0.001
-            && snapshot.weeklyFree > 0.001
-            && hasCapturedAuth
+        let quotaWindows = snapshot.quotaWindows?.map {
+            QuotaWindowPayload(
+                kind: $0.kind,
+                freePercent: $0.freePercent,
+                resetSeconds: $0.resetSeconds,
+                durationSeconds: $0.durationSeconds
+            )
+        }
+        let usableQuota: Bool
+        if let quotaWindows {
+            usableQuota = !quotaWindows.isEmpty
+                && quotaWindows.allSatisfy { $0.freePercent > 0.001 }
+        } else {
+            usableQuota = snapshot.sessionFree > 0.001 && snapshot.weeklyFree > 0.001
+        }
+        let usable = !snapshot.hasError && usableQuota && hasCapturedAuth
         let isFree = snapshot.plan.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "free"
-        let nextReset = Self.nextResetDate(
-            sessionFree: snapshot.sessionFree,
-            weeklyFree: snapshot.weeklyFree,
-            sessionResetSeconds: snapshot.sessionResetSeconds,
-            weeklyResetSeconds: snapshot.weeklyResetSeconds,
-            baseDate: snapshotRefreshDate
-        )
+        let nextReset = Self.nextResetDate(snapshot: snapshot, baseDate: snapshotRefreshDate)
         let needsRelogin = Self.needsRelogin(snapshot.errorMessage) || !hasCapturedAuth
-        let baseScore = snapshot.sessionFree * 0.6 + snapshot.weeklyFree * 0.4
+        let baseScore = quotaWindows?.map(\.freePercent).min()
+            ?? (snapshot.sessionFree * 0.6 + snapshot.weeklyFree * 0.4)
         let penalty = (snapshot.hasError ? 1_000.0 : 0) + (isFree ? 100.0 : 0)
         self.init(
             profileKey: profileKey,
@@ -1243,6 +1280,7 @@ private struct AccountPayload: Codable {
             plan: snapshot.plan,
             sessionFreePercent: snapshot.sessionFree,
             weeklyFreePercent: snapshot.weeklyFree,
+            quotaWindows: quotaWindows ?? [],
             usableForCodex: usable,
             needsRelogin: needsRelogin,
             nextResetAt: nextReset,
@@ -1251,22 +1289,26 @@ private struct AccountPayload: Codable {
         )
     }
 
-    private static func nextResetDate(
-        sessionFree: Double,
-        weeklyFree: Double,
-        sessionResetSeconds: Double,
-        weeklyResetSeconds: Double,
-        baseDate: Date
-    ) -> Date? {
+    private static func nextResetDate(snapshot: SnapshotAccount, baseDate: Date) -> Date? {
+        if let quotaWindows = snapshot.quotaWindows {
+            let exhaustedReset = quotaWindows
+                .filter { $0.freePercent <= 0.001 && $0.resetSeconds > 0 }
+                .map(\.resetSeconds)
+                .min()
+            let nextReset = exhaustedReset
+                ?? quotaWindows.filter { $0.resetSeconds > 0 }.map(\.resetSeconds).min()
+            return nextReset.map { baseDate.addingTimeInterval($0) }
+        }
+
         let seconds: Double
-        if sessionFree <= 0.001, sessionResetSeconds > 0 {
-            seconds = sessionResetSeconds
-        } else if weeklyFree <= 0.001, weeklyResetSeconds > 0 {
-            seconds = weeklyResetSeconds
-        } else if weeklyResetSeconds > 0 {
-            seconds = weeklyResetSeconds
-        } else if sessionResetSeconds > 0 {
-            seconds = sessionResetSeconds
+        if snapshot.sessionFree <= 0.001, snapshot.sessionResetSeconds > 0 {
+            seconds = snapshot.sessionResetSeconds
+        } else if snapshot.weeklyFree <= 0.001, snapshot.weeklyResetSeconds > 0 {
+            seconds = snapshot.weeklyResetSeconds
+        } else if snapshot.weeklyResetSeconds > 0 {
+            seconds = snapshot.weeklyResetSeconds
+        } else if snapshot.sessionResetSeconds > 0 {
+            seconds = snapshot.sessionResetSeconds
         } else {
             return nil
         }

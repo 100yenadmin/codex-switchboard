@@ -42,7 +42,7 @@ extension Account {
             usableForCodex: isUsableForCodex && !needsRelogin,
             needsRelogin: needsRelogin,
             isFreePlan: isFreePlan,
-            score: min(sessionFree, weeklyFree)
+            score: quotaScore
         )
     }
 }

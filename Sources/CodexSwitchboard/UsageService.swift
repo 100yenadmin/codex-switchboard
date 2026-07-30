@@ -5,8 +5,29 @@ final class UsageService: Sendable {
 
     private let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    private let oauthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
     private let refreshedAccessTokenKey = "__codex_switchboard_access_token"
     private static let refreshFailedError = "Refresh failed - re-login required"
+
+    private enum RefreshResult {
+        case unavailable
+        case failed
+        case refreshed([String: Any])
+    }
+
+    private struct RefreshedTokenResponse: Decodable {
+        let accessToken: String?
+        let refreshToken: String?
+        let idToken: String?
+        let expiresIn: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case accessToken = "access_token"
+            case refreshToken = "refresh_token"
+            case idToken = "id_token"
+            case expiresIn = "expires_in"
+        }
+    }
 
     private struct AccountMetadata: Sendable {
         let workspaceName: String?
@@ -17,23 +38,42 @@ final class UsageService: Sendable {
 
     func loadAll() async -> [Account] {
         let collection = AccountProfileStore.load()
-        let profiles = collection.profiles
+        var profiles = collection.profiles
         let validKeys = collection.orderedKeys.filter { profiles[$0] != nil }
 
         // Fetch usage concurrently
-        let usages: [String: [String: Any]] = await withTaskGroup(
+        var usages: [String: [String: Any]] = await withTaskGroup(
             of: (String, [String: Any]).self
         ) { group in
             for key in validKeys {
-                if let profile = profiles[key],
-                   let tok = profile["access"] as? String,
-                   !tok.isEmpty {
+                if let profile = profiles[key] {
                     group.addTask { (key, await self.fetchUsage(profileKey: key, profile: profile)) }
                 }
             }
             var map: [String: [String: Any]] = [:]
             for await (k, v) in group { map[k] = v }
             return map
+        }
+
+        // Refresh only profiles whose usage request proves the access token is stale.
+        // This loop is intentionally serial so each atomic profile-store write starts
+        // from the preceding write instead of racing another account refresh.
+        for key in validKeys {
+            guard let profile = profiles[key],
+                  let usage = usages[key],
+                  Self.shouldAttemptTokenRefresh(usage) else {
+                continue
+            }
+
+            switch await refreshProfile(profileKey: key, profile: profile) {
+            case .unavailable:
+                break
+            case .failed:
+                usages[key] = ["error": Self.refreshFailedError]
+            case .refreshed(let refreshedProfile):
+                profiles[key] = refreshedProfile
+                usages[key] = await fetchUsage(profileKey: key, profile: refreshedProfile)
+            }
         }
 
         var teamNames = TeamNameCacheStore.load()
@@ -88,11 +128,10 @@ final class UsageService: Sendable {
 
             let usageError = usageErrorMessage(from: usage)
             let rl  = usage["rate_limit"]       as? [String: Any]
-            let pw  = rl?["primary_window"]     as? [String: Any] ?? [:]
-            let sw  = rl?["secondary_window"]   as? [String: Any] ?? [:]
             let hasUsage = usageError == nil && rl != nil
-            let h5  = hasUsage ? (pw["used_percent"] as? Double ?? 0) : 100
-            let wk  = hasUsage ? (sw["used_percent"] as? Double ?? 0) : 100
+            let quotaWindows = hasUsage ? Self.quotaWindows(from: usage) : []
+            let sessionWindow = quotaWindows.first { $0.kind == .fiveHour }
+            let weeklyWindow = quotaWindows.first { $0.kind == .weekly }
 
             let planType = resolvedPlanType(profile: p, usage: usage)
             let usesWorkspaceName = workspaceNamedAccountIDs.contains(aid)
@@ -133,13 +172,16 @@ final class UsageService: Sendable {
                 email: email,
                 workspace: workspaceName,
                 plan: planType ?? "?",
-                sessionFree: max(0, 100 - h5),
-                weeklyFree:  max(0, 100 - wk),
-                sessionResetSeconds: pw["reset_after_seconds"] as? Double ?? 0,
-                weeklyResetSeconds:  sw["reset_after_seconds"] as? Double ?? 0,
+                sessionFree: sessionWindow?.freePercent ?? 100,
+                weeklyFree: weeklyWindow?.freePercent ?? 100,
+                sessionResetSeconds: sessionWindow?.resetSeconds ?? 0,
+                weeklyResetSeconds: weeklyWindow?.resetSeconds ?? 0,
+                quotaWindows: quotaWindows,
                 planRenewalDate: planRenewalDate,
-                hasError: !hasUsage,
-                errorMessage: usageError ?? (rl == nil ? "Codex usage unavailable" : nil)
+                hasError: !hasUsage || quotaWindows.isEmpty,
+                errorMessage: usageError
+                    ?? (rl == nil ? "Codex usage unavailable" : nil)
+                    ?? (quotaWindows.isEmpty ? "No quota windows reported" : nil)
             ))
         }
         applyWorkspacePlanDates(to: &accounts)
@@ -152,8 +194,79 @@ final class UsageService: Sendable {
         "\(email.lowercased())|\(accountID.isEmpty ? profileKey : accountID)"
     }
 
-    private func fetchUsage(token: String) async -> [String: Any] {
-        await apiGet("/backend-api/codex/usage", token: token)
+    static func quotaWindows(from data: [String: Any]) -> [QuotaWindow] {
+        guard let rateLimit = data["rate_limit"] as? [String: Any] else { return [] }
+
+        let rawWindows: [(String, [String: Any])] = [
+            ("primary", rateLimit["primary_window"] as? [String: Any]),
+            ("secondary", rateLimit["secondary_window"] as? [String: Any]),
+        ].compactMap { name, value in
+            guard let value else { return nil }
+            return (name, value)
+        }
+
+        return rawWindows.compactMap { position, raw in
+            guard let usedPercent = number(raw["used_percent"]) else { return nil }
+            let duration = number(raw["limit_window_seconds"])
+            let fallbackKind: QuotaWindow.Kind = position == "secondary" ? .weekly : .fiveHour
+            return QuotaWindow(
+                kind: quotaKind(durationSeconds: duration, fallback: fallbackKind),
+                usedPercent: max(0, min(100, usedPercent)),
+                resetSeconds: max(0, number(raw["reset_after_seconds"]) ?? 0),
+                durationSeconds: duration
+            )
+        }
+        .sorted {
+            if $0.sortOrder != $1.sortOrder { return $0.sortOrder < $1.sortOrder }
+            return ($0.durationSeconds ?? 0) < ($1.durationSeconds ?? 0)
+        }
+    }
+
+    static func shouldAttemptTokenRefresh(_ data: [String: Any]) -> Bool {
+        if let code = normalizedErrorCode(from: data) {
+            if ["token_invalidated", "token_revoked", "refresh_token_expired",
+                "refresh_token_reused", "refresh_token_invalidated"].contains(code) {
+                return false
+            }
+            if code == "token_expired" { return true }
+        }
+        return number(data["http_status"]) == 401
+    }
+
+    private static func quotaKind(
+        durationSeconds: Double?,
+        fallback: QuotaWindow.Kind
+    ) -> QuotaWindow.Kind {
+        guard let durationSeconds, durationSeconds > 0 else { return fallback }
+        switch durationSeconds {
+        case 14_400...21_600: return .fiveHour
+        case 75_600...97_200: return .daily
+        case 518_400...691_200: return .weekly
+        case 2_332_800...2_851_200: return .monthly
+        default: return .other
+        }
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? Double { return value }
+        if let value = value as? Int { return Double(value) }
+        return nil
+    }
+
+    private static func normalizedErrorCode(from data: [String: Any]) -> String? {
+        let candidates: [Any?] = [
+            (data["detail"] as? [String: Any])?["code"],
+            (data["error"] as? [String: Any])?["code"],
+            data["code"],
+        ]
+        for candidate in candidates {
+            if let value = candidate as? String {
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !normalized.isEmpty { return normalized }
+            }
+        }
+        return nil
     }
 
     private func fetchUsage(profileKey: String, profile: [String: Any]) async -> [String: Any] {
@@ -162,7 +275,99 @@ final class UsageService: Sendable {
             return ["error": "missing access token"]
         }
 
-        return usage(await fetchUsage(token: accessToken), accessToken: accessToken)
+        let accountID = profile["accountId"] as? String
+        return usage(
+            await apiGet(
+                "/backend-api/wham/usage",
+                token: accessToken,
+                accountID: accountID
+            ),
+            accessToken: accessToken
+        )
+    }
+
+    private func refreshProfile(
+        profileKey: String,
+        profile: [String: Any]
+    ) async -> RefreshResult {
+        guard let refreshToken = profile["refresh"] as? String,
+              !refreshToken.isEmpty else {
+            return .unavailable
+        }
+        guard let url = URL(string: "https://auth.openai.com/oauth/token") else {
+            return .failed
+        }
+
+        var request = URLRequest(url: url, timeoutInterval: 10)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "client_id": oauthClientID,
+                "grant_type": "refresh_token",
+                "refresh_token": refreshToken,
+            ])
+            let (data, urlResponse) = try await URLSession.shared.data(for: request)
+            let statusCode = (urlResponse as? HTTPURLResponse)?.statusCode ?? 0
+            guard (200...299).contains(statusCode) else { return .failed }
+
+            let response = try JSONDecoder().decode(RefreshedTokenResponse.self, from: data)
+            guard let accessToken = response.accessToken, !accessToken.isEmpty else {
+                return .failed
+            }
+
+            let nextRefreshToken = response.refreshToken.flatMap { $0.isEmpty ? nil : $0 }
+                ?? refreshToken
+            let expiresAt = tokenExpirationMilliseconds(
+                accessToken: accessToken,
+                expiresIn: response.expiresIn
+            )
+            let email = profile["email"] as? String ?? ""
+            let accountID = profile["accountId"] as? String ?? ""
+            try AccountProfileStore.updateTokens(
+                profileKey: profileKey,
+                email: email,
+                accountID: accountID,
+                accessToken: accessToken,
+                refreshToken: nextRefreshToken,
+                idToken: response.idToken,
+                expiresAt: expiresAt
+            )
+
+            var refreshedProfile = profile
+            refreshedProfile["access"] = accessToken
+            refreshedProfile["refresh"] = nextRefreshToken
+            refreshedProfile["expires"] = expiresAt
+            return .refreshed(refreshedProfile)
+        } catch {
+            return .failed
+        }
+    }
+
+    private func tokenExpirationMilliseconds(
+        accessToken: String,
+        expiresIn: Double?
+    ) -> Int {
+        if let expiresIn, expiresIn > 0 {
+            return Int((Date().timeIntervalSince1970 + expiresIn) * 1_000)
+        }
+
+        let parts = accessToken.split(separator: ".")
+        if parts.count >= 2 {
+            var encoded = String(parts[1])
+                .replacingOccurrences(of: "-", with: "+")
+                .replacingOccurrences(of: "_", with: "/")
+            while encoded.count % 4 != 0 { encoded += "=" }
+            if let payloadData = Data(base64Encoded: encoded),
+               let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+               let expiration = Self.number(payload["exp"]) {
+                return Int(expiration * 1_000)
+            }
+        }
+
+        return Int((Date().timeIntervalSince1970 + 3_600) * 1_000)
     }
 
     private func fetchAccountMetadata(token: String) async -> [String: AccountMetadata] {
@@ -239,7 +444,12 @@ final class UsageService: Sendable {
         }
     }
 
-    private func apiGet(_ endpoint: String, token: String, timeout: TimeInterval = 10) async -> [String: Any] {
+    private func apiGet(
+        _ endpoint: String,
+        token: String,
+        accountID: String? = nil,
+        timeout: TimeInterval = 10
+    ) async -> [String: Any] {
         guard let url = URL(string: "https://chatgpt.com\(endpoint)") else {
             return ["error": "bad URL"]
         }
@@ -250,6 +460,9 @@ final class UsageService: Sendable {
         req.setValue("https://chatgpt.com",  forHTTPHeaderField: "Origin")
         req.setValue("https://chatgpt.com/", forHTTPHeaderField: "Referer")
         req.setValue("en-US,en;q=0.9",   forHTTPHeaderField: "Accept-Language")
+        if let accountID, !accountID.isEmpty {
+            req.setValue(accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
         do {
             let (data, response) = try await URLSession.shared.data(for: req)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -277,30 +490,8 @@ final class UsageService: Sendable {
             return error
         }
 
-        if let detail = data["detail"] as? [String: Any],
-           let code = detail["code"] as? String,
-           !code.isEmpty {
-            switch code {
-            case "deactivated_workspace":
-                return "Workspace deactivated"
-            default:
-                return code.replacingOccurrences(of: "_", with: " ")
-            }
-        }
-
-        if let apiError = data["error"] as? [String: Any],
-           let code = apiError["code"] as? String,
-           !code.isEmpty {
-            switch code {
-            case "token_expired":
-                return "Token expired"
-            case "token_invalidated":
-                return "Token invalidated"
-            case "token_revoked":
-                return "Token revoked"
-            default:
-                return code.replacingOccurrences(of: "_", with: " ")
-            }
+        if let code = Self.normalizedErrorCode(from: data) {
+            return Self.displayMessage(forErrorCode: code)
         }
 
         if let status = data["http_status"] as? Int, status == 401 {
@@ -327,16 +518,38 @@ final class UsageService: Sendable {
     }
 
     static func isRecoverableAuthError(_ message: String?) -> Bool {
-        message == "Token expired"
+        normalizedAuthMessage(message) == "token expired"
     }
 
     static func requiresRelogin(_ message: String?) -> Bool {
-        message == "Expired or revoked"
-            || message == "Token invalidated"
-            || message == "Token revoked"
-            || message == refreshFailedError
-            || message == "HTTP 401"
-            || message == "HTTP 403"
+        guard let message = normalizedAuthMessage(message) else { return false }
+        return message == "expired or revoked"
+            || message == "token invalidated"
+            || message == "token revoked"
+            || message == "missing access token"
+            || message == refreshFailedError.lowercased()
+            || message == "http 401"
+            || message == "http 403"
+    }
+
+    private static func normalizedAuthMessage(_ message: String?) -> String? {
+        message?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func displayMessage(forErrorCode code: String) -> String {
+        switch code {
+        case "deactivated_workspace":
+            return "Workspace deactivated"
+        case "token_expired":
+            return "Token expired"
+        case "token_invalidated":
+            return "Token invalidated"
+        case "token_revoked":
+            return "Token revoked"
+        default:
+            let human = code.replacingOccurrences(of: "_", with: " ")
+            return human.prefix(1).uppercased() + human.dropFirst()
+        }
     }
 
     private func readableAPIError(from data: [String: Any]) -> String? {

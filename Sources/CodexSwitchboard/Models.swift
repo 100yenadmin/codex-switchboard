@@ -1,6 +1,65 @@
 import AppKit
 import SwiftUI
 
+// MARK: - Quota Window
+
+struct QuotaWindow: Identifiable, Equatable, Codable {
+    enum Kind: String, Codable {
+        case fiveHour
+        case daily
+        case weekly
+        case monthly
+        case other
+    }
+
+    let kind: Kind
+    let usedPercent: Double
+    let resetSeconds: Double
+    let durationSeconds: Double?
+
+    var id: String {
+        "\(kind.rawValue):\(Int(durationSeconds ?? 0))"
+    }
+
+    var freePercent: Double {
+        max(0, min(100, 100 - usedPercent))
+    }
+
+    var shortLabel: String {
+        switch kind {
+        case .fiveHour: return "5h"
+        case .daily: return "D"
+        case .weekly: return "W"
+        case .monthly: return "M"
+        case .other: return "Q"
+        }
+    }
+
+    var displayLabel: String {
+        switch kind {
+        case .fiveHour: return "5 hours"
+        case .daily: return "Daily"
+        case .weekly: return "Weekly"
+        case .monthly: return "Monthly"
+        case .other:
+            guard let durationSeconds, durationSeconds > 0 else { return "Quota" }
+            let hours = durationSeconds / 3_600
+            if hours < 48 { return "\(Int(hours.rounded())) hours" }
+            return "\(Int((hours / 24).rounded())) days"
+        }
+    }
+
+    var sortOrder: Int {
+        switch kind {
+        case .fiveHour: return 0
+        case .daily: return 1
+        case .weekly: return 2
+        case .monthly: return 3
+        case .other: return 4
+        }
+    }
+}
+
 // MARK: - Account
 
 struct Account: Identifiable, Equatable, Codable {
@@ -13,9 +72,41 @@ struct Account: Identifiable, Equatable, Codable {
     let weeklyFree: Double
     let sessionResetSeconds: Double
     let weeklyResetSeconds: Double
+    /// Nil means a pre-window-model snapshot. An empty array means the current response had no windows.
+    let quotaWindows: [QuotaWindow]?
     var planRenewalDate: Date?
     let hasError: Bool
     let errorMessage: String?
+
+    init(
+        id: String,
+        profileKey: String?,
+        email: String,
+        workspace: String,
+        plan: String,
+        sessionFree: Double,
+        weeklyFree: Double,
+        sessionResetSeconds: Double,
+        weeklyResetSeconds: Double,
+        quotaWindows: [QuotaWindow]? = nil,
+        planRenewalDate: Date?,
+        hasError: Bool,
+        errorMessage: String?
+    ) {
+        self.id = id
+        self.profileKey = profileKey
+        self.email = email
+        self.workspace = workspace
+        self.plan = plan
+        self.sessionFree = sessionFree
+        self.weeklyFree = weeklyFree
+        self.sessionResetSeconds = sessionResetSeconds
+        self.weeklyResetSeconds = weeklyResetSeconds
+        self.quotaWindows = quotaWindows
+        self.planRenewalDate = planRenewalDate
+        self.hasError = hasError
+        self.errorMessage = errorMessage
+    }
 
     var emailPrefix: String {
         email.components(separatedBy: "@").first ?? email
@@ -27,8 +118,46 @@ struct Account: Identifiable, Equatable, Codable {
         return String(pieces[1])
     }
 
-    /// Weekly quota fully used; session line is hidden and cell uses exhausted styling.
-    var isWeeklyExhausted: Bool { hasError || weeklyFree <= 0.001 }
+    var effectiveQuotaWindows: [QuotaWindow] {
+        if let quotaWindows {
+            return quotaWindows.sorted {
+                if $0.sortOrder != $1.sortOrder { return $0.sortOrder < $1.sortOrder }
+                return ($0.durationSeconds ?? 0) < ($1.durationSeconds ?? 0)
+            }
+        }
+
+        return [
+            QuotaWindow(
+                kind: .fiveHour,
+                usedPercent: 100 - sessionFree,
+                resetSeconds: sessionResetSeconds,
+                durationSeconds: 18_000
+            ),
+            QuotaWindow(
+                kind: .weekly,
+                usedPercent: 100 - weeklyFree,
+                resetSeconds: weeklyResetSeconds,
+                durationSeconds: 604_800
+            ),
+        ]
+    }
+
+    var leadingQuotaWindow: QuotaWindow? {
+        effectiveQuotaWindows.first { $0.kind != .weekly }
+    }
+
+    var weeklyQuotaWindow: QuotaWindow? {
+        effectiveQuotaWindows.first { $0.kind == .weekly }
+    }
+
+    var quotaScore: Double {
+        effectiveQuotaWindows.map(\.freePercent).min() ?? 0
+    }
+
+    /// Any reported quota window is exhausted; errors use the same waiting-row styling.
+    var isWeeklyExhausted: Bool {
+        hasError || effectiveQuotaWindows.contains { $0.freePercent <= 0.001 }
+    }
 
     var isFreePlan: Bool {
         plan.codexSwitchboardNormalized == "free"
@@ -37,47 +166,55 @@ struct Account: Identifiable, Equatable, Codable {
     var isFreeWaitingForReset: Bool {
         !hasError
             && isFreePlan
-            && sessionFree <= 0.001
-            && weeklyFree > 0.001
+            && effectiveQuotaWindows.contains { $0.freePercent <= 0.001 }
             && freePlanResetSeconds > 0
     }
 
     var freePlanResetSeconds: Double {
-        if sessionResetSeconds > 0 { return sessionResetSeconds }
-        return weeklyResetSeconds
+        effectiveQuotaWindows
+            .filter { $0.freePercent <= 0.001 && $0.resetSeconds > 0 }
+            .map(\.resetSeconds)
+            .min() ?? 0
     }
 
     var nextWaitingResetSeconds: Double {
-        if sessionFree <= 0.001, sessionResetSeconds > 0 {
-            return sessionResetSeconds
-        }
-        if weeklyFree <= 0.001, weeklyResetSeconds > 0 {
-            return weeklyResetSeconds
-        }
-        if weeklyResetSeconds > 0 {
-            return weeklyResetSeconds
-        }
-        if sessionResetSeconds > 0 {
-            return sessionResetSeconds
-        }
-        return Double.greatestFiniteMagnitude
+        let exhausted = effectiveQuotaWindows
+            .filter { $0.freePercent <= 0.001 && $0.resetSeconds > 0 }
+            .map(\.resetSeconds)
+            .min()
+        if let exhausted { return exhausted }
+        return effectiveQuotaWindows
+            .filter { $0.resetSeconds > 0 }
+            .map(\.resetSeconds)
+            .min() ?? Double.greatestFiniteMagnitude
     }
 
     var isUsableForCodex: Bool {
-        !hasError && sessionFree > 0.001 && weeklyFree > 0.001
+        !hasError
+            && !effectiveQuotaWindows.isEmpty
+            && effectiveQuotaWindows.allSatisfy { $0.freePercent > 0.001 }
     }
 
     /// Hours until weekly window resets (from API `reset_after_seconds`).
-    var hoursUntilWeeklyReset: Double { max(0, weeklyResetSeconds / 3600) }
+    var hoursUntilWeeklyReset: Double {
+        max(0, (weeklyQuotaWindow?.resetSeconds ?? 0) / 3600)
+    }
 
     /// Highlight reset text when meaningful balance expires soon.
     var isWeeklyResetUrgent: Bool {
-        isUsableForCodex && weeklyFree >= 20 && hoursUntilWeeklyReset < 12
+        guard let weeklyQuotaWindow else { return false }
+        return isUsableForCodex
+            && weeklyQuotaWindow.freePercent >= 20
+            && hoursUntilWeeklyReset < 12
     }
 
     /// Top priority strip: useful balance that resets in less than 24 hours.
     var isWeeklyPriority: Bool {
-        isUsableForCodex && sessionFree >= 20 && weeklyFree >= 20 && hoursUntilWeeklyReset < 24
+        guard let weeklyQuotaWindow else { return false }
+        return isUsableForCodex
+            && quotaScore >= 20
+            && weeklyQuotaWindow.freePercent >= 20
+            && hoursUntilWeeklyReset < 24
     }
 
     var planDaysRemaining: Int? {
