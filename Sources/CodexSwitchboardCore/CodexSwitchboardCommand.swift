@@ -1174,6 +1174,35 @@ private struct SnapshotQuotaWindow: Decodable {
     }
 }
 
+enum SnapshotQuotaCompatibility {
+    static func values(
+        windows: [(kind: String, freePercent: Double)]?,
+        legacySessionFree: Double,
+        legacyWeeklyFree: Double
+    ) -> (sessionFree: Double, weeklyFree: Double, score: Double) {
+        guard let windows else {
+            return (
+                legacySessionFree,
+                legacyWeeklyFree,
+                legacySessionFree * 0.6 + legacyWeeklyFree * 0.4
+            )
+        }
+
+        let leadingWindow = windows.first { $0.kind != "weekly" }
+        let weeklyWindow = windows.first { $0.kind == "weekly" }
+        let longTermWindow = weeklyWindow ?? windows.last
+        return (
+            leadingWindow?.freePercent
+                ?? longTermWindow?.freePercent
+                ?? legacySessionFree,
+            longTermWindow?.freePercent
+                ?? leadingWindow?.freePercent
+                ?? legacyWeeklyFree,
+            windows.map(\.freePercent).min() ?? 0
+        )
+    }
+}
+
 private struct QuotaWindowPayload: Codable {
     let kind: String
     let freePercent: Double
@@ -1270,22 +1299,25 @@ private struct AccountPayload: Codable {
         let isFree = snapshot.plan.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "free"
         let nextReset = Self.nextResetDate(snapshot: snapshot, baseDate: snapshotRefreshDate)
         let needsRelogin = Self.needsRelogin(snapshot.errorMessage) || !hasCapturedAuth
-        let baseScore = quotaWindows?.map(\.freePercent).min()
-            ?? (snapshot.sessionFree * 0.6 + snapshot.weeklyFree * 0.4)
+        let compatibility = SnapshotQuotaCompatibility.values(
+            windows: quotaWindows?.map { ($0.kind, $0.freePercent) },
+            legacySessionFree: snapshot.sessionFree,
+            legacyWeeklyFree: snapshot.weeklyFree
+        )
         let penalty = (snapshot.hasError ? 1_000.0 : 0) + (isFree ? 100.0 : 0)
         self.init(
             profileKey: profileKey,
             email: snapshot.email,
             workspace: snapshot.workspace,
             plan: snapshot.plan,
-            sessionFreePercent: snapshot.sessionFree,
-            weeklyFreePercent: snapshot.weeklyFree,
+            sessionFreePercent: compatibility.sessionFree,
+            weeklyFreePercent: compatibility.weeklyFree,
             quotaWindows: quotaWindows ?? [],
             usableForCodex: usable,
             needsRelogin: needsRelogin,
             nextResetAt: nextReset,
             isFreePlan: isFree,
-            score: baseScore - penalty
+            score: compatibility.score - penalty
         )
     }
 
@@ -1320,6 +1352,7 @@ private struct AccountPayload: Codable {
         return value.contains("expired")
             || value.contains("revoked")
             || value.contains("invalidated")
+            || value.contains("refresh token reused")
             || value.contains("http 401")
             || value.contains("http 403")
             || value.contains("refresh failed")

@@ -1,3 +1,4 @@
+import CodexSwitchboardCore
 import Foundation
 
 struct CodexAuthMirrorResult: Equatable {
@@ -166,6 +167,69 @@ enum CodexAuthFileLock {
         lock.lock()
         defer { lock.unlock() }
         return try body()
+    }
+}
+
+enum ActiveCodexAuthStore {
+    static func defaultAuthURLs(
+        homeURL: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [URL] {
+        var urls = [
+            homeURL.appendingPathComponent(".codex/auth.json"),
+        ]
+        if let codexHome = environment["CODEX_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !codexHome.isEmpty {
+            urls.append(
+                URL(fileURLWithPath: codexHome, isDirectory: true)
+                    .appendingPathComponent("auth.json")
+            )
+        }
+
+        var seen = Set<String>()
+        return urls.filter {
+            seen.insert($0.standardizedFileURL.path).inserted
+        }
+    }
+
+    static func updateMatching(
+        authURLs: [URL] = defaultAuthURLs(),
+        email: String,
+        accountID: String,
+        accessToken: String,
+        refreshToken: String,
+        idToken: String?
+    ) throws {
+        let refreshedIdentity = CodexAuthIdentity(
+            subject: "",
+            accountID: accountID,
+            email: email
+        )
+
+        for authURL in authURLs {
+            guard let liveAuth = StoredCodexAuth.load(from: authURL) else { continue }
+            let liveIdentity = CodexAuthIdentity(
+                subject: liveAuth.subject,
+                accountID: liveAuth.accountID,
+                email: liveAuth.email
+            )
+            guard refreshedIdentity.matches(liveIdentity) else { continue }
+
+            var root = liveAuth.root
+            var tokens = root["tokens"] as? [String: Any] ?? [:]
+            tokens["access_token"] = accessToken
+            tokens["refresh_token"] = refreshToken
+            if let idToken, !idToken.isEmpty {
+                tokens["id_token"] = idToken
+            }
+            if !accountID.isEmpty {
+                tokens["account_id"] = accountID
+            }
+            root["tokens"] = tokens
+            root["last_refresh"] = ISO8601DateFormatter.codexSwitchboard.string(from: Date())
+            try AppStorage.writeJSON(root, to: authURL, permissions: 0o600)
+        }
     }
 }
 

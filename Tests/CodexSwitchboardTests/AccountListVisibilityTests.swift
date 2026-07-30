@@ -34,6 +34,9 @@ final class AccountListVisibilityTests: XCTestCase {
         XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("token expired"))
         XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("Token invalidated"))
         XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("Token revoked"))
+        XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("Refresh token expired"))
+        XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("Refresh token reused"))
+        XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("Refresh token invalidated"))
         XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError("Refresh failed - re-login required"))
         XCTAssertFalse(UsageService.isExpiredOrRevokedAuthError("Workspace deactivated"))
     }

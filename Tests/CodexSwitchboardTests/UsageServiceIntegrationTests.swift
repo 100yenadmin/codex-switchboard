@@ -136,19 +136,114 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
-    private func makeService(tokenUpdate: TokenUpdateRecorder) -> UsageService {
+    func testBareUnauthorizedResponseStillRefreshesAndRetries() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            if path == "/oauth/token" {
+                return Self.response(request, json: [
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3_600,
+                ])
+            }
+            if path == "/backend-api/wham/usage",
+               request.value(forHTTPHeaderField: "Authorization") == "Bearer old-access" {
+                return Self.rawResponse(request, status: 401, data: Data())
+            }
+            if path == "/backend-api/wham/usage" {
+                return Self.healthyUsageResponse(request)
+            }
+            return Self.response(request, json: ["accounts": [:]])
+        }
+
+        let accounts = await makeService(tokenUpdate: tokenUpdate).loadAll()
+        let account = try XCTUnwrap(accounts.first)
+
+        XCTAssertFalse(account.hasError)
+        XCTAssertEqual(recorder.count(for: "/backend-api/wham/usage"), 2)
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 1)
+        XCTAssertEqual(tokenUpdate.count, 1)
+    }
+
+    func testMissingAccessTokenUsesAvailableRefreshGrant() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            if path == "/oauth/token" {
+                return Self.response(request, json: [
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3_600,
+                ])
+            }
+            if path == "/backend-api/wham/usage" {
+                return Self.healthyUsageResponse(request)
+            }
+            return Self.response(request, json: ["accounts": [:]])
+        }
+
+        let accounts = await makeService(
+            tokenUpdate: tokenUpdate,
+            accessToken: nil
+        ).loadAll()
+        let account = try XCTUnwrap(accounts.first)
+
+        XCTAssertFalse(account.hasError)
+        XCTAssertEqual(recorder.count(for: "/backend-api/wham/usage"), 1)
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 1)
+        XCTAssertEqual(tokenUpdate.count, 1)
+    }
+
+    func testTransientRefreshNetworkFailureDoesNotDemandRelogin() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            if path == "/oauth/token" {
+                throw URLError(.timedOut)
+            }
+            return Self.response(
+                request,
+                status: 401,
+                json: ["detail": ["code": "token_expired"]]
+            )
+        }
+
+        let accounts = await makeService(tokenUpdate: tokenUpdate).loadAll()
+        let account = try XCTUnwrap(accounts.first)
+
+        XCTAssertTrue(account.hasError)
+        XCTAssertEqual(account.errorMessage, "Refresh temporarily unavailable")
+        XCTAssertFalse(UsageService.requiresRelogin(account.errorMessage))
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 1)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
+    private func makeService(
+        tokenUpdate: TokenUpdateRecorder,
+        accessToken: String? = "old-access"
+    ) -> UsageService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
         let session = URLSession(configuration: configuration)
+        var profile: [String: Any] = [
+            "refresh": "old-refresh",
+            "email": "weekly@example.invalid",
+            "accountId": "acc-weekly",
+            "plan": "pro",
+        ]
+        if let accessToken {
+            profile["access"] = accessToken
+        }
         let collection = AccountProfileCollection(
             profiles: [
-                "profile-weekly": [
-                    "access": "old-access",
-                    "refresh": "old-refresh",
-                    "email": "weekly@example.invalid",
-                    "accountId": "acc-weekly",
-                    "plan": "pro",
-                ],
+                "profile-weekly": profile,
             ],
             orderedKeys: ["profile-weekly"]
         )
@@ -179,6 +274,36 @@ final class UsageServiceIntegrationTests: XCTestCase {
         )!
         let data = try! JSONSerialization.data(withJSONObject: json)
         return (response, data)
+    }
+
+    private static func rawResponse(
+        _ request: URLRequest,
+        status: Int,
+        data: Data
+    ) -> (HTTPURLResponse, Data) {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: status,
+            httpVersion: nil,
+            headerFields: nil
+        )!
+        return (response, data)
+    }
+
+    private static func healthyUsageResponse(
+        _ request: URLRequest
+    ) -> (HTTPURLResponse, Data) {
+        response(request, json: [
+            "account_id": "acc-weekly",
+            "plan_type": "pro",
+            "rate_limit": [
+                "primary_window": [
+                    "used_percent": 20.0,
+                    "reset_after_seconds": 500_000.0,
+                    "limit_window_seconds": 604_800.0,
+                ],
+            ],
+        ])
     }
 
     private static func bodyData(from request: URLRequest) throws -> Data {

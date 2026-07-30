@@ -21,21 +21,31 @@ final class UsageService: @unchecked Sendable {
     private let profileLoader: () -> AccountProfileCollection
     private let tokenUpdater: TokenUpdater
     private static let refreshFailedError = "Refresh failed - re-login required"
+    private static let refreshTemporarilyUnavailableError = "Refresh temporarily unavailable"
 
     init(
         session: URLSession = .shared,
         profileLoader: @escaping () -> AccountProfileCollection = AccountProfileStore.load,
         tokenUpdater: @escaping TokenUpdater = { profileKey, email, accountID,
             accessToken, refreshToken, idToken, expiresAt in
-            try AccountProfileStore.updateTokens(
-                profileKey: profileKey,
-                email: email,
-                accountID: accountID,
-                accessToken: accessToken,
-                refreshToken: refreshToken,
-                idToken: idToken,
-                expiresAt: expiresAt
-            )
+            try CodexAuthFileLock.withLock {
+                try ActiveCodexAuthStore.updateMatching(
+                    email: email,
+                    accountID: accountID,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    idToken: idToken
+                )
+                try AccountProfileStore.updateTokens(
+                    profileKey: profileKey,
+                    email: email,
+                    accountID: accountID,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    idToken: idToken,
+                    expiresAt: expiresAt
+                )
+            }
         }
     ) {
         self.session = session
@@ -45,6 +55,7 @@ final class UsageService: @unchecked Sendable {
 
     private enum RefreshResult {
         case unavailable
+        case transientFailure
         case failed
         case refreshed([String: Any])
     }
@@ -94,14 +105,18 @@ final class UsageService: @unchecked Sendable {
         // from the preceding write instead of racing another account refresh.
         for key in validKeys {
             guard let profile = profiles[key],
-                  let usage = usages[key],
-                  Self.shouldAttemptTokenRefresh(usage) else {
+                  let usage = usages[key] else {
                 continue
             }
+            let accessToken = profile["access"] as? String
+            let accessTokenMissing = accessToken?.isEmpty != false
+            guard accessTokenMissing || Self.shouldAttemptTokenRefresh(usage) else { continue }
 
             switch await refreshProfile(profileKey: key, profile: profile) {
             case .unavailable:
                 break
+            case .transientFailure:
+                usages[key] = ["error": Self.refreshTemporarilyUnavailableError]
             case .failed:
                 usages[key] = ["error": Self.refreshFailedError]
             case .refreshed(let refreshedProfile):
@@ -164,8 +179,9 @@ final class UsageService: @unchecked Sendable {
             let rl  = usage["rate_limit"]       as? [String: Any]
             let hasUsage = usageError == nil && rl != nil
             let quotaWindows = hasUsage ? Self.quotaWindows(from: usage) : []
-            let sessionWindow = quotaWindows.first { $0.kind == .fiveHour }
+            let sessionWindow = quotaWindows.first { $0.kind != .weekly }
             let weeklyWindow = quotaWindows.first { $0.kind == .weekly }
+            let longTermWindow = weeklyWindow ?? quotaWindows.last
 
             let planType = resolvedPlanType(profile: p, usage: usage)
             let usesWorkspaceName = workspaceNamedAccountIDs.contains(aid)
@@ -206,10 +222,10 @@ final class UsageService: @unchecked Sendable {
                 email: email,
                 workspace: workspaceName,
                 plan: planType ?? "?",
-                sessionFree: sessionWindow?.freePercent ?? 100,
-                weeklyFree: weeklyWindow?.freePercent ?? 100,
-                sessionResetSeconds: sessionWindow?.resetSeconds ?? 0,
-                weeklyResetSeconds: weeklyWindow?.resetSeconds ?? 0,
+                sessionFree: sessionWindow?.freePercent ?? longTermWindow?.freePercent ?? 100,
+                weeklyFree: longTermWindow?.freePercent ?? sessionWindow?.freePercent ?? 100,
+                sessionResetSeconds: sessionWindow?.resetSeconds ?? longTermWindow?.resetSeconds ?? 0,
+                weeklyResetSeconds: longTermWindow?.resetSeconds ?? sessionWindow?.resetSeconds ?? 0,
                 quotaWindows: quotaWindows,
                 planRenewalDate: planRenewalDate,
                 hasError: !hasUsage || quotaWindows.isEmpty,
@@ -375,9 +391,22 @@ final class UsageService: @unchecked Sendable {
             refreshedProfile["refresh"] = nextRefreshToken
             refreshedProfile["expires"] = expiresAt
             return .refreshed(refreshedProfile)
+        } catch let error as URLError where Self.isTransientRefreshError(error) {
+            return .transientFailure
         } catch {
             return .failed
         }
+    }
+
+    private static func isTransientRefreshError(_ error: URLError) -> Bool {
+        [
+            .notConnectedToInternet,
+            .networkConnectionLost,
+            .timedOut,
+            .cannotFindHost,
+            .cannotConnectToHost,
+            .dnsLookupFailed,
+        ].contains(error.code)
     }
 
     private func tokenExpirationMilliseconds(
@@ -500,17 +529,22 @@ final class UsageService: @unchecked Sendable {
         do {
             let (data, response) = try await session.data(for: req)
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                 obj["http_status"] = statusCode
                 if !(200...299).contains(statusCode), obj["error"] == nil {
                     obj["error"] = readableAPIError(from: obj) ?? "HTTP \(statusCode)"
                 }
                 return obj
             }
+            return [
+                "http_status": statusCode,
+                "error": (200...299).contains(statusCode)
+                    ? "parse error"
+                    : "HTTP \(statusCode)",
+            ]
         } catch {
             return ["error": error.localizedDescription]
         }
-        return ["error": "parse error"]
     }
 
     private func usage(_ usage: [String: Any], accessToken: String) -> [String: Any] {
@@ -560,6 +594,9 @@ final class UsageService: @unchecked Sendable {
         return message == "expired or revoked"
             || message == "token invalidated"
             || message == "token revoked"
+            || message == "refresh token expired"
+            || message == "refresh token reused"
+            || message == "refresh token invalidated"
             || message == "missing access token"
             || message == refreshFailedError.lowercased()
             || message == "http 401"
