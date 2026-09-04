@@ -2,6 +2,12 @@
 
 All notable changes to Codex Switchboard will be documented here.
 
+## 1.0.12
+
+- Fix account switching hanging for minutes on ChatGPT.app 26.9+ (bundled Codex 0.153.x): the desktop app now runs its own `codex app-server` child and never uses the managed `codex app-server daemon`, but the switch still called `daemon restart`/`bootstrap`/`stop`/`start` after copying auth. With a stale `app-server.pid` pointing at a zombie (left behind by the standalone `pid-update-loop`), each subcommand polled for ~60s before giving up, leaving the desktop app quit for 3–5 minutes mid-switch.
+- Only restart the managed daemon when its control socket (`~/.codex/app-server-control/app-server-control.sock`) exists; every helper the switch shells out to now runs under a hard timeout (15s for daemon subcommands) via `TimedProcessRunner`, and a timed-out `restart` no longer cascades into `stop`/`start`.
+- Drop the `daemon bootstrap` fallback: it installs durable launchd management for SSH use, which an account switch should not do as a side effect.
+
 ## 1.0.10 - 2026-07-11
 
 - Fixed shared-auth safety checks so the unified `ChatGPT.app` is treated as a running Codex consumer before CLI account switches.
