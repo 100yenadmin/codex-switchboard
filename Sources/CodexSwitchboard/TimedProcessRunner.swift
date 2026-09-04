@@ -57,19 +57,18 @@ enum TimedProcessRunner {
                     kill(process.processIdentifier, SIGKILL)
                     process.waitUntilExit()
                 }
-                // A grandchild may still hold the pipe open; never block on it after a kill.
-                if readGroup.wait(timeout: .now() + 1) == .timedOut {
-                    try? pipe.fileHandleForReading.close()
-                }
+                // A grandchild may still hold the write end open, which keeps the drain thread
+                // blocked. Do not wait on it and do not close the handle underneath it (reading a
+                // closed NSFileHandle raises an uncatchable exception); the thread ends on EOF.
                 throw TimedProcessRunnerError.timedOut(command: command, timeout: timeout)
             }
         } else {
             process.waitUntilExit()
         }
 
-        if readGroup.wait(timeout: .now() + 2) == .timedOut {
-            try? pipe.fileHandleForReading.close()
-        }
+        // Bounded wait for the drain; if a descendant still holds the pipe, return without the
+        // output rather than blocking (and never close the handle under the reader).
+        _ = readGroup.wait(timeout: .now() + 2)
         outputLock.lock()
         let output = String(data: collected, encoding: .utf8) ?? ""
         outputLock.unlock()
@@ -110,7 +109,32 @@ enum CodexAppServerDaemon {
             .appendingPathComponent("app-server-control.sock")
     }
 
+    /// True only when something is actually listening on the control socket. A socket file left
+    /// behind by a crashed daemon (or a plain file at that path) is not a running daemon.
     static func isLikelyRunning(codexHome: URL, fileManager: FileManager = .default) -> Bool {
-        fileManager.fileExists(atPath: controlSocketURL(codexHome: codexHome).path)
+        let path = controlSocketURL(codexHome: codexHome).path
+        guard fileManager.fileExists(atPath: path) else { return false }
+        return isUnixSocketAccepting(path: path)
+    }
+
+    static func isUnixSocketAccepting(path: String) -> Bool {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        let bytes = Array(path.utf8)
+        guard bytes.count < capacity else { return false }
+        withUnsafeMutableBytes(of: &address.sun_path) { raw in
+            raw.copyBytes(from: bytes)
+            raw[bytes.count] = 0
+        }
+
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        let length = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let result = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+        }
+        return result == 0
     }
 }
