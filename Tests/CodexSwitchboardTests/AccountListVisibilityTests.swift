@@ -202,6 +202,48 @@ final class AccountListVisibilityTests: XCTestCase {
         XCTAssertTrue(account.isUsableForCodex)
     }
 
+    func testExhaustedAccountStillOffersManualSwitch() {
+        // 0% on every window: not "usable" for smart ordering/auto-swap, but the user can still
+        // switch into it (earned resets, self-reset usage, or just wanting that identity active).
+        let account = Account(
+            id: "empty@example.com|acc-empty",
+            profileKey: "empty@example.com",
+            email: "empty@example.com",
+            workspace: "pro",
+            plan: "pro",
+            sessionFree: 0,
+            weeklyFree: 0,
+            sessionResetSeconds: 3_600,
+            weeklyResetSeconds: 86_400,
+            planRenewalDate: nil,
+            hasError: false,
+            errorMessage: nil
+        )
+
+        XCTAssertFalse(account.isUsableForCodex)
+        XCTAssertTrue(SwapControlVisibility.isAvailable(
+            showsCodexControls: true,
+            isActiveInCodex: false,
+            needsRelogin: false,
+            isRelogging: false
+        ))
+    }
+
+    func testSwapControlStillHiddenForActiveOrReloggingRows() {
+        XCTAssertFalse(SwapControlVisibility.isAvailable(
+            showsCodexControls: true, isActiveInCodex: true, needsRelogin: false, isRelogging: false
+        ))
+        XCTAssertFalse(SwapControlVisibility.isAvailable(
+            showsCodexControls: true, isActiveInCodex: false, needsRelogin: true, isRelogging: false
+        ))
+        XCTAssertFalse(SwapControlVisibility.isAvailable(
+            showsCodexControls: true, isActiveInCodex: false, needsRelogin: false, isRelogging: true
+        ))
+        XCTAssertFalse(SwapControlVisibility.isAvailable(
+            showsCodexControls: false, isActiveInCodex: false, needsRelogin: false, isRelogging: false
+        ))
+    }
+
     func testFreePlanSessionZeroUsesDedicatedResetState() {
         let account = Account(
             id: "free@example.com|acc-free",
