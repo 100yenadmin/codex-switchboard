@@ -5,6 +5,7 @@ import XCTest
 /// covers the check that decides whether an agent may switch the main CLI.
 final class CodexLoginsScriptTests: XCTestCase {
     func testCheckSwitchAndSwapRefuseLeasedReservedAndUnreadableState() throws {
+        try requirePython3()
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -29,6 +30,7 @@ final class CodexLoginsScriptTests: XCTestCase {
 
     /// codex-logins register takes `.auth.lock` with Python's `fcntl.lockf`; it must exclude the switch's hold.
     func testPythonLockfOnTheAuthLockWaitsForSwitchboardsHold() throws {
+        try requirePython3()
         let appSupport = FileManager.default.temporaryDirectory
             .appendingPathComponent("codex-logins-lock-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: appSupport) }
@@ -56,5 +58,12 @@ final class CodexLoginsScriptTests: XCTestCase {
         let held = try CodexAuthStoreLock.withRequiredLock(appSupportURL: appSupport) { try tryLock() }
         XCTAssertEqual(held, "busy")
         XCTAssertEqual(try tryLock(), "acquired")
+    }
+
+    private func requirePython3() throws {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
+        guard path.split(separator: ":").contains(where: { FileManager.default.isExecutableFile(atPath: "\($0)/python3") }) else {
+            throw XCTSkip("needs python3 on PATH")
+        }
     }
 }

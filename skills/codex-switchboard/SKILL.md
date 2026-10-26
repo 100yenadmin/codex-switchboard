@@ -120,7 +120,7 @@ codex-switchboard lease --profile-key "$HANDLE" --home "$LANE_HOME" --holder "$L
 
 ```bash
 codex-switchboard leases --json \
-  | jq '[.leases[] | {handle, lease_id, state, holder, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
+  | jq '[.leases[] | {handle, lease_id, state, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
 ```
 
 `state` is `leasing` until the home's `auth.json` is written, then `active`, and `returning` once a return starts, until it finishes; every state counts as leased. `holder_running: true` means a process holds `holder.lock`. `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
