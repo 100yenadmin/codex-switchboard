@@ -179,7 +179,7 @@ final class CodexAuthMirrorService: @unchecked Sendable {
 
     /// A busy home, a torn read (Codex writes `auth.json` in place) or a failed write leaves the
     /// home's rotation uncopied, so the next tick tries again instead of waiting for a new rotation.
-    private static func needsRetry(_ results: [CodexAuthMirrorResult]) -> Bool {
+    static func needsRetry(_ results: [CodexAuthMirrorResult]) -> Bool {
         results.contains { result in
             guard result.status == .skipped, let reason = result.reason else { return false }
             if reason == homeLockedReason { return true }

@@ -250,6 +250,31 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
+    func testRefreshSkipsATokenThatMovedOnBeforeTheReservation() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        let expected = ExpectedTokenRecorder()
+        MockURLProtocol.handler = { request in
+            recorder.record(path: request.url?.path ?? "")
+            return Self.response(request, status: 401, json: ["detail": ["code": "token_expired"]])
+        }
+
+        _ = await makeService(
+            tokenUpdate: tokenUpdate,
+            refreshGate: UsageService.RefreshGate(
+                reserve: { _, expectedRefreshToken in
+                    expected.record(expectedRefreshToken)
+                    return .stale
+                },
+                release: { _ in }
+            )
+        ).loadAll()
+
+        XCTAssertEqual(expected.values, ["old-refresh"])
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 0)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
     func testRefreshReservationSpansTheGrantUntilTheRotationIsStored() async throws {
         let events = EventRecorder()
         MockURLProtocol.handler = { request in
@@ -514,5 +539,22 @@ private final class TokenUpdateRecorder: @unchecked Sendable {
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
         lock.unlock()
+    }
+}
+
+private final class ExpectedTokenRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    func record(_ value: String) {
+        lock.lock()
+        recorded.append(value)
+        lock.unlock()
+    }
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
     }
 }

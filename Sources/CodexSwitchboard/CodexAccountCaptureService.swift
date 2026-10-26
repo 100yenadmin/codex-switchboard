@@ -734,10 +734,15 @@ enum LeasedAccountError: LocalizedError {
 /// into the stored profile. A sign-in would replace that profile and a removal would drop it,
 /// so both refuse while the account is in the lease journal. Call under `CodexAuthFileLock`.
 enum LeasedAccountGuard {
-    static func rejectIfLeased(profileKeys: Set<String>, email: String, accountID: String) throws {
+    static func rejectIfLeased(
+        profileKeys: Set<String>,
+        email: String,
+        accountID: String,
+        storageRootURL: URL = AppStorage.rootURL
+    ) throws {
         let leases: [CodexLease]
         do {
-            leases = try CodexLeaseStore(appSupportURL: AppStorage.rootURL).load()
+            leases = try CodexLeaseStore(appSupportURL: storageRootURL).load()
         } catch {
             throw LeasedAccountError.leaseStoreUnreadable
         }
@@ -745,7 +750,8 @@ enum LeasedAccountGuard {
         // A capture also drops other keys for the same seat, so those count too.
         var keys = profileKeys
         if !accountID.isEmpty {
-            for (key, value) in AccountProfileStore.loadLocalProfiles()
+            let root = AppStorage.readJSON(storageRootURL.appendingPathComponent("accounts.json"))
+            for (key, value) in root?["profiles"] as? [String: [String: Any]] ?? [:]
             where (value["accountId"] as? String) == accountID
                 && (value["email"] as? String)?.lowercased() == email.lowercased() {
                 keys.insert(key)

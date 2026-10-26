@@ -36,8 +36,10 @@ final class CodexLeaseTests: XCTestCase {
         let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
         XCTAssertEqual(returned.exitCode, 0, returned.text)
         XCTAssertEqual(returned.json["sync"] as? String, "rotated")
-        XCTAssertEqual(returned.json["home_auth_removed"] as? Bool, true)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: homeAuth.path))
+        XCTAssertEqual(returned.json["home_auth_tombstoned"] as? Bool, true)
+        XCTAssertEqual(returned.json["lease_id"] as? String, lease.json["lease_id"] as? String)
+        XCTAssertNil(fixture.refreshToken(in: homeAuth))
+        XCTAssertEqual(CodexLeaseTombstone.leaseID(at: homeAuth), lease.json["lease_id"] as? String)
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
         XCTAssertEqual(fixture.accountListRefreshToken("profile-k"), "refresh-k-2")
         XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load(), [])
@@ -393,7 +395,11 @@ final class CodexLeaseTests: XCTestCase {
             fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
             0
         )
-        XCTAssertEqual(leasable(fixture.run(["status", "--json", "--leasable-only"])), ["profile-b": true])
+        let leasableOnly = fixture.run(["status", "--json", "--leasable-only"])
+        let free = leasableOnly.json["accounts"] as? [[String: Any]] ?? []
+        XCTAssertEqual(free.compactMap { $0["handle"] as? String }, [CodexAccountHandle.handle(for: "profile-b")])
+        XCTAssertFalse(leasableOnly.text.contains("profile-"))
+        XCTAssertFalse(leasableOnly.text.contains("@example.invalid"))
 
         let lease = try XCTUnwrap((fixture.run(["leases", "--json"]).json["leases"] as? [[String: Any]])?.first)
         XCTAssertEqual(lease["plan"] as? String, "pro")
@@ -413,9 +419,9 @@ final class CodexLeaseTests: XCTestCase {
         let swapped = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
 
         XCTAssertEqual(swapped.exitCode, 0, swapped.text)
-        XCTAssertEqual(swapped.json["returned_profile_key"] as? String, "profile-k")
+        XCTAssertEqual(swapped.json["returned_handle"] as? String, CodexAccountHandle.handle(for: "profile-k"))
         XCTAssertEqual(swapped.json["return_sync"] as? String, "rotated")
-        XCTAssertEqual(swapped.json["leased_profile_key"] as? String, "profile-b")
+        XCTAssertEqual(swapped.json["leased_handle"] as? String, CodexAccountHandle.handle(for: "profile-b"))
         XCTAssertEqual(swapped.json["holder"] as? String, "bench")
         XCTAssertEqual(fixture.refreshToken(in: homeAuth), "refresh-b-1")
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
@@ -622,7 +628,7 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
     }
 
-    func testSwapWaitsForAPythonHolderMidRefreshAndKeepsItsRotation() throws {
+    func testSwapRefusesARunningPythonHolderAndKeepsItsRotationAfterItExits() throws {
         let python = URL(fileURLWithPath: "/usr/bin/python3")
         guard FileManager.default.isExecutableFile(atPath: python.path) else {
             throw XCTSkip("needs /usr/bin/python3")
@@ -633,45 +639,362 @@ final class CodexLeaseTests: XCTestCase {
             0
         )
 
-        // A holder like the benchmark director: flock, re-read, refresh, then temp file + fsync + os.replace.
+        // A holder like the benchmark director: holder.lock for its lifetime; around a refresh,
+        // flock on auth.json.lock, re-read, then temp file + fsync + os.replace. It exits on stdin EOF.
         let holder = Process()
         holder.executableURL = python
         holder.arguments = ["-I", "-c", """
-        import fcntl, json, os, sys, time
+        import fcntl, json, os, sys
         home = sys.argv[1]
-        lock = open(os.path.join(home, "auth.json.lock"), "a")
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        print("locked", flush=True)
-        time.sleep(1.0)
-        path = os.path.join(home, "auth.json")
-        auth = json.load(open(path))
-        auth["tokens"]["access_token"] = "access-k-3"
-        auth["tokens"]["refresh_token"] = "refresh-k-3"
-        tmp = path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump(auth, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
+        held = open(os.path.join(home, "holder.lock"), "a")
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(os.path.join(home, "auth.json.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            path = os.path.join(home, "auth.json")
+            auth = json.load(open(path))
+            auth["tokens"]["access_token"] = "access-k-3"
+            auth["tokens"]["refresh_token"] = "refresh-k-3"
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(auth, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        print("rotated", flush=True)
+        sys.stdin.read()
         """, home.path]
+        let input = Pipe()
         let output = Pipe()
+        holder.standardInput = input
         holder.standardOutput = output
         try holder.run()
         defer { holder.terminate() }
-        XCTAssertEqual(String(data: output.fileHandleForReading.availableData, encoding: .utf8), "locked\n")
+        XCTAssertEqual(String(data: output.fileHandleForReading.availableData, encoding: .utf8), "rotated\n")
 
-        let swapped = fixture.run(
-            ["swap-lease", "--home", home.path, "--holder", "bench", "--json"],
-            environment: ["CODEX_SWITCHBOARD_HOME_LOCK_TIMEOUT_SECONDS": "10"]
-        )
+        let busy = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(busy.json["error"] as? String, "home_in_use", busy.text)
+        XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-k-3")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
 
+        try input.fileHandleForWriting.close()
         holder.waitUntilExit()
+        let swapped = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
         XCTAssertEqual(swapped.exitCode, 0, swapped.text)
         XCTAssertEqual(swapped.json["return_sync"] as? String, "rotated")
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-3")
         XCTAssertEqual(fixture.accountListRefreshToken("profile-k"), "refresh-k-3")
         XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-b-1")
+    }
+
+    func testLeaseMarksTheHomeAndNamesTheAccountByHandleOnly() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let handle = CodexAccountHandle.handle(for: "profile-k")
+        XCTAssertNotNil(handle.range(of: "^acct_[0-9a-f]{12}$", options: .regularExpression))
+
+        let lease = fixture.run(["lease", "--profile-key", handle, "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.exitCode, 0, lease.text)
+        XCTAssertEqual(lease.json["handle"] as? String, handle)
+        XCTAssertEqual(lease.json["config_written"] as? Bool, true)
+        XCTAssertFalse(lease.text.contains("profile-k"))
+
+        let journal = try XCTUnwrap(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().first)
+        XCTAssertEqual(journal.profileKey, "profile-k")
+        XCTAssertEqual(journal.state, .active)
+        XCTAssertTrue(journal.authWritten)
+        XCTAssertEqual(lease.json["lease_id"] as? String, journal.leaseID)
+
+        let marker = try XCTUnwrap(try CodexLeaseMarker.read(home: home.path))
+        XCTAssertEqual(marker.leaseID, journal.leaseID)
+        XCTAssertEqual(marker.consumer, "bench")
+        let markerText = try String(contentsOf: CodexLeaseMarker.url(home: home.path), encoding: .utf8)
+        for secret in ["profile-k", "k@example.invalid", "acct-k", "refresh-k"] {
+            XCTAssertFalse(markerText.contains(secret), "\(secret) leaked into lease.json")
+        }
+
+        let config = try String(contentsOf: home.appendingPathComponent("config.toml"), encoding: .utf8)
+        XCTAssertTrue(config.contains("cli_auth_credentials_store = \"file\""))
+        XCTAssertTrue(config.contains("CODEX_HOME = \"/var/empty/"))
+
+        let leases = fixture.run(["leases", "--json"])
+        let listed = try XCTUnwrap((leases.json["leases"] as? [[String: Any]])?.first)
+        XCTAssertEqual(listed["handle"] as? String, handle)
+        XCTAssertEqual(listed["state"] as? String, "active")
+        XCTAssertEqual(listed["holder_running"] as? Bool, false)
+        XCTAssertFalse(leases.text.contains("profile-k"))
+
+        let returned = fixture.run(["return", "--profile-key", handle, "--home", home.path, "--json"])
+        XCTAssertEqual(returned.exitCode, 0, returned.text)
+        XCTAssertEqual(returned.json["handle"] as? String, handle)
+    }
+
+    func testLeaseKeepsAnExistingConfigAndReleasesIntoATombstonedHome() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let configURL = home.appendingPathComponent("config.toml")
+        try "model = \"owner-choice\"\n".write(to: configURL, atomically: true, encoding: .utf8)
+
+        let first = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(first.exitCode, 0, first.text)
+        XCTAssertEqual(first.json["config_written"] as? Bool, false)
+        XCTAssertEqual(try String(contentsOf: configURL, encoding: .utf8), "model = \"owner-choice\"\n")
+        XCTAssertEqual(fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"]).exitCode, 0)
+
+        let second = fixture.run(["lease", "--profile-key", "profile-b", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(second.exitCode, 0, second.text)
+        XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-b-1")
+        XCTAssertNotEqual(second.json["lease_id"] as? String, first.json["lease_id"] as? String)
+        XCTAssertEqual(try CodexLeaseMarker.read(home: home.path)?.leaseID, second.json["lease_id"] as? String)
+    }
+
+    func testABusyHolderLockRefusesLeaseReturnAndSwap() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let held = try fixture.holdLock(in: home, fileName: CodexLeaseHome.holderLockFileName)
+        defer { fixture.releaseAuthLock(held) }
+        let other = fixture.root.appendingPathComponent("other-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let otherHeld = try fixture.holdLock(in: other, fileName: CodexLeaseHome.holderLockFileName)
+        defer { fixture.releaseAuthLock(otherHeld) }
+
+        let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(returned.json["error"] as? String, "home_in_use", returned.text)
+        let swapped = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(swapped.json["error"] as? String, "home_in_use", swapped.text)
+        let leased = fixture.run(["lease", "--profile-key", "profile-b", "--home", other.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(leased.json["error"] as? String, "home_in_use", leased.text)
+        XCTAssertTrue(CodexFileProbe.isMissing(other.appendingPathComponent("auth.json")))
+        XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-k-1")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+    }
+
+    func testReturnRefusesAMarkerFromAnotherLease() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let markerURL = CodexLeaseMarker.url(home: home.path)
+        let original = try Data(contentsOf: markerURL)
+        let foreign = try XCTUnwrap(String(data: original, encoding: .utf8))
+            .replacingOccurrences(
+                of: try XCTUnwrap(try CodexLeaseMarker.read(home: home.path)).leaseID,
+                with: "lease-from-elsewhere"
+            )
+        try foreign.write(to: markerURL, atomically: true, encoding: .utf8)
+        let mismatch = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(mismatch.json["error"] as? String, "lease_id_mismatch", mismatch.text)
+
+        try "{not json".write(to: markerURL, atomically: true, encoding: .utf8)
+        let unreadable = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(unreadable.json["error"] as? String, "lease_marker_unreadable", unreadable.text)
+
+        XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-k-1")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+        try original.write(to: markerURL)
+        XCTAssertEqual(fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"]).exitCode, 0)
+    }
+
+    func testReturnRefusesWhenTheLentAuthIsGone() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        try FileManager.default.removeItem(at: home.appendingPathComponent("auth.json"))
+
+        let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+
+        XCTAssertEqual(returned.json["error"] as? String, "home_auth_missing", returned.text)
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+        let status = fixture.run(["status", "--json"])
+        XCTAssertEqual(fixture.account("profile-k", in: status.json)?["leasable"] as? Bool, false)
+    }
+
+    func testReturnAfterACrashMidReturnFinishesFromTheHome() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let homeAuth = home.appendingPathComponent("auth.json")
+        let store = CodexLeaseStore(appSupportURL: fixture.appSupport)
+        func markReturning() throws {
+            try store.save(try store.load().map { lease in
+                var lease = lease
+                lease.state = .returning
+                return lease
+            })
+        }
+
+        // Killed after marking the lease returning, before the sync: the home still holds the chain.
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        try fixture.writeAuth(account: "k", generation: 2, to: homeAuth)
+        try markReturning()
+        XCTAssertEqual(fixture.run(["leases", "--json"]).json["leases"].flatMap { ($0 as? [[String: Any]])?.first?["state"] } as? String, "returning")
+        let blocked = fixture.run(["lease", "--profile-key", "profile-k", "--home", fixture.root.appendingPathComponent("elsewhere").path, "--holder", "bench", "--json"])
+        XCTAssertEqual(blocked.json["error"] as? String, "already_leased", blocked.text)
+        let first = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(first.exitCode, 0, first.text)
+        XCTAssertEqual(first.json["sync"] as? String, "rotated")
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
+
+        // Killed after the tombstone, before the journal entry was removed.
+        let again = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(again.exitCode, 0, again.text)
+        try fixture.writeAuth(account: "k", generation: 3, to: homeAuth)
+        try markReturning()
+        _ = try CodexLeaseSync.syncHome(try XCTUnwrap(try store.load().first), appSupportURL: fixture.appSupport)
+        try CodexLeaseTombstone.write(leaseID: try XCTUnwrap(again.json["lease_id"] as? String), to: homeAuth)
+        let second = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(second.exitCode, 0, second.text)
+        XCTAssertEqual(second.json["sync"] as? String, "home_returned")
+        XCTAssertEqual(try store.load(), [])
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-3")
+        XCTAssertEqual(fixture.accountListRefreshToken("profile-k"), "refresh-k-3")
+    }
+
+    func testAStaleReservationMakesNothingLeasable() throws {
+        try fixture.writeRegistry([
+            ["purpose": "bench", "codex_home": "~/bench-home", "profile_key": "profile-renamed-since"],
+        ])
+
+        let status = fixture.run(["status", "--json"])
+        let accounts = status.json["accounts"] as? [[String: Any]] ?? []
+        XCTAssertFalse(accounts.isEmpty)
+        XCTAssertFalse(accounts.contains { $0["leasable"] as? Bool == true })
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let lease = fixture.run(["lease", "--profile-key", "profile-b", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.json["error"] as? String, "reserved_registry_stale", lease.text)
+        XCTAssertFalse(lease.text.contains("profile-renamed-since"))
+        XCTAssertTrue(CodexFileProbe.isMissing(home.appendingPathComponent("auth.json")))
+    }
+
+    func testLeaseRefusesWhenTheStoredCopiesDisagree() throws {
+        let accountsURL = fixture.appSupport.appendingPathComponent("accounts.json")
+        var root = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: accountsURL)) as? [String: Any])
+        var profiles = try XCTUnwrap(root["profiles"] as? [String: Any])
+        var entry = try XCTUnwrap(profiles["profile-b"] as? [String: Any])
+        entry["refresh"] = "refresh-b-2"
+        profiles["profile-b"] = entry
+        root["profiles"] = profiles
+        try CodexAtomicFile.writeJSON(root, to: accountsURL)
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+
+        let lease = fixture.run(["lease", "--profile-key", "profile-b", "--home", home.path, "--holder", "bench", "--json"])
+
+        XCTAssertEqual(lease.json["error"] as? String, "stored_copies_disagree", lease.text)
+        XCTAssertTrue(CodexFileProbe.isMissing(home.appendingPathComponent("auth.json")))
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load(), [])
+    }
+
+    func testLeaseGivesUpOnAStoreLockHeldByAnotherProcess() throws {
+        let python = URL(fileURLWithPath: "/usr/bin/python3")
+        guard FileManager.default.isExecutableFile(atPath: python.path) else {
+            throw XCTSkip("needs /usr/bin/python3")
+        }
+        let holder = Process()
+        holder.executableURL = python
+        holder.arguments = ["-I", "-c", """
+        import fcntl, os, sys
+        lock = open(os.path.join(sys.argv[1], ".auth.lock"), "a")
+        fcntl.lockf(lock, fcntl.LOCK_EX)
+        print("locked", flush=True)
+        sys.stdin.read()
+        """, fixture.appSupport.path]
+        let input = Pipe()
+        let output = Pipe()
+        holder.standardInput = input
+        holder.standardOutput = output
+        try holder.run()
+        defer { holder.terminate() }
+        XCTAssertEqual(String(data: output.fileHandleForReading.availableData, encoding: .utf8), "locked\n")
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+
+        let lease = fixture.run(
+            ["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"],
+            environment: ["CODEX_SWITCHBOARD_STORE_LOCK_TIMEOUT_SECONDS": "0.5"]
+        )
+
+        XCTAssertEqual(lease.json["error"] as? String, "auth_store_locked", lease.text)
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load(), [])
+        try input.fileHandleForWriting.close()
+        holder.waitUntilExit()
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+    }
+
+    func testSwitchRefusesALaneHomeOrAReservedHomeAsItsDestination() throws {
+        let lane = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: lane, withIntermediateDirectories: true)
+        try Data().write(to: lane.appendingPathComponent(CodexLeaseHome.holderLockFileName))
+        try fixture.writeAuth(account: "a", generation: 1, to: lane.appendingPathComponent("auth.json"))
+        let laneBefore = try Data(contentsOf: lane.appendingPathComponent("auth.json"))
+
+        let intoLane = fixture.run(
+            ["switch", "--profile-key", "profile-b", "--surface", "cli", "--json"],
+            environment: ["CODEX_HOME": lane.path]
+        )
+        XCTAssertEqual(intoLane.json["error"] as? String, "surface_is_lane_home", intoLane.text)
+        XCTAssertEqual(try Data(contentsOf: lane.appendingPathComponent("auth.json")), laneBefore)
+
+        let reserved = fixture.home.appendingPathComponent("bench-home", isDirectory: true)
+        try fixture.writeAuth(account: "a", generation: 1, to: reserved.appendingPathComponent("auth.json"))
+        try fixture.writeRegistry([["purpose": "bench", "codex_home": "~/bench-home", "profile_key": "profile-f"]])
+        let intoReserved = fixture.run(
+            ["switch", "--profile-key", "profile-b", "--surface", "cli", "--json"],
+            environment: ["CODEX_HOME": reserved.path]
+        )
+        XCTAssertEqual(intoReserved.json["error"] as? String, "surface_is_reserved_home", intoReserved.text)
+        XCTAssertEqual(fixture.refreshToken(in: reserved.appendingPathComponent("auth.json")), "refresh-a-1")
+    }
+
+    func testAppRefusesToSignInOrRemoveALeasedAccount() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let root = fixture.appSupport
+
+        XCTAssertThrowsError(try LeasedAccountGuard.rejectIfLeased(
+            profileKeys: ["profile-k"], email: "k@example.invalid", accountID: "acct-k", storageRootURL: root
+        )) { error in
+            guard case LeasedAccountError.leased(holder: "bench") = error else {
+                return XCTFail("unexpected \(error)")
+            }
+        }
+        // A new sign-in under another key for the same seat would drop the leased key as a duplicate.
+        XCTAssertThrowsError(try LeasedAccountGuard.rejectIfLeased(
+            profileKeys: ["profile-k-new"], email: "K@example.invalid", accountID: "acct-k", storageRootURL: root
+        ))
+        XCTAssertNoThrow(try LeasedAccountGuard.rejectIfLeased(
+            profileKeys: ["profile-b"], email: "b@example.invalid", accountID: "acct-b", storageRootURL: root
+        ))
+
+        try Data("{not json".utf8).write(to: root.appendingPathComponent(CodexLeaseStore.fileName))
+        XCTAssertThrowsError(try LeasedAccountGuard.rejectIfLeased(
+            profileKeys: ["profile-b"], email: "b@example.invalid", accountID: "acct-b", storageRootURL: root
+        )) { error in
+            guard case LeasedAccountError.leaseStoreUnreadable = error else {
+                return XCTFail("unexpected \(error)")
+            }
+        }
+    }
+
+    func testMirrorRetriesAHomeWhoseSyncFailed() {
+        func result(_ reason: String?, _ status: CodexAuthMirrorResult.Status = .skipped) -> CodexAuthMirrorResult {
+            CodexAuthMirrorResult(status: status, profileKey: "profile-k", reason: reason)
+        }
+        XCTAssertTrue(CodexAuthMirrorService.needsRetry([result("home_locked")]))
+        XCTAssertTrue(CodexAuthMirrorService.needsRetry([result("home_auth_unreadable")]))
+        XCTAssertTrue(CodexAuthMirrorService.needsRetry([result("The file could not be written.")]))
+        XCTAssertFalse(CodexAuthMirrorService.needsRetry([result(nil, .synced)]))
+        XCTAssertFalse(CodexAuthMirrorService.needsRetry([result("unchanged"), result("home_quarantined"), result("home_returned")]))
     }
 
     func testHelpListsLeaseCommands() {
@@ -844,6 +1167,15 @@ private struct LeaseFixture {
     /// holder process does while it refreshes.
     func holdAuthLock(in home: URL) throws -> Int32 {
         let descriptor = open(home.appendingPathComponent("auth.json.lock").path, O_CREAT | O_RDWR, 0o600)
+        guard descriptor >= 0, flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            throw POSIXError(.EBUSY)
+        }
+        return descriptor
+    }
+
+    /// The same, on any lock file in the home, such as `holder.lock`.
+    func holdLock(in home: URL, fileName: String) throws -> Int32 {
+        let descriptor = open(home.appendingPathComponent(fileName).path, O_CREAT | O_RDWR, 0o600)
         guard descriptor >= 0, flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             throw POSIXError(.EBUSY)
         }
