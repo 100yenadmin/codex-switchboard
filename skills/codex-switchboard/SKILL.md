@@ -106,7 +106,7 @@ codex-switchboard status --json --leasable-only \
   | jq '[.accounts[] | {handle, plan, session_free_percent, weekly_free_percent, score, next_reset_at}]'
 ```
 
-Drop `--leasable-only` to see every account with its `handle`, `plan`, free percentages, `leased`, `lease_holder`, `lease_quarantined`, `reserved` and `leasable`. `reserved: true` means the codex-logins registry (`~/.config/codex-logins/registry.json`) sets the account aside for one consumer with its own sign-in; it is never leased, and no lease or switch goes into a registered home. If that registry cannot be read, lists a login without a `profile_key`, or lists a key Switchboard no longer has (a stale reservation), nothing is leasable.
+Drop `--leasable-only` to see every account with its `handle`, `plan`, free percentages, `leased`, `lease_holder`, `lease_quarantined`, `reserved` and `leasable`. `reserved: true` means the codex-logins registry (`~/.config/codex-logins/registry.json`) sets the account aside for one consumer with its own sign-in; it is never leased or picked by auto-swap, and no lease or switch goes into a registered home. If that registry cannot be read, lists a login without a `profile_key`, or lists a key Switchboard no longer has (a stale reservation), nothing is leasable.
 
 Choose the highest `score`.
 

@@ -132,6 +132,17 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: liveAuth), before)
     }
 
+    func testAutoSwapSkipsReservedAccount() throws {
+        try AutoSwapPolicyStore(url: fixture.appSupport.appendingPathComponent("auto-swap-policy.json"))
+            .save(AutoSwapPolicy(enabledSurfaces: [.cli]))
+        let dryRun = ["autoswap", "run-once", "--surface", "cli", "--json", "--dry-run"]
+        XCTAssertEqual(fixture.candidate(in: fixture.run(dryRun)), "profile-k")
+
+        try fixture.writeRegistry([["purpose": "bench", "codex_home": "~/bench-home", "profile_key": "profile-k"]])
+
+        XCTAssertEqual(fixture.candidate(in: fixture.run(dryRun)), "profile-b")
+    }
+
     func testAutoSwapSkipsLeasedAccount() throws {
         try AutoSwapPolicyStore(url: fixture.appSupport.appendingPathComponent("auto-swap-policy.json"))
             .save(AutoSwapPolicy(enabledSurfaces: [.cli]))

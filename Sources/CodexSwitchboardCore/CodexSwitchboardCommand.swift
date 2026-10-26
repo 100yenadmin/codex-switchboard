@@ -251,7 +251,7 @@ private final class CommandRunner {
             let planned = AutoSwapDecisionEngine.evaluate(
                 policy: policy,
                 surface: surface.autoSwapSurface,
-                accounts: accounts.map(\.autoSwapAccount),
+                accounts: autoSwapAccounts(accounts),
                 history: history
             )
             guard planned.decision == .wouldSwitch,
@@ -334,8 +334,15 @@ private final class CommandRunner {
         ))
     }
 
+    /// A reserved login's account belongs to its one consumer, so auto-swap never picks it: a switch
+    /// would spend that consumer's quota. A manual `switch` may still choose it.
+    private func autoSwapAccounts(_ accounts: [AccountPayload]) -> [AutoSwapAccount] {
+        let reserved = (try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL))?.profileKeys ?? []
+        return accounts.map { $0.autoSwapAccount(reserved: reserved.contains($0.profileKey)) }
+    }
+
     private func autoswapDecisions(policy: AutoSwapPolicy, scope: SurfaceScope) -> [AutoSwapDecision] {
-        let accounts = accountStore.accounts().map(\.autoSwapAccount)
+        let accounts = autoSwapAccounts(accountStore.accounts())
         let history = autoSwapAuditStore.load()
         return surfaceService.statuses(scope: scope).map { surface in
             AutoSwapDecisionEngine.evaluate(
@@ -1261,12 +1268,23 @@ private struct ReservedLogins {
     }
 }
 
-/// The homes the codex-logins registry reserves, for the app's own switch check. An unreadable
-/// registry reserves no home here; `holder.lock` still marks every home a holder has used.
-public enum CodexReservedLoginHomes {
-    public static func load(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String] {
-        let registryURL = homeURL.appendingPathComponent(".config/codex-logins/registry.json")
-        return (try? ReservedLogins.load(from: registryURL, homeURL: homeURL))?.homes ?? []
+/// The codex-logins registry, for the app's switch and auto-swap checks. An unreadable registry
+/// reserves nothing here: `holder.lock` still marks every home a holder has used, and a reserved
+/// account only shares its quota with a switch, not its token chain.
+public enum CodexReservedLogins {
+    public static func homes(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String] {
+        load(homeURL: homeURL)?.homes ?? []
+    }
+
+    public static func profileKeys(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> Set<String> {
+        load(homeURL: homeURL)?.profileKeys ?? []
+    }
+
+    private static func load(homeURL: URL) -> ReservedLogins? {
+        try? ReservedLogins.load(
+            from: homeURL.appendingPathComponent(".config/codex-logins/registry.json"),
+            homeURL: homeURL
+        )
     }
 }
 
@@ -2357,7 +2375,7 @@ private extension SurfaceStatusPayload {
 }
 
 private extension AccountPayload {
-    var autoSwapAccount: AutoSwapAccount {
+    func autoSwapAccount(reserved: Bool) -> AutoSwapAccount {
         AutoSwapAccount(
             profileKey: profileKey,
             sessionFreePercent: sessionFreePercent,
@@ -2366,7 +2384,7 @@ private extension AccountPayload {
             needsRelogin: needsRelogin,
             isFreePlan: isFreePlan,
             score: score,
-            isLeased: leased
+            isLeased: leased || reserved
         )
     }
 }

@@ -1080,7 +1080,7 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         }
         if let destination {
             let home = destination.deletingLastPathComponent()
-            if CodexReservedLoginHomes.load().contains(where: { CodexLease.sameHome($0, home.path) }) {
+            if CodexReservedLogins.homes().contains(where: { CodexLease.sameHome($0, home.path) }) {
                 throw CodexAccountSwitchError.destinationIsReservedHome
             }
             if !CodexFileProbe.isMissing(home.appendingPathComponent(CodexLeaseHome.holderLockFileName)) {
