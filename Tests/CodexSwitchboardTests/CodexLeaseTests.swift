@@ -273,6 +273,9 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(switched.json["error"] as? String, "lease_store_unreadable")
         XCTAssertEqual(leased.json["error"] as? String, "lease_store_unreadable")
         XCTAssertEqual(try Data(contentsOf: liveAuth), before)
+        let leasable = (fixture.run(["status", "--json"]).json["accounts"] as? [[String: Any]] ?? [])
+            .compactMap { $0["leasable"] as? Bool }
+        XCTAssertEqual(Set(leasable), [false])
     }
 
     func testLeaseWaitsForAnInFlightAppRefresh() throws {
@@ -435,6 +438,14 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(free.json["error"] as? String, "free_plan")
         let active = fixture.run(["swap-lease", "--home", home.path, "--profile-key", "profile-a", "--json"])
         XCTAssertEqual(active.json["error"] as? String, "active_account")
+
+        try CodexRefreshReservations(appSupportURL: fixture.appSupport).reserve(profileKey: "profile-b")
+        let refreshing = fixture.run(["swap-lease", "--home", home.path, "--json"])
+        XCTAssertEqual(refreshing.json["error"] as? String, "refresh_in_progress")
+        try CodexRefreshReservations(appSupportURL: fixture.appSupport).release(profileKey: "profile-b")
+
+        let malformed = fixture.run(["swap-lease", "--home", home.path, "--exclude-profile-key", "--json"])
+        XCTAssertEqual(malformed.exitCode, 64)
 
         let consumer = try fixture.startFakeCodex(codexHome: home)
         defer { consumer.terminate() }

@@ -441,11 +441,14 @@ private struct SwapLeaseOptions {
         let excluded = try parser.takeAllValues("--exclude-profile-key")
         let holder = parser.takeOptionalValue("--holder")?.trimmingCharacters(in: .whitespacesAndNewlines)
         try parser.finish()
-        if profileKey?.isEmpty == true {
+        if let profileKey, profileKey.isEmpty || profileKey.hasPrefix("--") {
             throw CLIError.usage("Missing value for --profile-key.", jsonPreferred: false)
         }
-        if let holder, holder.isEmpty || holder.count > 200 {
+        if let holder, holder.isEmpty || holder.count > 200 || holder.hasPrefix("--") {
             throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
+        }
+        if let profileKey, excluded.contains(profileKey) {
+            throw CLIError.usage("--profile-key \(profileKey) is also excluded.", jsonPreferred: false)
         }
         return SwapLeaseOptions(
             json: json,
@@ -635,7 +638,7 @@ private struct ArgumentParser {
     mutating func takeAllValues(_ flag: String) throws -> [String] {
         var values: [String] = []
         while let value = takeOptionalValue(flag) {
-            guard !value.isEmpty else {
+            guard !value.isEmpty, !value.hasPrefix("--") else {
                 throw CLIError.usage("Missing value for \(flag).", jsonPreferred: false)
             }
             values.append(value)
@@ -1381,11 +1384,14 @@ private final class CLILeaseService {
 
     /// Marks the accounts an agent could lease now: unleased, a known paid plan, usable quota, no
     /// re-login needed, and not the active account of any surface.
+    /// Nothing is leasable while the lease store cannot be read.
     func annotateLeasable(_ accounts: [AccountPayload]) -> [AccountPayload] {
+        let storeReadable = (try? paths.leaseStore.load()) != nil
         let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
         return accounts.map { account in
             var account = account
-            account.leasable = !account.leased
+            account.leasable = storeReadable
+                && !account.leased
                 && account.isKnownPaidPlan
                 && account.usableForCodex
                 && !account.needsRelogin
@@ -1453,6 +1459,14 @@ private final class CLILeaseService {
                 )
             }
             try ensureLeasableAccount(profileKey: targetKey)
+            if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
+                .isReserved(profileKey: targetKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
+                throw CLIError.refused(
+                    code: "refresh_in_progress",
+                    message: "Switchboard is refreshing the token of profile_key \(targetKey) right now; swap again in a few seconds.",
+                    details: nil
+                )
+            }
             try ensureAppMirrorsLeases()
 
             let returned = try returnLease(profileKey: current.profileKey, home: current.home)
