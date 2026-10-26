@@ -820,9 +820,62 @@ final class CodexLeaseTests: XCTestCase {
         let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
 
         XCTAssertEqual(returned.json["error"] as? String, "home_auth_missing", returned.text)
-        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+        let kept = try CodexLeaseStore(appSupportURL: fixture.appSupport).load()
+        XCTAssertEqual(kept.map(\.profileKey), ["profile-k"])
+        XCTAssertEqual(kept.first?.state, .returning)
         let status = fixture.run(["status", "--json"])
         XCTAssertEqual(fixture.account("profile-k", in: status.json)?["leasable"] as? Bool, false)
+
+        // A store emptied of its tokens, for example by a holder that moved to a keychain store, is no better.
+        try CodexAtomicFile.writeJSON(["auth_mode": "chatgpt", "tokens": [String: Any]()], to: home.appendingPathComponent("auth.json"))
+        let emptied = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(emptied.json["error"] as? String, "home_auth_missing", emptied.text)
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().first?.state, .returning)
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-1")
+    }
+
+    func testReturnOfALeaseThatStoppedWhileLeasing() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let homeAuth = home.appendingPathComponent("auth.json")
+        let store = CodexLeaseStore(appSupportURL: fixture.appSupport)
+        func killedWhileLeasing() throws {
+            try store.save(try store.load().map { lease in
+                var lease = lease
+                lease.state = .leasing
+                lease.authWritten = false
+                return lease
+            })
+        }
+
+        // Killed after the journal entry, before auth.json: the chain was never lent.
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        try killedWhileLeasing()
+        try FileManager.default.removeItem(at: homeAuth)
+        XCTAssertEqual(fixture.run(["leases", "--json"]).json["leases"].flatMap { ($0 as? [[String: Any]])?.first?["state"] } as? String, "leasing")
+        let status = fixture.run(["status", "--json"])
+        XCTAssertEqual(fixture.account("profile-k", in: status.json)?["leased"] as? Bool, true)
+        XCTAssertEqual(fixture.account("profile-k", in: status.json)?["leasable"] as? Bool, false)
+        let nothingLent = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(nothingLent.exitCode, 0, nothingLent.text)
+        XCTAssertEqual(nothingLent.json["sync"] as? String, "home_auth_missing")
+        XCTAssertEqual(try store.load(), [])
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-1")
+
+        // Killed after auth.json, before the flip to active: the home holds the chain, so return copies it.
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        try killedWhileLeasing()
+        try fixture.writeAuth(account: "k", generation: 2, to: homeAuth)
+        let copied = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(copied.exitCode, 0, copied.text)
+        XCTAssertEqual(copied.json["sync"] as? String, "rotated")
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
+        XCTAssertEqual(fixture.accountListRefreshToken("profile-k"), "refresh-k-2")
     }
 
     func testReturnAfterACrashMidReturnFinishesFromTheHome() throws {

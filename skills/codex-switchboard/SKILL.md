@@ -99,7 +99,7 @@ A lease lends one account's captured auth to a separate `CODEX_HOME`, so an auto
 
 Lease commands name an account by an opaque **handle**, `acct_` plus 12 hex digits, never by email or profile key. `--profile-key` accepts a handle or a profile key.
 
-1. See which accounts you can lease. Every account listed is unleased, not reserved, on a known paid plan, with usable quota, no re-login needed, and not the active account of any surface:
+1. See which accounts you can lease. Every account listed is unleased, not registry-reserved, on a known paid plan, with usable quota, no re-login needed, not the active account of the CLI or Desktop surface, and not being refreshed by the app right now (`lease` refuses `refresh_in_progress` meanwhile):
 
 ```bash
 codex-switchboard status --json --leasable-only \
@@ -117,9 +117,11 @@ codex-switchboard lease --profile-key "$HANDLE" --home "$LANE_HOME" --holder "$L
   | jq '{handle, lease_id, home, holder, leased_at, auth_written, config_written}'
 ```
 
-The lease writes, in this order: `$LANE_HOME/lease.json` (the lease id, the holder and the time; no account), the lease journal entry, `$LANE_HOME/config.toml` when the home has none, then `auth.json` (mode `0600`). The `config.toml` keeps Codex on the file store (`cli_auth_credentials_store = "file"`) and points `CODEX_HOME` for commands Codex runs at a path that does not exist, so a nested `codex` cannot share the home's token. An existing `config.toml` is kept as it is (`config_written: false`).
+`lease` takes `$LANE_HOME/holder.lock` and writes only into a directory that is new, or whose `auth.json` is absent or a return's tombstone, never into a registry, CLI or Desktop home. It writes, in this order: `$LANE_HOME/lease.json` (the lease id, the holder and the time; no account), the lease journal entry as `leasing`, `$LANE_HOME/config.toml` when the home has none, then `auth.json` (mode `0600`), and then marks the lease `active`. The `config.toml` keeps Codex on the file store (`cli_auth_credentials_store = "file"`) and points `CODEX_HOME` for commands Codex runs at a path that does not exist, so a nested `codex` cannot share the home's token. An existing `config.toml` is kept as it is (`config_written: false`).
 
 3. Run the lane with `CODEX_HOME="$LANE_HOME"`. Do not run `codex-switchboard` itself with `CODEX_HOME` pointing at the lease home.
+
+   Run one Codex per lease home: the command is the native Codex binary, or a shell that `exec`s its only Codex as its last command. Two Codex processes need two leases on two homes. Switchboard cannot enforce this for processes a shell starts side by side; it is a rule for whoever writes the lane.
 
    A holder process takes `flock(LOCK_EX | LOCK_NB)` on `$LANE_HOME/holder.lock` before its first token read and keeps it for its whole lifetime. A holder that refreshes the token itself, instead of Codex, also takes `flock(LOCK_EX)` on `$LANE_HOME/auth.json.lock` around each read, refresh and write-back of `auth.json`, re-reads the file each time, and replaces it atomically. Use `flock` only, never `lockf` or `fcntl` locks, and never delete either lock file.
 
@@ -132,7 +134,7 @@ codex-switchboard leases --json \
   | jq '[.leases[] | {handle, lease_id, state, holder, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
 ```
 
-`state` is `active`, or `returning` after a return that stopped partway; a returning lease still counts as leased. `holder_running: true` means a process holds `holder.lock`. `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
+`state` is `leasing` until the home's `auth.json` is written, then `active`, and `returning` once a return starts, until it finishes; every state counts as leased. `holder_running: true` means a process holds `holder.lock`. `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
 
 5. When the lane's account runs low, swap it between runs, after every process in the home has exited. Only the lease's holder swaps it, because the lane's run records name the account each run used: pass your own holder name, never one copied from `leases`:
 
@@ -150,9 +152,9 @@ codex-switchboard return --profile-key "$HANDLE" --home "$LANE_HOME" --json \
   | jq '{handle, lease_id, holder, sync, home_auth_tombstoned}'
 ```
 
-Return re-reads the home under both locks, writes its token into the stored profile, then replaces `auth.json` with a tombstone (`{"switchboard_returned": {"lease_id", "returned_at"}}`, no token) and removes the journal entry. `sync` is `rotated` when the home held a newer token, `unchanged` when it did not, `home_returned` when an earlier, interrupted return had already written this lease's tombstone, or `home_auth_missing` when the lease stopped before its `auth.json` was written. A tombstoned home can take a new lease.
+Return re-reads the home under both locks, writes its token into the stored profile, then replaces `auth.json` with a tombstone (`{"switchboard_returned": {"lease_id", "returned_at"}}`, no token) and removes the journal entry. `sync` is `rotated` when the home held a newer token, `unchanged` when it did not, `home_returned` when an earlier, interrupted return had already written this lease's tombstone, or `home_auth_missing` when the lease stopped while `leasing`, so it lent nothing. A tombstoned home can take a new lease.
 
-Return is also the recovery path. After a crash, a kill or any refusal that leaves a lease `returning`, fix the cause and run `return` again; it always starts from a fresh read of the home.
+Return is also the recovery path. After a crash, a kill or any refusal that leaves a lease `returning`, fix the cause and run `return` again; it always starts from a fresh read of the home. One window it cannot cover: a Codex lane or the app killed between sending a refresh token and writing the new one back leaves a spent chain, which shows up only at the next refresh.
 
 Refusals exit with status 2 and a JSON `error` code. Report the code; never work around it by editing auth files, lock files or the journal:
 
@@ -160,7 +162,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 |---------|---------|
 | `active_account` | The account is the active CLI or Desktop account. Pick another. |
 | `surface_identity_unknown` | A surface keeps its sign-in in a keychain or auto store, so Switchboard cannot tell which account it uses. Nothing is leased until it can. |
-| `reserved_account`, `home_reserved` | The codex-logins registry reserves the account, or the home is a reserved login's home. |
+| `reserved_account`, `home_reserved` | The account is registry-reserved, or the home is a registry-reserved login's home. |
 | `reserved_registry_unreadable`, `reserved_registry_stale` | The codex-logins registry cannot be read, lists a login without a `profile_key`, or reserves a key Switchboard no longer lists. Nothing is leased until it is fixed. |
 | `stored_copies_disagree` | Switchboard's two stored copies of the account hold different tokens, so the one a lease would copy may be spent. Open the Switchboard app so it settles them, then lease again. |
 | `home_quarantined` | The home holds `auth.json.stopped`. Nothing was synced, written or removed; its owner diagnoses the home. |
@@ -173,7 +175,8 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `already_leased`, `home_already_leased` | The account, or the home, already has a lease (active or returning). |
 | `not_leased`, `home_mismatch` | `return`: the account has no lease, or its lease is at another home. |
 | `lease_id_mismatch`, `lease_marker_unreadable` | The home's `lease.json` names another lease, or cannot be read. Nothing changed; the home is not this lease's. |
-| `home_auth_missing` | `return`: the lent `auth.json` is gone, or holds an earlier lease's tombstone, so the latest token may be somewhere Switchboard cannot see. The lease stays. |
+| `home_auth_missing` | `return`: the lent `auth.json` is gone, holds no token, or holds an earlier lease's tombstone, so the latest token may be somewhere Switchboard cannot see. The lease stays `returning` and the account unleasable. |
+| `lease_incomplete` | `lease` wrote `auth.json` but could not mark the lease `active`. Do not use the home; run `return` for it. |
 | `home_auth_unreadable`, `home_holds_other_account`, `stored_profile_missing` | `return`: the home cannot be read as Codex auth, now holds another account, or the stored profile is gone. Nothing was removed; the lease stays `returning`. |
 | `free_plan`, `plan_unknown`, `needs_relogin`, `unknown_profile` | The account cannot be leased. |
 | `home_holds_other_login` | The home already holds a sign-in (for example its own device-code login). Use another home. |

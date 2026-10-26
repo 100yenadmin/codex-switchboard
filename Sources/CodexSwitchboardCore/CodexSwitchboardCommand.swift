@@ -1377,6 +1377,7 @@ private final class CLILeaseService {
                         home: home,
                         holder: holder,
                         profileDirectory: profile.profileURL.lastPathComponent,
+                        state: alreadyHeld ? .active : .leasing,
                         authWritten: alreadyHeld
                     )
                     // The marker first, then the journal, then config.toml, then auth.json: a crash at any
@@ -1397,9 +1398,18 @@ private final class CLILeaseService {
                         throw error
                     }
                     if !alreadyHeld {
+                        lease.state = .active
                         lease.authWritten = true
-                        // Best effort: return reads the home whatever this flag says.
-                        try? paths.leaseStore.save(leases + [lease])
+                        do {
+                            try paths.leaseStore.save(leases + [lease])
+                        } catch {
+                            // The home holds the chain while the journal still says leasing, so a holder that
+                            // later empties the home would make return drop the chain. Return it before use.
+                            throw refused(
+                                "lease_incomplete",
+                                "\(handle)'s auth was written to \(home), but the lease could not be marked active: \(error.localizedDescription) Do not use the home; run return for it."
+                            )
+                        }
                     }
                     return LeasePayload(
                         generatedAt: Date(),
@@ -1449,41 +1459,47 @@ private final class CLILeaseService {
     private func finishReturn(_ original: CodexLease, leases: [CodexLease]) throws -> LeaseReturnPayload {
         var lease = original
         let handle = CodexAccountHandle.handle(for: lease.profileKey)
+        // From here until the entry is removed the lease is returning, which every reader treats as
+        // leased. A return that stops on any refusal below is redone from a fresh read of the home.
+        if lease.state != .returning {
+            lease.state = .returning
+            try paths.leaseStore.save(leases.map { $0.leaseID == lease.leaseID ? lease : $0 })
+        }
         if CodexLeaseHome.isQuarantined(home: lease.home) {
             throw quarantined(lease.home)
         }
 
         let outcome: CodexLeaseSyncOutcome
-        if CodexFileProbe.isMissing(lease.authURL) {
-            // A keychain store, or a holder that deleted the file, can hold the chain elsewhere.
-            guard !lease.authWritten else {
-                throw refused(
-                    "home_auth_missing",
-                    "\(lease.authURL.path) is gone, so the home's latest token may be somewhere Switchboard cannot see. Nothing was changed; the lease stays."
-                )
-            }
-            outcome = .homeAuthMissing
-        } else if let tombstone = CodexLeaseTombstone.leaseID(at: lease.authURL) {
+        if let tombstone = CodexLeaseTombstone.leaseID(at: lease.authURL) {
             guard tombstone == lease.leaseID || !lease.authWritten else {
                 throw refused(
                     "home_auth_missing",
-                    "\(lease.authURL.path) holds an earlier lease's tombstone, so this lease's token is not there. Nothing was changed; the lease stays."
+                    "\(lease.authURL.path) holds an earlier lease's tombstone, so this lease's token is not there. Nothing was changed; the lease stays returning."
                 )
             }
             outcome = .homeReturned
-        } else {
-            // From here until the entry is removed, a crash leaves the lease returning; the next return
-            // redoes it from the read of the home.
-            if lease.state != .returning {
-                lease.state = .returning
-                try paths.leaseStore.save(leases.map { $0.leaseID == lease.leaseID ? lease : $0 })
+        } else if CodexFileProbe.isMissing(lease.authURL) || CodexLeaseHome.holdsNoTokens(authURL: lease.authURL) {
+            // A lease that never left leasing lent nothing, so there is nothing to copy. Any other lease's
+            // chain is now somewhere Switchboard cannot see, such as a keychain store.
+            guard !lease.authWritten else {
+                throw refused(
+                    "home_auth_missing",
+                    "\(lease.authURL.path) is gone or holds no token, so the home's latest token may be somewhere Switchboard cannot see. Nothing was changed; the lease stays returning and the account stays unleasable."
+                )
             }
+            outcome = .homeAuthMissing
+        } else {
             let synced = try CodexLeaseSync.syncHome(lease, appSupportURL: paths.appSupportURL)
             switch synced {
             case .rotated, .unchanged:
                 try CodexLeaseTombstone.write(leaseID: lease.leaseID, to: lease.authURL)
-            case .homeReturned, .homeAuthMissing:
+            case .homeReturned:
                 break
+            case .homeAuthMissing:
+                throw refused(
+                    "home_auth_missing",
+                    "\(lease.authURL.path) disappeared during the return. Nothing was changed; the lease stays returning."
+                )
             case .homeQuarantined:
                 throw quarantined(lease.home)
             case .identityMismatch:
@@ -1499,7 +1515,7 @@ private final class CLILeaseService {
             case .storedProfileMissing:
                 throw refused(
                     "stored_profile_missing",
-                    "The captured profile for \(handle) is gone, so the lease home holds the only copy. Nothing was removed."
+                    "The captured profile for \(handle) is gone, so the lease home holds the only copy. Nothing was removed; the lease stays returning."
                 )
             }
             outcome = synced

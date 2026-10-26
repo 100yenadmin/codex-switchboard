@@ -9,7 +9,11 @@ import Foundation
 public struct CodexLease: Codable, Equatable {
     /// `returning` is still a lease to every reader: the account stays out of switch, auto-swap,
     /// refresh and leasing until the return re-reads the home and the entry is removed.
+    /// Every state counts as leased. `leasing` lasts until the home's `auth.json` is durable; a return
+    /// of a lease that never left `leasing` has nothing to copy, which `authWritten` remembers through
+    /// `returning`.
     public enum State: String, Codable {
+        case leasing
         case active
         case returning
     }
@@ -282,6 +286,18 @@ public enum CodexLeaseHome {
 
     public static func isQuarantined(home: String) -> Bool {
         FileManager.default.fileExists(atPath: stoppedSentinelURL(home: home).path)
+    }
+
+    /// True for a file that parses as JSON but holds no refresh token and is not a return's tombstone,
+    /// such as a store emptied by a holder that moved its sign-in elsewhere.
+    public static func holdsNoTokens(authURL: URL) -> Bool {
+        guard let data = try? Data(contentsOf: authURL),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              root[CodexLeaseTombstone.key] == nil else {
+            return false
+        }
+        let refreshToken = (root["tokens"] as? [String: Any])?["refresh_token"] as? String
+        return refreshToken?.isEmpty ?? true
     }
 
     public static func quarantinedSince(home: String) -> Date? {
