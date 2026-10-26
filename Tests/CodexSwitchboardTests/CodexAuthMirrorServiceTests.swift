@@ -182,6 +182,26 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: record), Data("{not json".utf8))
     }
 
+    func testARefreshWithoutTheCrossProcessLockSkipsAnotherHome() throws {
+        // A directory where the lock file should be: the app's best-effort hold then runs without the file lock,
+        // and a record written there could lose the CLI's concurrent update.
+        let root = try temporaryDirectory()
+        let appSupport = root.appendingPathComponent("app-support", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: appSupport.appendingPathComponent(CodexAuthStoreLock.fileName, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let defaultHome = root.appendingPathComponent(".codex", isDirectory: true).path
+        let defaultAuth = URL(fileURLWithPath: defaultHome).appendingPathComponent("auth.json")
+        let otherAuth = root.appendingPathComponent("other-home/auth.json")
+
+        let kept = CodexAuthStoreLock.withLock(appSupportURL: appSupport) {
+            ActiveCodexAuthStore.recordingSwitchHomes([defaultAuth, otherAuth], appSupportURL: appSupport, defaultHome: defaultHome)
+        }
+        XCTAssertEqual(kept, [defaultAuth])
+        XCTAssertEqual(CodexSwitchHomes.load(appSupportURL: appSupport), [])
+    }
+
     private func temporaryDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
