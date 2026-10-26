@@ -2,10 +2,34 @@ import Foundation
 
 enum AppStorage {
     private static let fileManager = FileManager.default
+    private static let defaultNamespace = "CodexSwitchboard"
+
+    static var storageNamespace: String {
+        let environmentValue = ProcessInfo.processInfo.environment[
+            "CODEX_SWITCHBOARD_STORAGE_NAMESPACE"
+        ]
+        let bundleValue = Bundle.main.object(
+            forInfoDictionaryKey: "CodexSwitchboardStorageNamespace"
+        ) as? String
+        return normalizedStorageNamespace(environmentValue ?? bundleValue)
+    }
+
+    static func normalizedStorageNamespace(_ value: String?) -> String {
+        guard let value else { return defaultNamespace }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed != ".",
+              trimmed != "..",
+              !trimmed.contains("/"),
+              !trimmed.contains(":") else {
+            return defaultNamespace
+        }
+        return trimmed
+    }
 
     static var rootURL: URL {
         let url = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("CodexSwitchboard", isDirectory: true)
+            .appendingPathComponent(storageNamespace, isDirectory: true)
         try? ensureDirectory(url, permissions: 0o700)
         return url
     }
@@ -57,6 +81,10 @@ enum AppStorage {
 struct AccountProfileCollection {
     var profiles: [String: [String: Any]]
     var orderedKeys: [String]
+}
+
+enum AccountProfileTokenUpdateError: Error {
+    case profileChanged
 }
 
 enum AccountProfileStore {
@@ -122,11 +150,21 @@ enum AccountProfileStore {
         accessToken: String,
         refreshToken: String,
         idToken: String?,
-        expiresAt: Int
+        expiresAt: Int,
+        expectedRefreshToken: String? = nil
     ) throws {
         var root = accountsRoot()
         var profiles = root["profiles"] as? [String: Any] ?? [:]
-        var entry = profiles[profileKey] as? [String: Any] ?? [:]
+        guard var entry = profiles[profileKey] as? [String: Any] else {
+            if expectedRefreshToken != nil {
+                throw AccountProfileTokenUpdateError.profileChanged
+            }
+            return
+        }
+        if let expectedRefreshToken,
+           entry["refresh"] as? String != expectedRefreshToken {
+            throw AccountProfileTokenUpdateError.profileChanged
+        }
 
         entry["access"] = accessToken
         entry["refresh"] = refreshToken
@@ -148,14 +186,26 @@ enum AccountProfileStore {
 
     static func remove(profileKeys: Set<String>) throws {
         guard !profileKeys.isEmpty else { return }
-        var root = accountsRoot()
-        var profiles = root["profiles"] as? [String: Any] ?? [:]
-        for key in profileKeys {
-            profiles.removeValue(forKey: key)
-            removeProfileKey(in: &root, key: key)
+        try CodexAuthFileLock.withLock {
+            var root = accountsRoot()
+            var profiles = root["profiles"] as? [String: Any] ?? [:]
+            for key in profileKeys {
+                profiles.removeValue(forKey: key)
+                removeProfileKey(in: &root, key: key)
+            }
+            root["profiles"] = profiles
+            try AppStorage.writeJSON(root, to: AppStorage.accountsURL, permissions: 0o600)
         }
-        root["profiles"] = profiles
-        try AppStorage.writeJSON(root, to: AppStorage.accountsURL, permissions: 0o600)
+    }
+
+    static func canUpdateTokens(
+        profileKey: String,
+        expectedRefreshToken: String
+    ) -> Bool {
+        let root = accountsRoot()
+        let profiles = root["profiles"] as? [String: Any]
+        let entry = profiles?[profileKey] as? [String: Any]
+        return entry?["refresh"] as? String == expectedRefreshToken
     }
 
     private static func loadLocal() -> AccountProfileCollection? {

@@ -8,12 +8,28 @@ private let statusBarSymbolName = "chart.bar.fill"
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
-    private let viewModel = UsageViewModel()
+    private let viewModel: UsageViewModel
     private let authMirrorService = CodexAuthMirrorService()
     private var eventMonitor: Any?
     private var cancellables = Set<AnyCancellable>()
+    private let fixtureSnapshotOnly: Bool
+    private var fixtureWindow: NSWindow?
+
+    override init() {
+        let fixtureSnapshotOnly = CommandLine.arguments.contains(
+            "--fixture-snapshot-only"
+        )
+        self.fixtureSnapshotOnly = fixtureSnapshotOnly
+        self.viewModel = UsageViewModel(skipCodexSurfaces: fixtureSnapshotOnly)
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if fixtureSnapshotOnly {
+            setupFixtureWindow()
+            return
+        }
+
         authMirrorService.start()
         setupStatusItem()
         setupPopover()
@@ -95,6 +111,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func setupFixtureWindow() {
+        let size = preferredContentSize(for: viewModel.informationMode)
+        let controller = NSHostingController(rootView: ContentView(viewModel: viewModel))
+        controller.preferredContentSize = size
+
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Codex Switchboard Fork RC Fixture"
+        window.contentViewController = controller
+        window.setContentSize(size)
+        window.orderFrontRegardless()
+        fixtureWindow = window
+
+        viewModel.$informationMode
+            .removeDuplicates()
+            .sink { [weak window, weak controller] mode in
+                let nextSize = Self.preferredContentSize(for: mode)
+                controller?.preferredContentSize = nextSize
+                window?.setContentSize(nextSize)
+            }
+            .store(in: &cancellables)
+    }
+
     private func removeEventMonitor() {
         if let m = eventMonitor { NSEvent.removeMonitor(m); eventMonitor = nil }
     }
@@ -104,6 +147,7 @@ MainActor.assumeIsolated {
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate
-    app.setActivationPolicy(.accessory)   // hide from Dock
+    let fixtureSnapshotOnly = CommandLine.arguments.contains("--fixture-snapshot-only")
+    app.setActivationPolicy(fixtureSnapshotOnly ? .regular : .accessory)
     app.run()
 }

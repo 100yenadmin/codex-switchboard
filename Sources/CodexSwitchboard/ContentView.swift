@@ -282,6 +282,11 @@ struct HeaderView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(
+                vm.informationMode == .complete
+                    ? "Compact account details"
+                    : "Expand account details"
+            )
             .help(vm.informationMode == .complete ? "Compact view" : "Expand view")
 
             Button {

@@ -6,6 +6,7 @@
 #   DISPLAY_NAME  Finder / Spotlight name.
 #   BUNDLE_ID     CFBundleIdentifier.
 #   VERSION       CFBundleShortVersionString and CFBundleVersion.
+#   STORAGE_NAMESPACE  Application Support directory name.
 #   INSTALL_APPS  If 1, copies the generated app to /Applications.
 #
 # Usage:
@@ -23,6 +24,7 @@ PRODUCT_NAME="${PRODUCT_NAME:-CodexSwitchboard}"
 DISPLAY_NAME="${DISPLAY_NAME:-Codex Switchboard}"
 BUNDLE_ID="${BUNDLE_ID:-app.codexswitchboard.menubar}"
 VERSION="${VERSION:-1.0.10}"
+STORAGE_NAMESPACE="${STORAGE_NAMESPACE:-CodexSwitchboard}"
 INSTALL_APPS="${INSTALL_APPS:-0}"
 
 ICNS="${ROOT}/Support/AppIcon.icns"
@@ -56,6 +58,7 @@ PLIST="${OUT}/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$PLIST"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :CodexSwitchboardStorageNamespace ${STORAGE_NAMESPACE}" "$PLIST"
 
 if command -v codesign &>/dev/null; then
 	codesign --force --deep --sign - "$OUT" 2>/dev/null || true

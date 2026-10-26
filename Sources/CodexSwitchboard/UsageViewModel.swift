@@ -61,7 +61,7 @@ final class UsageViewModel: ObservableObject {
 
     // MARK: - Init
 
-    init() {
+    init(skipCodexSurfaces: Bool = false) {
         if UserDefaults.standard.object(forKey: "groupByWorkspace") != nil {
             groupByWorkspace = UserDefaults.standard.bool(forKey: "groupByWorkspace")
         }
@@ -83,7 +83,9 @@ final class UsageViewModel: ObservableObject {
         }
         autoSwapPolicy = autoSwapPolicyStore.load()
         codexLoginStatus = CodexLoginStatusStore.load()
-        refreshCodexAvailability()
+        if !skipCodexSurfaces {
+            refreshCodexAvailability()
+        }
     }
 
     // MARK: - Derived Lists
@@ -103,15 +105,15 @@ final class UsageViewModel: ObservableObject {
 
     /// Smart score for default ordering of active rows.
     static func smartScore(_ a: Account) -> Double {
-        min(a.sessionFree, a.weeklyFree)
+        a.quotaScore
     }
 
     /// Urgency for priority ordering.
     static func expiringScore(_ a: Account) -> Double {
-        let w = a.weeklyFree
+        let w = a.weeklyQuotaWindow?.freePercent ?? a.quotaScore
         let h = min(max(0, a.hoursUntilWeeklyReset), 168)
         let urgencyMultiplier = 1 + (168 - h) / 168 * 2
-        let sessionHealthFactor = min(a.sessionFree / 30, 1.0)
+        let sessionHealthFactor = min(a.quotaScore / 30, 1.0)
         return w * urgencyMultiplier * sessionHealthFactor
     }
 
