@@ -271,7 +271,7 @@ final class UsageServiceIntegrationTests: XCTestCase {
             tokenUpdate: TokenUpdateRecorder(),
             tokenUpdater: { _, _, _, _, _, _, _, _ in events.record("store") },
             refreshGate: UsageService.RefreshGate(
-                reserve: { _ in
+                reserve: { _, _ in
                     events.record("reserve")
                     return .granted
                 },
@@ -370,7 +370,7 @@ final class UsageServiceIntegrationTests: XCTestCase {
                 )
             },
             refreshGate: refreshGate ?? UsageService.RefreshGate(
-                reserve: { profileKey in
+                reserve: { profileKey, _ in
                     guard let leasedProfileKeys else { return .leaseStoreUnreadable }
                     return leasedProfileKeys.contains(profileKey) ? .leased : .granted
                 },

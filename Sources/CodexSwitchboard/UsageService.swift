@@ -100,13 +100,16 @@ final class UsageService: @unchecked Sendable {
             case granted
             case leased
             case leaseStoreUnreadable
+            /// The stored token is no longer the one the usage poll loaded: a lease or another writer
+            /// moved the chain on, so that token may already be spent. The next poll uses the new one.
+            case stale
         }
 
-        let reserve: (_ profileKey: String) -> Decision
+        let reserve: (_ profileKey: String, _ expectedRefreshToken: String) -> Decision
         let release: (_ profileKey: String) -> Void
 
         static let live = RefreshGate(
-            reserve: { profileKey in
+            reserve: { profileKey, expectedRefreshToken in
                 CodexAuthFileLock.withLock {
                     guard let leased = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
                         .leasedProfileKeys() else {
@@ -114,6 +117,13 @@ final class UsageService: @unchecked Sendable {
                     }
                     if leased.contains(profileKey) {
                         return .leased
+                    }
+                    // Read under the same lock that admits the grant, so the token sent is the head.
+                    guard AccountProfileStore.canUpdateTokens(
+                        profileKey: profileKey,
+                        expectedRefreshToken: expectedRefreshToken
+                    ) else {
+                        return .stale
                     }
                     do {
                         try CodexRefreshReservations(appSupportURL: AppStorage.rootURL)
@@ -194,9 +204,11 @@ final class UsageService: @unchecked Sendable {
             guard accessTokenMissing || Self.shouldAttemptTokenRefresh(usage) else { continue }
             // A leased account's refresh token belongs to its lease home. Spending it here
             // would log that home out, so the mirror brings its rotations back instead.
-            switch refreshGate.reserve(key) {
+            switch refreshGate.reserve(key, profile["refresh"] as? String ?? "") {
             case .granted:
                 break
+            case .stale:
+                continue
             case .leased:
                 usages[key] = ["error": Self.leasedRefreshDeferredError]
                 continue
