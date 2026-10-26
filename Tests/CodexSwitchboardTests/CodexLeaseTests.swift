@@ -325,11 +325,19 @@ final class CodexLeaseTests: XCTestCase {
     func testOnlyOneAppHoldsARefreshGrantAtATime() throws {
         let reservations = CodexRefreshReservations(appSupportURL: fixture.appSupport)
         let old = Date().addingTimeInterval(-CodexRefreshReservations.maxAge - 1)
-        // launchd is always running, so its reservation holds however old it is.
-        try reservations.reserve(profileKey: "profile-k", pid: 1, now: old)
+        // Another app still running holds its reservation past maxAge, until no grant could still be in flight.
+        let otherApp = Process()
+        otherApp.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        otherApp.arguments = ["30"]
+        try otherApp.run()
+        defer { otherApp.terminate() }
+        try reservations.reserve(profileKey: "profile-k", pid: otherApp.processIdentifier, now: old)
         XCTAssertThrowsError(try reservations.reserve(profileKey: "profile-k")) { error in
             XCTAssertTrue(error is CodexRefreshReservations.HeldElsewhere)
         }
+        let longAgo = Date().addingTimeInterval(-CodexRefreshReservations.maxHoldWhileRunning - 1)
+        try reservations.reserve(profileKey: "profile-k", pid: otherApp.processIdentifier, now: longAgo)
+        XCTAssertNoThrow(try reservations.reserve(profileKey: "profile-k"))
 
         let exited = Process()
         exited.executableURL = URL(fileURLWithPath: "/usr/bin/true")
@@ -478,8 +486,11 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(active.json["error"] as? String, "active_account")
 
         try CodexRefreshReservations(appSupportURL: fixture.appSupport).reserve(profileKey: "profile-b")
-        let refreshing = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
+        let refreshing = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--profile-key", "profile-b", "--json"])
         XCTAssertEqual(refreshing.json["error"] as? String, "refresh_in_progress")
+        // Without a choice, the account being refreshed is not a candidate at all.
+        let unchosen = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(unchosen.json["error"] as? String, "no_candidate")
         try CodexRefreshReservations(appSupportURL: fixture.appSupport).release(profileKey: "profile-b")
 
         let malformed = fixture.run(["swap-lease", "--home", home.path, "--exclude-profile-key", "--holder", "bench", "--json"])
@@ -1193,6 +1204,40 @@ final class CodexLeaseTests: XCTestCase {
         try fixture.writeAuth(account: "a", generation: 3, to: liveAuth)
         XCTAssertEqual(mirror.syncActiveAuth().status, .synced)
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("a")), "refresh-a-3")
+
+        // The app stored generation 4 in the account list only: live auth and the captured copy both
+        // still hold generation 3, and neither may overwrite the list.
+        let accountsURL = fixture.appSupport.appendingPathComponent("accounts.json")
+        var root = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: accountsURL)) as? [String: Any])
+        var profiles = try XCTUnwrap(root["profiles"] as? [String: Any])
+        var entry = try XCTUnwrap(profiles["profile-a"] as? [String: Any])
+        entry["refresh"] = "refresh-a-4"
+        entry["expires"] = (1_800_000_000 + 4) * 1000
+        profiles["profile-a"] = entry
+        root["profiles"] = profiles
+        try CodexAtomicFile.writeJSON(root, to: accountsURL)
+        XCTAssertEqual(mirror.syncActiveAuth().reason, "live auth is older than the stored copy")
+        XCTAssertEqual(fixture.accountListRefreshToken("profile-a"), "refresh-a-4")
+    }
+
+    func testLeaseChecksTheNestedCodexHomeValue() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let configURL = home.appendingPathComponent("config.toml")
+        for unsafe in [
+            "set = { CODEX_HOME_OTHER = \"/var/empty/x\" }",
+            "set = { CODEX_HOME = \"\(home.path)\" }",
+            "set = { CODEX_HOME = \"\(fixture.root.path)\" }",
+        ] {
+            try "cli_auth_credentials_store = \"file\"\n\n[shell_environment_policy]\n\(unsafe)\n"
+                .write(to: configURL, atomically: true, encoding: .utf8)
+            let lease = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+            XCTAssertEqual(lease.json["error"] as? String, "home_config_unsafe", unsafe)
+        }
+        try "cli_auth_credentials_store = \"file\"\n\n[shell_environment_policy.set]\nCODEX_HOME = \"/var/empty/nested\"\n"
+            .write(to: configURL, atomically: true, encoding: .utf8)
+        let lease = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.exitCode, 0, lease.text)
     }
 
     func testHelpListsLeaseCommands() {

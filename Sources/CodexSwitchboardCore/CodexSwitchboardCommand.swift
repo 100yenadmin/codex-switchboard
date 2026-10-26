@@ -691,7 +691,8 @@ private struct ArgumentParser {
 
     func finish() throws {
         guard args.isEmpty else {
-            throw CLIError.usage("Unexpected arguments: \(args.map(\.value).joined(separator: " "))", jsonPreferred: false)
+            // Never echoed: a stray value can be a profile key, which embeds an email.
+            throw CLIError.usage("\(args.count) unexpected argument(s); each option takes its value right after it.", jsonPreferred: false)
         }
     }
 }
@@ -1632,6 +1633,7 @@ private final class CLILeaseService {
                 _ = try ensureCanLend(profileKey: targetKey, into: current.home)
                 throw refused("not_usable", "\(targetHandle) cannot be leased now: it has no usable quota left.")
             }
+            try ensureLeaseHomeAllowed(current.home)
             _ = try ensureCanLend(profileKey: targetKey, into: current.home)
             _ = try leaseConfigText(
                 at: URL(fileURLWithPath: current.home).appendingPathComponent("config.toml"),
@@ -1885,7 +1887,7 @@ private final class CLILeaseService {
         guard others.isEmpty else {
             throw refused(
                 "duplicate_account_keys",
-                "Switchboard lists \(CodexAccountHandle.handle(for: profileKey))'s seat under more than one key. Remove the extra entry in the Switchboard app, then lease."
+                "Switchboard lists \(CodexAccountHandle.handle(for: profileKey))'s seat under more than one key. Remove the account in the Switchboard app, which removes every key of the seat, sign in to it again, then lease."
             )
         }
     }

@@ -581,17 +581,9 @@ final class CodexAccountCaptureService: @unchecked Sendable {
         try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
     }
 
+    /// Durable and atomic, so a sign-in killed mid-write keeps the old file or the new one.
     private func writeJSONObject(_ object: Any, to url: URL, permissions: Int) throws {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        let tempURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: tempURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: tempURL.path)
-        if fileManager.fileExists(atPath: url.path) {
-            try fileManager.removeItem(at: url)
-        }
-        try fileManager.moveItem(at: tempURL, to: url)
+        try CodexAtomicFile.writeJSON(object, to: url, permissions: permissions)
     }
 
     private func randomURLSafeString(byteCount: Int) throws -> String {
@@ -892,15 +884,7 @@ final class LocalAccountRemovalService: @unchecked Sendable {
     }
 
     private func writeJSONObject(_ object: Any, to url: URL, permissions: Int) throws {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        let tempURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: tempURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: tempURL.path)
-        if fileManager.fileExists(atPath: url.path) {
-            try fileManager.removeItem(at: url)
-        }
-        try fileManager.moveItem(at: tempURL, to: url)
+        try CodexAtomicFile.writeJSON(object, to: url, permissions: permissions)
     }
 }
 
@@ -1002,7 +986,7 @@ final class CodexAccountSwitchService: @unchecked Sendable {
             throw CodexAccountSwitchError.codexAppMissing
         }
 
-        let profile = try CodexAuthFileLock.withLock {
+        let profile = try CodexAuthFileLock.withRequiredLock {
             try ensureNotLeased(account)
             authMirrorService.syncActiveAuth()
             return try capturedProfile(for: account)
@@ -1018,7 +1002,7 @@ final class CodexAccountSwitchService: @unchecked Sendable {
 
         try terminateCodex()
         didTerminateCodex = true
-        try CodexAuthFileLock.withLock {
+        try CodexAuthFileLock.withRequiredLock {
             try ensureNotLeased(account, destination: defaultAuthURL)
             try copyReplacing(source: profile.authURL, destination: defaultAuthURL)
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: defaultAuthURL.path)
@@ -1039,13 +1023,13 @@ final class CodexAccountSwitchService: @unchecked Sendable {
             throw CodexAccountSwitchError.codexAuthConsumersStillRunning(consumers)
         }
 
-        try CodexAuthFileLock.withLock {
+        try CodexAuthFileLock.withRequiredLock {
             authMirrorService.syncActiveAuth()
             let profile = try capturedProfile(for: account)
             try validateCapturedProfileIdentity(profile, for: account)
         }
 
-        let profile = try CodexAuthFileLock.withLock {
+        let profile = try CodexAuthFileLock.withRequiredLock {
             try ensureNotLeased(account, destination: cliAuthURL)
             authMirrorService.syncActiveAuth()
             let profile = try capturedProfile(for: account)

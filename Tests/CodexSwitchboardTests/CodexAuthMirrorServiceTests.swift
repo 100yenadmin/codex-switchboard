@@ -20,6 +20,7 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
             subject: "sub-1",
             email: "person@example.com",
             refreshToken: "fresh-refresh",
+            expiresAt: 1_800_000_100,
             to: liveAuthURL
         )
 
@@ -171,6 +172,7 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
         email: String,
         accountID: String? = nil,
         refreshToken: String,
+        expiresAt: Int = 1_800_000_000,
         to url: URL
     ) throws {
         try AppStorage.writeJSON(
@@ -180,7 +182,7 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
                 "tokens": [
                     "access_token": "access-\(refreshToken)",
                     "account_id": accountID ?? subject,
-                    "id_token": idToken(subject: subject, email: email),
+                    "id_token": idToken(subject: subject, email: email, expiresAt: expiresAt),
                     "refresh_token": refreshToken,
                 ],
             ],
@@ -200,11 +202,11 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
         return tokens?["access_token"] as? String
     }
 
-    private func idToken(subject: String, email: String) -> String {
+    private func idToken(subject: String, email: String, expiresAt: Int = 1_800_000_000) -> String {
         let header = base64URL(["alg": "none"])
         let payload = base64URL([
             "email": email,
-            "exp": 1_800_000_000,
+            "exp": expiresAt,
             "sub": subject,
         ])
         return "\(header).\(payload).sig"

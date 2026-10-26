@@ -117,7 +117,7 @@ codex-switchboard lease --profile-key "$HANDLE" --home "$LANE_HOME" --holder "$L
   | jq '{handle, lease_id, home, holder, leased_at, auth_written, config_written}'
 ```
 
-`lease` takes `$LANE_HOME/holder.lock` and writes only into a directory that is new, or whose `auth.json` is absent or a return's tombstone, never into a registry, CLI or Desktop home. It writes, in this order: `$LANE_HOME/lease.json` (the lease id, the holder and the time; no account), the lease journal entry as `leasing`, `$LANE_HOME/config.toml` when the home has none, then `auth.json` (mode `0600`), and then marks the lease `active`. The `config.toml` keeps Codex on the file store (`cli_auth_credentials_store = "file"`) and points `CODEX_HOME` for commands Codex runs at a path that does not exist, so a nested `codex` cannot share the home's token. An existing `config.toml` is kept as it is (`config_written: false`) only when it already sets both; otherwise `lease` refuses `home_config_unsafe`.
+`lease` takes `$LANE_HOME/holder.lock` and writes only into a directory that is new, or whose `auth.json` is absent, a return's tombstone, or already exactly the stored token, never into a registry, CLI or Desktop home. It writes, in this order: `$LANE_HOME/lease.json` (the lease id, the holder and the time; no account), the lease journal entry as `leasing`, `$LANE_HOME/config.toml` when the home has none, then `auth.json` (mode `0600`), and then marks the lease `active`. The `config.toml` keeps Codex on the file store (`cli_auth_credentials_store = "file"`) and points `CODEX_HOME` for commands Codex runs at a path that does not exist, so a nested `codex` cannot share the home's token. An existing `config.toml` is kept as it is (`config_written: false`) only when it already sets both; otherwise `lease` refuses `home_config_unsafe`.
 
 3. Run the lane with `CODEX_HOME="$LANE_HOME"`. Do not run `codex-switchboard` itself with `CODEX_HOME` pointing at the lease home.
 
@@ -172,7 +172,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `home_lock_unavailable` | A lock file in the home cannot be opened or locked. Nothing changed. |
 | `auth_store_locked` | `lease`, `return`, `swap-lease`: another Switchboard process kept Switchboard's own store lock for 60 s. Nothing changed; try again. |
 | `home_config_unsafe` | The home's `config.toml` cannot be read, or does not set both `cli_auth_credentials_store = "file"` and a `CODEX_HOME` for nested commands under `[shell_environment_policy]`. Add both, or move the file away so `lease` writes its own. |
-| `duplicate_account_keys` | Switchboard lists the account's seat under more than one key, so a lease check on one key would miss the other. Remove the extra entry in the Switchboard app. |
+| `duplicate_account_keys` | Switchboard lists the account's seat under more than one key, so a lease check on one key would miss the other. Remove the account in the Switchboard app (that removes every key of the seat), sign in to it again, then lease. |
 | `holder_mismatch` | `swap-lease`: the lease belongs to another holder. |
 | `already_leased`, `home_already_leased` | The account, or the home, already has a lease (active or returning). |
 | `not_leased`, `home_mismatch` | `return`: the account has no lease, or its lease is at another home. |

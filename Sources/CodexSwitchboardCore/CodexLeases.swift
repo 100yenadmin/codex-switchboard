@@ -707,6 +707,8 @@ public enum CodexLeaseSync {
 public final class CodexRefreshReservations {
     public static let fileName = "refresh-reservations.json"
     public static let maxAge: TimeInterval = 60
+    /// No grant takes this long, so a reservation this old belongs to a reused pid, not a live grant.
+    static let maxHoldWhileRunning: TimeInterval = 600
 
     private struct Reservation: Codable {
         let since: TimeInterval
@@ -727,7 +729,8 @@ public final class CodexRefreshReservations {
     public func reserve(profileKey: String, pid: Int32 = Darwin.getpid(), now: Date = Date()) throws {
         var reservations = load()
         if let existing = reservations[profileKey], existing.pid != pid,
-           Self.isRunning(existing.pid) || now.timeIntervalSince1970 - existing.since < Self.maxAge {
+           now.timeIntervalSince1970 - existing.since < Self.maxAge
+            || (Self.isRunning(existing.pid) && now.timeIntervalSince1970 - existing.since < Self.maxHoldWhileRunning) {
             throw HeldElsewhere()
         }
         reservations[profileKey] = Reservation(since: now.timeIntervalSince1970, pid: pid)
@@ -735,7 +738,7 @@ public final class CodexRefreshReservations {
     }
 
     private static func isRunning(_ pid: Int32) -> Bool {
-        kill(pid, 0) == 0 || errno == EPERM
+        kill(pid, 0) == 0
     }
 
     public func release(profileKey: String, pid: Int32 = Darwin.getpid()) throws {
