@@ -111,6 +111,39 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
         XCTAssertEqual(refreshToken(in: unrelated), "unrelated-refresh")
     }
 
+    func testRefreshRotationSkipsAnotherSeatOfTheSameTeamWorkspace() throws {
+        let root = try temporaryDirectory()
+        let sameSeat = root.appendingPathComponent("same-seat-auth.json")
+        let otherSeat = root.appendingPathComponent("other-seat-auth.json")
+        try writeAuth(
+            subject: "sub-1",
+            email: "person@example.com",
+            accountID: "team-acc",
+            refreshToken: "seat-one-refresh",
+            to: sameSeat
+        )
+        try writeAuth(
+            subject: "sub-2",
+            email: "colleague@example.com",
+            accountID: "team-acc",
+            refreshToken: "seat-two-refresh",
+            to: otherSeat
+        )
+
+        try ActiveCodexAuthStore.updateMatching(
+            authURLs: [sameSeat, otherSeat],
+            email: "Person@example.com",
+            accountID: "team-acc",
+            accessToken: "new-access",
+            refreshToken: "new-refresh",
+            idToken: nil
+        )
+
+        XCTAssertEqual(refreshToken(in: sameSeat), "new-refresh")
+        XCTAssertEqual(refreshToken(in: otherSeat), "seat-two-refresh")
+        XCTAssertEqual(accessToken(in: otherSeat), "access-seat-two-refresh")
+    }
+
     func testDefaultActiveAuthURLsDeduplicateSharedCodexHome() {
         let home = URL(fileURLWithPath: "/tmp/switchboard-home", isDirectory: true)
         let urls = ActiveCodexAuthStore.defaultAuthURLs(
