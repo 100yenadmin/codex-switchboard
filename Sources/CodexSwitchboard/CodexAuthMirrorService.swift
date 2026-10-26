@@ -140,12 +140,20 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         if let profileKey = match.sourceProfileKey, leasedKeys.contains(profileKey) {
             return CodexAuthMirrorResult(status: .skipped, profileKey: profileKey, reason: "leased profile")
         }
-        // A refresh always moves the access token's expiry forward. Live auth that expires before the
-        // stored copy is the older link of the chain, for example after the app stored a rotation and
-        // could not pass it on; copying it back would replace the stored successor with a spent token.
-        if liveAuth.refreshToken != match.auth.refreshToken,
-           liveAuth.accessExpiresAt > 0,
-           liveAuth.accessExpiresAt < match.auth.accessExpiresAt {
+        // Live auth that differs from a stored copy is taken only when it is a later link: a refresh, or a
+        // new sign-in, always moves the access token's expiry forward. The account list is checked too,
+        // since the app stores a rotation there first; after it stored one and could not pass it on,
+        // live auth and the captured copy can both still hold the spent predecessor.
+        var storedCopies = [(refreshToken: match.auth.refreshToken, expiresAt: match.auth.accessExpiresAt)]
+        if let profileKey = match.sourceProfileKey,
+           let entry = (AppStorage.readJSON(storageRootURL.appendingPathComponent("accounts.json"))?["profiles"]
+               as? [String: Any])?[profileKey] as? [String: Any],
+           let listed = entry["refresh"] as? String {
+            storedCopies.append((listed, (entry["expires"] as? NSNumber)?.intValue ?? 0))
+        }
+        let differing = storedCopies.filter { $0.refreshToken != liveAuth.refreshToken }
+        if !differing.isEmpty,
+           liveAuth.accessExpiresAt <= 0 || differing.contains(where: { liveAuth.accessExpiresAt <= $0.expiresAt }) {
             return CodexAuthMirrorResult(status: .skipped, profileKey: match.sourceProfileKey, reason: "live auth is older than the stored copy")
         }
 

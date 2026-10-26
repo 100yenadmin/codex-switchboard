@@ -1421,11 +1421,21 @@ private final class CLILeaseService {
                     "\(CodexAccountHandle.handle(for: profileKey)) is leased at \(lease.home), not \(requestedHome)."
                 )
             }
-            return try withHolder(lease.home) {
-                try ensureMarkerMatches(lease)
-                try ensureNotInUse(lease.home)
-                return try withHomeLock(lease.home) {
-                    try finishReturn(lease, leases: leases)
+            // From here until the entry is removed the lease is returning, which every reader treats as
+            // leased. A return that stops on any refusal, a busy holder included, is redone later from a
+            // fresh read of the home.
+            var returning = lease
+            var journal = leases
+            if returning.state != .returning {
+                returning.state = .returning
+                journal = leases.map { $0.leaseID == lease.leaseID ? returning : $0 }
+                try paths.leaseStore.save(journal)
+            }
+            return try withHolder(returning.home) {
+                try ensureMarkerMatches(returning)
+                try ensureNotInUse(returning.home)
+                return try withHomeLock(returning.home) {
+                    try finishReturn(returning, leases: journal)
                 }
             }
         }
@@ -1433,15 +1443,8 @@ private final class CLILeaseService {
 
     /// Copies the home's tokens into the stored profile, tombstones the home's auth and removes the
     /// lease. Callers hold all three locks.
-    private func finishReturn(_ original: CodexLease, leases: [CodexLease]) throws -> LeaseReturnPayload {
-        var lease = original
+    private func finishReturn(_ lease: CodexLease, leases: [CodexLease]) throws -> LeaseReturnPayload {
         let handle = CodexAccountHandle.handle(for: lease.profileKey)
-        // From here until the entry is removed the lease is returning, which every reader treats as
-        // leased. A return that stops on any refusal below is redone from a fresh read of the home.
-        if lease.state != .returning {
-            lease.state = .returning
-            try paths.leaseStore.save(leases.map { $0.leaseID == lease.leaseID ? lease : $0 })
-        }
         if CodexLeaseHome.isQuarantined(home: lease.home) {
             throw quarantined(lease.home)
         }
@@ -1555,6 +1558,8 @@ private final class CLILeaseService {
         let reserved = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
         let registryUsable = reserved.map { $0.staleKeys(among: Set(accounts.map(\.profileKey))).isEmpty } ?? false
         let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
+        let reservations = CodexRefreshReservations(appSupportURL: paths.appSupportURL)
+        let appPIDs = Set(runningSwitchboardAppPIDs())
         return accounts.map { account in
             var account = account
             account.reserved = reserved?.profileKeys.contains(account.profileKey) ?? false
@@ -1566,6 +1571,7 @@ private final class CLILeaseService {
                 && account.usableForCodex
                 && !account.needsRelogin
                 && !activeKeys.contains(account.profileKey)
+                && !reservations.isReserved(profileKey: account.profileKey, runningAppPIDs: appPIDs)
             return account
         }
     }
@@ -1619,12 +1625,12 @@ private final class CLILeaseService {
             try ensureNotReserved(profileKey: targetKey, home: current.home)
             if let target = candidates.first(where: { $0.profileKey == targetKey }), !target.leasable {
                 try ensureLeasableAccount(profileKey: targetKey)
-                let (code, reason) = target.leased
-                    ? ("already_leased", "it is already leased")
-                    : target.usableForCodex
-                        ? ("active_account", "it is the active CLI or Desktop account")
-                        : ("not_usable", "it has no usable quota left")
-                throw refused(code, "\(targetHandle) cannot be leased now: \(reason).")
+                if target.leased {
+                    throw refused("already_leased", "\(targetHandle) cannot be leased now: it is already leased.")
+                }
+                // Names the precise reason, such as an active account or an app refresh in flight.
+                _ = try ensureCanLend(profileKey: targetKey, into: current.home)
+                throw refused("not_usable", "\(targetHandle) cannot be leased now: it has no usable quota left.")
             }
             _ = try ensureCanLend(profileKey: targetKey, into: current.home)
             _ = try leaseConfigText(
@@ -1640,6 +1646,12 @@ private final class CLILeaseService {
                     let leased: LeasePayload
                     do {
                         leased = try lease(profileKey: targetKey, home: current.home, holder: current.holder)
+                    } catch CLIError.refused(code: "lease_incomplete", let message, let details) {
+                        throw CLIError.refused(
+                            code: "lease_incomplete",
+                            message: "Returned \(returned.handle) from \(current.home). \(message)",
+                            details: details
+                        )
                     } catch {
                         throw refused(
                             "swap_incomplete",
@@ -1893,7 +1905,10 @@ private final class CLILeaseService {
         guard mode == "file" else {
             throw CLIError.unsupportedMode(surface: "lease home", mode: mode, path: home, jsonPreferred: true)
         }
-        guard Self.keepsLeaseOnFileStore(text), Self.givesNestedCommandsTheirOwnHome(text) else {
+        guard Self.keepsLeaseOnFileStore(text),
+              let nested = Self.nestedCodexHome(text),
+              !CodexLease.sameHome(nested, home),
+              CodexFileProbe.isMissing(URL(fileURLWithPath: nested)) else {
             throw refused(
                 "home_config_unsafe",
                 "\(configURL.path) must set cli_auth_credentials_store = \"file\" and, under [shell_environment_policy], set CODEX_HOME to a path that does not exist, so a nested codex cannot share this home's sign-in. Add both, or move the file away so lease writes its own."
@@ -1906,7 +1921,8 @@ private final class CLILeaseService {
         config.range(of: #"(?m)^\s*cli_auth_credentials_store\s*=\s*"file""#, options: .regularExpression) != nil
     }
 
-    static func givesNestedCommandsTheirOwnHome(_ config: String) -> Bool {
+    /// The `CODEX_HOME` that `[shell_environment_policy]` sets for commands Codex runs, if any.
+    static func nestedCodexHome(_ config: String) -> String? {
         var section = ""
         for rawLine in config.split(separator: "\n") {
             let line = (rawLine.split(separator: "#", maxSplits: 1).first.map(String.init) ?? "")
@@ -1915,14 +1931,23 @@ private final class CLILeaseService {
                 section = line.replacingOccurrences(of: " ", with: "")
                 continue
             }
-            if section == "[shell_environment_policy]", line.hasPrefix("set"), line.contains("CODEX_HOME") {
-                return true
+            let pattern: String
+            switch section {
+            case "[shell_environment_policy]" where line.hasPrefix("set"):
+                pattern = #"[{,]\s*CODEX_HOME\s*=\s*"([^"]+)""#
+            case "[shell_environment_policy.set]":
+                pattern = #"^CODEX_HOME\s*=\s*"([^"]+)""#
+            default:
+                continue
             }
-            if section == "[shell_environment_policy.set]", line.hasPrefix("CODEX_HOME") {
-                return true
+            if let match = line.range(of: pattern, options: .regularExpression) {
+                let assignment = String(line[match])
+                if let open = assignment.firstIndex(of: "\""), let close = assignment.lastIndex(of: "\""), open < close {
+                    return String(assignment[assignment.index(after: open)..<close])
+                }
             }
         }
-        return false
+        return nil
     }
 
     /// The captured profile is what lease copies. If its token differs from the account list's, an
