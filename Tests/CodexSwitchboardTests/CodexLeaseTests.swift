@@ -602,6 +602,58 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
     }
 
+    func testSwapWaitsForAPythonHolderMidRefreshAndKeepsItsRotation() throws {
+        let python = URL(fileURLWithPath: "/usr/bin/python3")
+        guard FileManager.default.isExecutableFile(atPath: python.path) else {
+            throw XCTSkip("needs /usr/bin/python3")
+        }
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+
+        // A holder like the benchmark director: flock, re-read, refresh, then temp file + fsync + os.replace.
+        let holder = Process()
+        holder.executableURL = python
+        holder.arguments = ["-I", "-c", """
+        import fcntl, json, os, sys, time
+        home = sys.argv[1]
+        lock = open(os.path.join(home, "auth.json.lock"), "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        print("locked", flush=True)
+        time.sleep(1.0)
+        path = os.path.join(home, "auth.json")
+        auth = json.load(open(path))
+        auth["tokens"]["access_token"] = "access-k-3"
+        auth["tokens"]["refresh_token"] = "refresh-k-3"
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(auth, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        """, home.path]
+        let output = Pipe()
+        holder.standardOutput = output
+        try holder.run()
+        defer { holder.terminate() }
+        XCTAssertEqual(String(data: output.fileHandleForReading.availableData, encoding: .utf8), "locked\n")
+
+        let swapped = fixture.run(
+            ["swap-lease", "--home", home.path, "--holder", "bench", "--json"],
+            environment: ["CODEX_SWITCHBOARD_HOME_LOCK_TIMEOUT_SECONDS": "10"]
+        )
+
+        holder.waitUntilExit()
+        XCTAssertEqual(swapped.exitCode, 0, swapped.text)
+        XCTAssertEqual(swapped.json["return_sync"] as? String, "rotated")
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-3")
+        XCTAssertEqual(fixture.accountListRefreshToken("profile-k"), "refresh-k-3")
+        XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-b-1")
+    }
+
     func testHelpListsLeaseCommands() {
         let help = fixture.run(["--help"])
         XCTAssertTrue(help.text.contains("lease --profile-key <key> --home <dir> --holder <name> --json"))
