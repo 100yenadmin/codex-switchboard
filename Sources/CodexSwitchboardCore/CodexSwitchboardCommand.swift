@@ -1092,11 +1092,19 @@ private final class CLISwitchService {
             try ensureSwitchable(profileKey: profileKey, surfaces: surfaces)
             // Recorded before the write: a lease must see this home's chain even after CODEX_HOME is unset.
             for (_, destination) in destinations {
-                try CodexSwitchHomes.record(
-                    destination.deletingLastPathComponent().path,
-                    appSupportURL: paths.appSupportURL,
-                    defaultHome: paths.homeURL.appendingPathComponent(".codex").path
-                )
+                do {
+                    try CodexSwitchHomes.record(
+                        destination.deletingLastPathComponent().path,
+                        appSupportURL: paths.appSupportURL,
+                        defaultHome: paths.homeURL.appendingPathComponent(".codex").path
+                    )
+                } catch is CodexSwitchHomes.Unreadable {
+                    throw CLIError.refused(
+                        code: "switch_record_unreadable",
+                        message: "\(CodexSwitchHomes.fileName) in Switchboard's storage cannot be read, so Switchboard cannot record this switch for its lease checks. Nothing was switched.",
+                        details: nil
+                    )
+                }
             }
             let sourceData = try Data(contentsOf: profile.authURL)
             let previousAuth = destinations.reduce(into: [String: Data?]()) { result, destination in
@@ -1337,35 +1345,6 @@ private final class CLISwitchService {
 /// Logins the codex-logins registry sets aside for one consumer each, such as a benchmark director with
 /// its own device-code home. Lending one would share its rate limit with another consumer, so none is
 /// ever leased, and no lease goes into a registered home.
-/// Codex homes other than ~/.codex that `switch` wrote an account into, so a lease can still see a chain
-/// there after the shell that set CODEX_HOME is gone. Paths only, no account. Callers hold `CodexAuthStoreLock`.
-enum CodexSwitchHomes {
-    static let fileName = "cli-homes.json"
-
-    /// The recorded homes; nil when the record exists but cannot be read.
-    static func load(appSupportURL: URL) -> [String]? {
-        let url = appSupportURL.appendingPathComponent(fileName)
-        if CodexFileProbe.isMissing(url) { return [] }
-        guard let root = readJSON(url), let homes = root["homes"] as? [String] else { return nil }
-        return homes
-    }
-
-    /// An unreadable record is never overwritten, since that would drop the homes it lists.
-    static func record(_ home: String, appSupportURL: URL, defaultHome: String) throws {
-        guard !CodexLease.sameHome(home, defaultHome) else { return }
-        guard var homes = load(appSupportURL: appSupportURL) else {
-            throw CLIError.refused(
-                code: "switch_record_unreadable",
-                message: "\(appSupportURL.appendingPathComponent(fileName).path) cannot be read, so Switchboard cannot record this switch for its lease checks. Nothing was switched.",
-                details: nil
-            )
-        }
-        guard !homes.contains(where: { CodexLease.sameHome($0, home) }) else { return }
-        homes.append(CodexLease.normalizedHome(home))
-        try CodexAtomicFile.writeJSON(["version": 1, "homes": homes], to: appSupportURL.appendingPathComponent(fileName))
-    }
-}
-
 private struct ReservedLogins {
     let profileKeys: Set<String>
     let homes: [String]
@@ -1397,7 +1376,7 @@ private struct ReservedLogins {
         return ReservedLogins(profileKeys: profileKeys, homes: homes)
     }
 
-    /// Reservations whose key no Switchboard account has any more, for example after a new sign-in
+    /// Registry entries whose key no Switchboard account has any more, for example after a new sign-in
     /// re-keyed the account. While one exists, nothing can tell which account it means.
     func staleKeys(among accountKeys: Set<String>) -> Set<String> {
         profileKeys.subtracting(accountKeys)
@@ -1676,16 +1655,19 @@ private final class CLILeaseService {
         )
     }
 
-    /// Marks the accounts an agent could lease now: unleased (a returning lease counts), not reserved,
-    /// a known paid plan, usable quota, no re-login needed, and not the active account of any surface.
-    /// Nothing is leasable while the lease store or the reserved-login registry cannot be read, or while
-    /// the registry reserves a key no account has.
+    /// Marks the accounts an agent could lease now: unleased (a returning lease counts), not registry-reserved,
+    /// a known paid plan, usable quota, no re-login needed, not being refreshed by the app (no live refresh
+    /// reservation), and with no chain in a Codex home a surface uses or a switch wrote. Nothing is leasable
+    /// while the lease store, the registry, one of those homes' auth.json or the switch record cannot be read,
+    /// while the registry reserves a key no account has, or while a surface keeps its sign-in in a keychain.
     func annotateLeasable(_ accounts: [AccountPayload]) -> [AccountPayload] {
         let storeReadable = (try? paths.leaseStore.load()) != nil
         let reserved = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
         let registryUsable = reserved.map { $0.staleKeys(among: Set(accounts.map(\.profileKey))).isEmpty } ?? false
         let live = surfaceService.liveChains()
-        let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey)).union(live.keys)
+        let surfaces = surfaceService.statuses(scope: .all)
+        let surfacesKnown = !surfaces.contains { $0.detected && !$0.supportsFileSwitching }
+        let activeKeys = Set(surfaces.compactMap(\.activeProfileKey)).union(live.keys)
         let reservations = CodexRefreshReservations(appSupportURL: paths.appSupportURL)
         let appPIDs = Set(runningSwitchboardAppPIDs())
         return accounts.map { account in
@@ -1693,6 +1675,7 @@ private final class CLILeaseService {
             account.reserved = reserved?.profileKeys.contains(account.profileKey) ?? false
             account.leasable = storeReadable
                 && !live.unknown
+                && surfacesKnown
                 && registryUsable
                 && !account.reserved
                 && !account.leased

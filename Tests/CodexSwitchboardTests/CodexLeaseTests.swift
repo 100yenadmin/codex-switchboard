@@ -1214,6 +1214,17 @@ final class CodexLeaseTests: XCTestCase {
             .json["error"] as? String, "active_account")
     }
 
+    func testAKeychainSurfaceMakesNothingLeasable() throws {
+        // A CLI that keeps its sign-in in a keychain could be on any account, so status lists none as leasable.
+        try "cli_auth_credentials_store = \"keychain\"\n"
+            .write(to: fixture.home.appendingPathComponent(".codex/config.toml"), atomically: true, encoding: .utf8)
+        let status = fixture.run(["status", "--json", "--leasable-only"])
+        XCTAssertEqual((status.json["accounts"] as? [[String: Any]])?.count, 0, status.text)
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let lease = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.json["error"] as? String, "surface_identity_unknown", lease.text)
+    }
+
     func testLeaseSeesAChainASwitchWroteIntoAnotherCodexHome() throws {
         // A switch run with CODEX_HOME=other records that home, then writes profile-b's chain there. A real switch
         // refuses consumers_running while any Codex app runs on the test machine, so the test does both steps.
