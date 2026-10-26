@@ -40,6 +40,18 @@ final class UsageService: @unchecked Sendable {
                 ) else {
                     throw AccountProfileTokenUpdateError.profileChanged
                 }
+                // The account store first: once the server has rotated, the new token must be kept
+                // even if a live copy below cannot be written.
+                try AccountProfileStore.updateTokens(
+                    profileKey: profileKey,
+                    email: email,
+                    accountID: accountID,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    idToken: idToken,
+                    expiresAt: expiresAt,
+                    expectedRefreshToken: expectedRefreshToken
+                )
                 // A lease home is written only under its holder's lock, below, even when the
                 // app's own CODEX_HOME names one. Without a readable lease store any CODEX_HOME
                 // could be one, so only ~/.codex, which is never a lease home, is written.
@@ -49,7 +61,7 @@ final class UsageService: @unchecked Sendable {
                         !leases.contains { CodexLease.sameHome($0.home, authURL.deletingLastPathComponent().path) }
                     }
                 } ?? ActiveCodexAuthStore.defaultAuthURLs(environment: [:])
-                try ActiveCodexAuthStore.updateMatching(
+                try? ActiveCodexAuthStore.updateMatching(
                     authURLs: authURLs,
                     email: email,
                     accountID: accountID,
@@ -73,16 +85,6 @@ final class UsageService: @unchecked Sendable {
                         )
                     }
                 }
-                try AccountProfileStore.updateTokens(
-                    profileKey: profileKey,
-                    email: email,
-                    accountID: accountID,
-                    accessToken: accessToken,
-                    refreshToken: refreshToken,
-                    idToken: idToken,
-                    expiresAt: expiresAt,
-                    expectedRefreshToken: expectedRefreshToken
-                )
             }
         },
         refreshGate: RefreshGate = .live
