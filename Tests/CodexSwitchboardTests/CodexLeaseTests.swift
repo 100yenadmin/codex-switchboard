@@ -446,6 +446,11 @@ final class CodexLeaseTests: XCTestCase {
 
         let malformed = fixture.run(["swap-lease", "--home", home.path, "--exclude-profile-key", "--holder", "bench", "--json"])
         XCTAssertEqual(malformed.exitCode, 64)
+        // A flag between an option and a later word does not make that word the option's value.
+        let shifted = fixture.run([
+            "swap-lease", "--home", home.path, "--holder", "bench", "--exclude-profile-key", "--json", "profile-b",
+        ])
+        XCTAssertEqual(shifted.exitCode, 64)
 
         let consumer = try fixture.startFakeCodex(codexHome: home)
         defer { consumer.terminate() }
@@ -556,6 +561,21 @@ final class CodexLeaseTests: XCTestCase {
         let leasable = (fixture.run(["status", "--json"]).json["accounts"] as? [[String: Any]] ?? [])
             .compactMap { $0["leasable"] as? Bool }
         XCTAssertEqual(Set(leasable), [false])
+
+        // A registry that cannot even be looked for is not a missing one.
+        guard getuid() != 0 else { return }
+        try fixture.writeRegistry([["purpose": "bench-director", "codex_home": "~/bench-home", "profile_key": "profile-b"]])
+        let directory = registry.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: directory.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        let hidden = fixture.run([
+            "lease", "--profile-key", "profile-b", "--home", fixture.root.appendingPathComponent("lane-3").path,
+            "--holder", "bench", "--json",
+        ])
+        XCTAssertEqual(hidden.json["error"] as? String, "reserved_registry_unreadable")
+        let hiddenLeasable = (fixture.run(["status", "--json"]).json["accounts"] as? [[String: Any]] ?? [])
+            .compactMap { $0["leasable"] as? Bool }
+        XCTAssertEqual(Set(hiddenLeasable), [false])
     }
 
     func testLeaseCommandsWaitForTheHoldersAuthLock() throws {

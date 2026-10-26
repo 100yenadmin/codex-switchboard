@@ -116,7 +116,7 @@ public final class CodexLeaseStore {
     /// A missing file means no leases. A file that exists but does not decode throws, so that callers
     /// fail closed instead of treating a leased account as free.
     public func load() throws -> [CodexLease] {
-        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        guard !CodexFileProbe.isMissing(url) else { return [] }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let data = try? Data(contentsOf: url),
@@ -564,6 +564,15 @@ public enum CodexLeaseMirrorMarker {
 
     public static func isReady(runningAppPIDs: [Int32], recordedPID: Int32?) -> Bool {
         runningAppPIDs.allSatisfy { $0 == recordedPID }
+    }
+}
+
+public enum CodexFileProbe {
+    /// True only when the file is known not to exist. A path that cannot be checked, such as one
+    /// behind a directory this process cannot search, is not missing, so callers fail closed.
+    public static func isMissing(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) != 0 && errno == ENOENT
     }
 }
 

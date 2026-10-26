@@ -609,14 +609,16 @@ private struct AutoSwapRunOptions {
 }
 
 private struct ArgumentParser {
-    private var args: [String]
+    /// Each argument with its original position, so a value is only ever the token right after its
+    /// option, even once flags between them have been taken.
+    private var args: [(position: Int, value: String)]
 
     init(_ args: [String]) {
-        self.args = args
+        self.args = args.enumerated().map { ($0.offset, $0.element) }
     }
 
     mutating func takeFlag(_ flag: String) -> Bool {
-        guard let index = args.firstIndex(of: flag) else { return false }
+        guard let index = args.firstIndex(where: { $0.value == flag }) else { return false }
         args.remove(at: index)
         return true
     }
@@ -629,10 +631,10 @@ private struct ArgumentParser {
     }
 
     mutating func takeOptionalValue(_ flag: String) -> String? {
-        guard let index = args.firstIndex(of: flag) else { return nil }
-        args.remove(at: index)
-        guard index < args.count else { return "" }
-        return args.remove(at: index)
+        guard let index = args.firstIndex(where: { $0.value == flag }) else { return nil }
+        let position = args.remove(at: index).position
+        guard index < args.count, args[index].position == position + 1 else { return "" }
+        return args.remove(at: index).value
     }
 
     mutating func takeAllValues(_ flag: String) throws -> [String] {
@@ -676,7 +678,7 @@ private struct ArgumentParser {
 
     func finish() throws {
         guard args.isEmpty else {
-            throw CLIError.usage("Unexpected arguments: \(args.joined(separator: " "))", jsonPreferred: false)
+            throw CLIError.usage("Unexpected arguments: \(args.map(\.value).joined(separator: " "))", jsonPreferred: false)
         }
     }
 }
@@ -1202,7 +1204,7 @@ private struct ReservedLogins {
     /// A missing registry reserves nothing. One that does not parse, or lists a login without a
     /// profile key, throws, so that callers fail closed as `codex-logins.py check-switch` does.
     static func load(from url: URL, homeURL: URL) throws -> ReservedLogins {
-        guard FileManager.default.fileExists(atPath: url.path) else {
+        guard !CodexFileProbe.isMissing(url) else {
             return ReservedLogins(profileKeys: [], homes: [])
         }
         guard let root = readJSON(url), let logins = root["logins"] as? [[String: Any]] else {

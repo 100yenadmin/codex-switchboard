@@ -40,7 +40,13 @@ final class UsageService: @unchecked Sendable {
                 ) else {
                     throw AccountProfileTokenUpdateError.profileChanged
                 }
+                // A lease home is written only under its holder's lock, below, even when the
+                // app's own CODEX_HOME names one.
+                let leases = (try? CodexLeaseStore(appSupportURL: AppStorage.rootURL).load()) ?? []
                 try ActiveCodexAuthStore.updateMatching(
+                    authURLs: ActiveCodexAuthStore.defaultAuthURLs().filter { authURL in
+                        !leases.contains { CodexLease.sameHome($0.home, authURL.deletingLastPathComponent().path) }
+                    },
                     email: email,
                     accountID: accountID,
                     accessToken: accessToken,
@@ -50,8 +56,7 @@ final class UsageService: @unchecked Sendable {
                 // A lease can only appear mid-grant if the reservation went stale; that
                 // home then holds the token just spent, so hand it the rotation too, under
                 // its holder's lock. A quarantined home is left for its owner.
-                if let lease = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
-                    .lease(forProfileKey: profileKey) {
+                if let lease = leases.first(where: { $0.profileKey == profileKey }) {
                     try? CodexHomeAuthLock.withLock(home: lease.home, timeout: 30) {
                         guard !CodexLeaseHome.isQuarantined(home: lease.home) else { return }
                         try ActiveCodexAuthStore.updateMatching(
