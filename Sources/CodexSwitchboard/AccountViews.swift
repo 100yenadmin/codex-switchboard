@@ -211,6 +211,21 @@ struct FreeWaitingGroupHeader: View {
     }
 }
 
+/// Whether a row offers "switch into this account". Quota state is deliberately NOT an input:
+/// an exhausted (0%) account is still a valid target — the user may have earned resets, may reset
+/// usage themselves in ChatGPT, or may simply want that identity active. Smart ordering and the
+/// opt-in auto-swap keep preferring accounts with balance; the manual switch is never disabled.
+enum SwapControlVisibility {
+    static func isAvailable(
+        showsCodexControls: Bool,
+        isActiveInCodex: Bool,
+        needsRelogin: Bool,
+        isRelogging: Bool
+    ) -> Bool {
+        showsCodexControls && !isActiveInCodex && !needsRelogin && !isRelogging
+    }
+}
+
 // MARK: - Expanded Row
 
 struct AccountRow: View {
@@ -368,11 +383,12 @@ struct AccountCompactRow: View {
     private var resetFontSize: CGFloat { 10 * resetTextScale }
     private var rowHeight: CGFloat { ceil((showsFullInformation ? 34 : 28) * max(1, min(resetTextScale, 1.6))) }
     private var canShowSwapControl: Bool {
-        showsCodexControls
-            && !isActiveInCodex
-            && !needsRelogin
-            && !isRelogging
-            && account.isUsableForCodex
+        SwapControlVisibility.isAvailable(
+            showsCodexControls: showsCodexControls,
+            isActiveInCodex: isActiveInCodex,
+            needsRelogin: needsRelogin,
+            isRelogging: isRelogging
+        )
     }
 
     var body: some View {

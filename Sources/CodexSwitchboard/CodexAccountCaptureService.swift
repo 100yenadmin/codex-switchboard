@@ -886,12 +886,16 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         homeURL.appendingPathComponent(".codex/auth.json")
     }
 
-    private var cliAuthURL: URL {
+    private var codexHomeURL: URL {
         if let value = ProcessInfo.processInfo.environment["CODEX_HOME"],
            !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return URL(fileURLWithPath: value).appendingPathComponent("auth.json")
+            return URL(fileURLWithPath: value, isDirectory: true)
         }
-        return defaultAuthURL
+        return homeURL.appendingPathComponent(".codex", isDirectory: true)
+    }
+
+    private var cliAuthURL: URL {
+        codexHomeURL.appendingPathComponent("auth.json")
     }
 
     private var bundledCodexURL: URL {
@@ -1078,17 +1082,27 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         try run("/usr/bin/open", ["-n", appURL.path])
     }
 
+    /// See `CodexAppServerDaemon`: only touch the managed daemon when its control socket says it is
+    /// running, and never let a daemon subcommand block the switch for more than `commandTimeout`.
+    /// A timed-out `restart` is not followed by `stop`/`start` — they wait on the same stale pid and
+    /// would hang identically. The former `bootstrap` fallback is gone: it installs durable launchd
+    /// management for SSH use, which is not a side effect an account switch should have.
     private func restartAppServerDaemonBestEffort() {
-        guard fileManager.isExecutableFile(atPath: bundledCodexURL.path) else { return }
-        if (try? run(bundledCodexURL.path, ["app-server", "daemon", "restart"])) != nil {
+        guard fileManager.isExecutableFile(atPath: bundledCodexURL.path),
+              CodexAppServerDaemon.isLikelyRunning(codexHome: codexHomeURL, fileManager: fileManager) else {
             return
         }
-        _ = try? run(bundledCodexURL.path, ["app-server", "daemon", "bootstrap"])
-        if (try? run(bundledCodexURL.path, ["app-server", "daemon", "restart"])) != nil {
+        let timeout = CodexAppServerDaemon.commandTimeout
+        do {
+            _ = try run(bundledCodexURL.path, ["app-server", "daemon", "restart"], timeout: timeout)
             return
+        } catch TimedProcessRunnerError.timedOut {
+            return
+        } catch {
+            // Fall through to an explicit stop/start.
         }
-        _ = try? run(bundledCodexURL.path, ["app-server", "daemon", "stop"])
-        _ = try? run(bundledCodexURL.path, ["app-server", "daemon", "start"])
+        _ = try? run(bundledCodexURL.path, ["app-server", "daemon", "stop"], timeout: timeout)
+        _ = try? run(bundledCodexURL.path, ["app-server", "daemon", "start"], timeout: timeout)
     }
 
     private func codexProcessDescriptions(includeDesktopConsumers: Bool = true) -> [String] {
@@ -1181,27 +1195,12 @@ final class CodexAccountSwitchService: @unchecked Sendable {
     }
 
     @discardableResult
-    private func run(_ launchPath: String, _ arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launchPath)
-        process.arguments = arguments
-
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        if process.terminationStatus != 0 {
-            throw NSError(
-                domain: "CodexSwitchboard.CodexAccountSwitchService",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: output.trimmingCharacters(in: .whitespacesAndNewlines)]
-            )
-        }
-        return output
+    private func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        timeout: TimeInterval? = nil
+    ) throws -> String {
+        try TimedProcessRunner.run(launchPath, arguments, timeout: timeout)
     }
 
     private func runBestEffort(_ launchPath: String, _ arguments: [String]) -> String {
