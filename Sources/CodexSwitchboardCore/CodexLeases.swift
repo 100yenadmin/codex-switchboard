@@ -244,10 +244,7 @@ public enum CodexLeaseSync {
         }
 
         // Every stored copy must be readable, or one of them could keep a spent token after return.
-        let stored = try storedProfiles(
-            profileKey: lease.profileKey,
-            profilesURL: appSupportURL.appendingPathComponent("profiles", isDirectory: true)
-        )
+        let stored = try storedProfiles(of: lease, identity: homeAuth.identity, appSupportURL: appSupportURL)
         guard let pinned = stored.first(where: { $0.directoryName == lease.profileDirectory })
             ?? stored.max(by: { $0.modified < $1.modified }) else {
             return .storedProfileMissing
@@ -294,10 +291,7 @@ public enum CodexLeaseSync {
     /// True when the home and the profile copied at lease time hold the same token chain head.
     public static func homeMatchesStoredProfile(_ lease: CodexLease, appSupportURL: URL) -> Bool {
         guard let homeAuth = StoredAuth.load(from: lease.authURL),
-              let stored = try? storedProfiles(
-            profileKey: lease.profileKey,
-              profilesURL: appSupportURL.appendingPathComponent("profiles", isDirectory: true)
-              ),
+              let stored = try? storedProfiles(of: lease, identity: homeAuth.identity, appSupportURL: appSupportURL),
               let pinned = stored.first(where: { $0.directoryName == lease.profileDirectory })
                 ?? stored.max(by: { $0.modified < $1.modified }) else {
             return false
@@ -313,9 +307,13 @@ public enum CodexLeaseSync {
         let modified: Date
     }
 
-    private static func storedProfiles(profileKey: String, profilesURL: URL) throws -> [StoredProfile] {
+    private static func storedProfiles(
+        of lease: CodexLease,
+        identity: CodexAuthIdentity,
+        appSupportURL: URL
+    ) throws -> [StoredProfile] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: profilesURL,
+            at: appSupportURL.appendingPathComponent("profiles", isDirectory: true),
             includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else {
@@ -327,8 +325,18 @@ public enum CodexLeaseSync {
                 return nil
             }
             let metaURL = entry.appendingPathComponent("meta.json")
-            guard (readJSON(metaURL)?["source_profile_key"] as? String) == profileKey else { return nil }
             let authURL = entry.appendingPathComponent("auth.json")
+            let meta = readJSON(metaURL)
+            if meta == nil, FileManager.default.fileExists(atPath: metaURL.path) {
+                // Unreadable metadata hides whose copy this is. The copy lent from, or one holding
+                // this account's auth, must not stay behind with a spent token.
+                let holdsAccount = StoredAuth.load(from: authURL).map { identity.matches($0.identity) } ?? false
+                if entry.lastPathComponent == lease.profileDirectory || holdsAccount {
+                    throw CodexLeaseSyncError.storedCopyUnreadable(path: metaURL.path)
+                }
+                return nil
+            }
+            guard (meta?["source_profile_key"] as? String) == lease.profileKey else { return nil }
             guard FileManager.default.fileExists(atPath: authURL.path) else { return nil }
             guard let auth = StoredAuth.load(from: authURL) else {
                 throw CodexLeaseSyncError.storedCopyUnreadable(path: authURL.path)
@@ -370,11 +378,17 @@ public enum CodexLeaseSync {
 }
 
 /// The app's in-flight refresh grants. A grant spends the account's current refresh token, so a
-/// lease must not copy that token until the grant's rotation is stored. A reservation older than
-/// `maxAge` is stale (the app died mid-grant). Callers hold `CodexAuthStoreLock`.
+/// lease must not copy that token until the grant's rotation is stored. A reservation holds while
+/// the app that made it still runs, and expires after `maxAge` once that app is gone (it died
+/// mid-grant). Callers hold `CodexAuthStoreLock`.
 public final class CodexRefreshReservations {
     public static let fileName = "refresh-reservations.json"
     public static let maxAge: TimeInterval = 60
+
+    private struct Reservation: Codable {
+        let since: TimeInterval
+        let pid: Int32
+    }
 
     private let url: URL
 
@@ -382,9 +396,9 @@ public final class CodexRefreshReservations {
         url = appSupportURL.appendingPathComponent(Self.fileName)
     }
 
-    public func reserve(profileKey: String, now: Date = Date()) throws {
+    public func reserve(profileKey: String, pid: Int32 = Darwin.getpid(), now: Date = Date()) throws {
         var reservations = load()
-        reservations[profileKey] = now.timeIntervalSince1970
+        reservations[profileKey] = Reservation(since: now.timeIntervalSince1970, pid: pid)
         try save(reservations)
     }
 
@@ -394,17 +408,19 @@ public final class CodexRefreshReservations {
         try save(reservations)
     }
 
-    public func isReserved(profileKey: String, now: Date = Date()) -> Bool {
-        guard let since = load()[profileKey] else { return false }
-        return now.timeIntervalSince1970 - since < Self.maxAge
+    /// `runningAppPIDs` are the Switchboard app processes alive now.
+    public func isReserved(profileKey: String, runningAppPIDs: Set<Int32>, now: Date = Date()) -> Bool {
+        guard let reservation = load()[profileKey] else { return false }
+        return runningAppPIDs.contains(reservation.pid)
+            || now.timeIntervalSince1970 - reservation.since < Self.maxAge
     }
 
-    private func load() -> [String: TimeInterval] {
+    private func load() -> [String: Reservation] {
         guard let data = try? Data(contentsOf: url) else { return [:] }
-        return (try? JSONDecoder().decode([String: TimeInterval].self, from: data)) ?? [:]
+        return (try? JSONDecoder().decode([String: Reservation].self, from: data)) ?? [:]
     }
 
-    private func save(_ reservations: [String: TimeInterval]) throws {
+    private func save(_ reservations: [String: Reservation]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try CodexAtomicFile.write(encoder.encode(reservations), to: url)

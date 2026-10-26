@@ -293,6 +293,41 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(leased.exitCode, 0, leased.text)
     }
 
+    func testRefreshReservationHoldsWhileItsAppRuns() throws {
+        let reservations = CodexRefreshReservations(appSupportURL: fixture.appSupport)
+        let old = Date().addingTimeInterval(-CodexRefreshReservations.maxAge - 1)
+        try reservations.reserve(profileKey: "profile-k", pid: 4242, now: old)
+
+        XCTAssertTrue(reservations.isReserved(profileKey: "profile-k", runningAppPIDs: [4242]))
+        XCTAssertFalse(reservations.isReserved(profileKey: "profile-k", runningAppPIDs: [7]))
+        try reservations.release(profileKey: "profile-k")
+        XCTAssertFalse(reservations.isReserved(profileKey: "profile-k", runningAppPIDs: [4242]))
+    }
+
+    func testReturnKeepsHomeAuthWhenTheLentCopysMetadataCannotBeRead() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let homeAuth = home.appendingPathComponent("auth.json")
+        try fixture.writeAuth(account: "k", generation: 2, to: homeAuth)
+        // A second copy of the account that would otherwise let the sync look complete.
+        let spare = fixture.appSupport.appendingPathComponent("profiles/k-spare", isDirectory: true)
+        try fixture.writeAuth(account: "k", generation: 1, to: spare.appendingPathComponent("auth.json"))
+        try FileManager.default.copyItem(
+            at: fixture.appSupport.appendingPathComponent("profiles/k/meta.json"),
+            to: spare.appendingPathComponent("meta.json")
+        )
+        try Data("{broken".utf8).write(to: fixture.appSupport.appendingPathComponent("profiles/k/meta.json"))
+
+        let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+
+        XCTAssertNotEqual(returned.exitCode, 0)
+        XCTAssertEqual(fixture.refreshToken(in: homeAuth), "refresh-k-2")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().count, 1)
+    }
+
     func testLeaseRefusesSymlinkIntoAppStorage() throws {
         let link = fixture.root.appendingPathComponent("storage-link")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fixture.appSupport)

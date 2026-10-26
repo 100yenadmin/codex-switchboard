@@ -1147,7 +1147,8 @@ private final class CLILeaseService {
                     details: nil
                 )
             }
-            if CodexRefreshReservations(appSupportURL: paths.appSupportURL).isReserved(profileKey: profileKey) {
+            if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
+                .isReserved(profileKey: profileKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
                 throw CLIError.refused(
                     code: "refresh_in_progress",
                     message: "Switchboard is refreshing the token of profile_key \(profileKey) right now; lease again in a few seconds.",
