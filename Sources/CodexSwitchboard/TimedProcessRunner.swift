@@ -38,6 +38,11 @@ enum TimedProcessRunner {
         let outputLock = NSLock()
         var collected = Data()
         let readGroup = DispatchGroup()
+
+        // Start the drain only once the child exists: a failed launch would otherwise leave the
+        // reader blocked on a write end this process still holds. Until then output waits in the pipe.
+        try process.run()
+
         readGroup.enter()
         DispatchQueue.global(qos: .utility).async {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -46,8 +51,6 @@ enum TimedProcessRunner {
             outputLock.unlock()
             readGroup.leave()
         }
-
-        try process.run()
 
         let command = ([launchPath] + arguments).joined(separator: " ")
         if let timeout {

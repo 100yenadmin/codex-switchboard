@@ -301,6 +301,11 @@ enum ActiveCodexAuthStore {
                 email: liveAuth.email
             )
             guard refreshedIdentity.matches(liveIdentity) else { continue }
+            // Every seat of a Team workspace shares its account id, so the seat is the email.
+            if !refreshedIdentity.email.isEmpty, !liveIdentity.email.isEmpty,
+               refreshedIdentity.email != liveIdentity.email {
+                continue
+            }
 
             var root = liveAuth.root
             var tokens = root["tokens"] as? [String: Any] ?? [:]
