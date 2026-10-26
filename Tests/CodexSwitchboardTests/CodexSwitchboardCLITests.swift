@@ -48,7 +48,8 @@ final class CodexSwitchboardCLITests: XCTestCase {
     func testAppAutoSwapRanksOnlyCapturedUsableAccounts() throws {
         let viewModel = try String(contentsOf: usageViewModelSourceURL(), encoding: .utf8)
         let adapter = try String(contentsOf: autoSwapAppAdapterSourceURL(), encoding: .utf8)
-        XCTAssertTrue(viewModel.contains(#"autoSwapAccount(needsRelogin: needsRelogin($0))"#))
+        XCTAssertTrue(viewModel.contains(#"needsRelogin: needsRelogin($0),"#))
+        XCTAssertTrue(viewModel.contains(#"isLeased: $0.profileKey.map(leasedKeys.contains) ?? false"#))
         XCTAssertTrue(adapter.contains(#"usableForCodex: isUsableForCodex && !needsRelogin"#))
         XCTAssertTrue(adapter.contains(#"needsRelogin: needsRelogin"#))
     }

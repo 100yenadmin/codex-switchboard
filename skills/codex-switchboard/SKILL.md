@@ -1,6 +1,6 @@
 ---
 name: codex-switchboard
-description: Use when an agent orchestrator needs to inspect Codex Desktop or Codex CLI auth capacity, choose a usable paid Codex profile, or perform an explicit local Codex Switchboard profile switch.
+description: Use when an agent orchestrator needs to inspect Codex Desktop or Codex CLI auth capacity, choose a usable paid Codex profile, perform an explicit local Codex Switchboard profile switch, or lease an account's token into a separate CODEX_HOME for an automated lane and return it.
 ---
 
 # Codex Switchboard
@@ -18,6 +18,7 @@ Use the local `codex-switchboard` CLI to inspect Codex Desktop/CLI auth surfaces
 - Prefer `autoswap run-once --dry-run` before a policy-driven switch so the decision and candidate are visible without mutating auth.
 - After any switch, verify the selected surface reports the requested `active_profile_key`.
 - Report counts, chosen rationale, and safe commands. Avoid pasting full account JSON into chat or logs.
+- Never copy an auth file into another `CODEX_HOME` yourself. Use `lease` and `return`: a refresh token is single-use, so two live copies of one token chain log each other out.
 
 ## Workflow
 
@@ -92,6 +93,60 @@ codex-switchboard autoswap run-once --surface cli --json
 
 Add `--stop-consumers` only when the caller explicitly authorized stopping running Codex consumers. If the result is `blocked`, report the `reason` and do not manually edit auth files.
 
+## Lease Workflow
+
+A lease lends one account's captured auth to a separate `CODEX_HOME`, so an automated lane runs on its own account without touching the main CLI or Desktop sign-in. While a lease is active its home is the account's only live holder: `switch`, `autoswap`, and the app's own switching and token refresh all leave the account alone, and the Switchboard app writes every token rotation in the home back to the stored profile. `return` writes the latest token back and clears the lease.
+
+1. Pick a paid, usable account that no surface is using. `--usable-only` already leaves out leased accounts:
+
+```bash
+codex-switchboard status --json --surface all --paid-only --usable-only \
+  | jq '{active: [.surfaces[] | .active_profile_key], accounts: [.accounts[] | {profile_key, plan, needs_relogin, session_free_percent, weekly_free_percent, score, leased}]}'
+```
+
+Choose a `profile_key` that is not in `active`.
+
+2. Lease it into a dedicated, empty directory. The CLI creates the directory with mode `0700` and writes `auth.json` with mode `0600`:
+
+```bash
+codex-switchboard lease --profile-key "$PROFILE_KEY" --home "$LANE_HOME" --holder "$LANE_NAME" --json \
+  | jq '{profile_key, home, holder, leased_at, auth_written}'
+```
+
+3. Run the lane with `CODEX_HOME="$LANE_HOME"`. Do not run `codex-switchboard` itself with `CODEX_HOME` pointing at the lease home.
+
+4. Check active leases at any time:
+
+```bash
+codex-switchboard leases --json \
+  | jq '[.leases[] | {profile_key, holder, home, home_auth_present, home_matches_stored_profile, active_on_surface}]'
+```
+
+`home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
+
+5. When every process in the lane has exited, return the lease:
+
+```bash
+codex-switchboard return --profile-key "$PROFILE_KEY" --home "$LANE_HOME" --json \
+  | jq '{profile_key, holder, sync, home_auth_removed}'
+```
+
+`sync` is `rotated` when the home held a newer token, `unchanged` when it did not, or `home_auth_missing` when the lane already deleted `auth.json` (the stored profile then keeps the last mirrored token).
+
+Refusals exit with status 2 and a JSON `error` code. Report the code; never work around it by editing auth files:
+
+| `error` | Meaning |
+|---------|---------|
+| `active_account` | The account is the active CLI or Desktop account. Pick another. |
+| `already_leased`, `home_already_leased` | The account, or the home, already has a lease. |
+| `free_plan`, `plan_unknown`, `needs_relogin`, `unknown_profile` | The account cannot be leased. |
+| `home_holds_other_account`, `home_holds_other_login` | The home already holds a sign-in (for example its own device-code login). Use an empty home. |
+| `home_not_allowed` | The home is `~`, a Switchboard surface home such as `~/.codex`, or inside Switchboard's storage. |
+| `app_not_lease_aware` | A running Switchboard app predates leases and would refresh the leased token itself. Update or quit it. |
+| `home_in_use` | `return` found processes holding files open in the home (listed in `details`). Stop them first. |
+| `account_leased`, `surface_is_lease_home` | `switch` refused a leased account, or a surface whose auth store is a lease home. |
+| `lease_store_unreadable` | Switchboard could not read `leases.json`; every writer fails closed. |
+
 ## Pressure Scenario
 
 An orchestrator says: "A Codex CLI agent exhausted its current account. Put it back to work if a paid account has tokens."
@@ -108,5 +163,6 @@ Incorrect behavior:
 
 - Reading `auth.json` into chat.
 - Choosing a free plan because it has reset sooner.
+- Copying an `auth.json` into a lane's `CODEX_HOME` instead of leasing it.
 - Using `--stop-consumers` without explicit authorization.
 - Claiming success without verifying the active profile.

@@ -103,6 +103,9 @@ Codex Switchboard is local-first and never syncs tokens or exposes a remote serv
 | `~/Library/Application Support/CodexSwitchboard/team-name-cache.json` | Team name cache |
 | `~/Library/Application Support/CodexSwitchboard/auto-swap-policy.json` | Auto-swap preferences |
 | `~/Library/Application Support/CodexSwitchboard/auto-swap-events.json` | Redacted auto-swap audit events |
+| `~/Library/Application Support/CodexSwitchboard/leases.json` | Accounts lent to agent `CODEX_HOME`s (no tokens) |
+| `~/Library/Application Support/CodexSwitchboard/lease-mirror.json` | Pid of the lease-aware app mirroring lease homes |
+| `~/Library/Application Support/CodexSwitchboard/.auth.lock` | Lock shared by the app and CLI for auth writes |
 | `~/Library/Application Support/CodexSwitchboard/backups/<timestamp>-remove-account/` | Backups before removal |
 
 All sensitive files are written with `0600` permissions. Removal actions create backups before deleting profile data.

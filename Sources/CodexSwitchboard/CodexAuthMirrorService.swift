@@ -12,25 +12,31 @@ struct CodexAuthMirrorResult: Equatable {
     let reason: String?
 }
 
+/// Mirrors rotated Codex tokens back into the stored profiles: the live `~/.codex` auth, and the
+/// auth in every lease home, each written only into the profile of the account it holds.
 final class CodexAuthMirrorService: @unchecked Sendable {
     private let fileManager: FileManager
     private let authURL: URL
     private let profileStoreURL: URL
+    private let storageRootURL: URL
     private let queue = DispatchQueue(label: "CodexSwitchboard.CodexAuthMirror")
     private let interval: TimeInterval
     private var timer: DispatchSourceTimer?
     private var lastSignature: FileSignature?
+    private var leaseSignatures: [String: FileSignature?] = [:]
 
     init(
         fileManager: FileManager = .default,
         authURL: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".codex/auth.json"),
         profileStoreURL: URL = AppStorage.profilesURL,
+        storageRootURL: URL = AppStorage.rootURL,
         interval: TimeInterval = 3
     ) {
         self.fileManager = fileManager
         self.authURL = authURL
         self.profileStoreURL = profileStoreURL
+        self.storageRootURL = storageRootURL
         self.interval = interval
     }
 
@@ -38,13 +44,18 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         queue.async {
             guard self.timer == nil else { return }
 
+            // Tells the CLI that this app mirrors lease homes and leaves leased tokens alone.
+            try? CodexLeaseMirrorMarker.record(appSupportURL: self.storageRootURL)
             self.lastSignature = self.fileSignature()
             _ = self.syncActiveAuth()
+            self.leaseSignatures = self.leaseHomeSignatures()
+            _ = self.syncLeasedHomes()
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + self.interval, repeating: self.interval)
             timer.setEventHandler { [weak self] in
                 self?.syncIfChanged()
+                self?.syncLeasedHomesIfChanged()
             }
             self.timer = timer
             timer.resume()
@@ -60,8 +71,38 @@ final class CodexAuthMirrorService: @unchecked Sendable {
 
     @discardableResult
     func syncActiveAuth() -> CodexAuthMirrorResult {
-        CodexAuthFileLock.withLock {
+        CodexAuthFileLock.withLock(storageRootURL: storageRootURL) {
             syncActiveAuthWithoutLock()
+        }
+    }
+
+    /// Writes each lease home's current tokens into the stored copies of its account. The lease
+    /// home is the account's only live holder, so its rotations are the ones to keep.
+    @discardableResult
+    func syncLeasedHomes() -> [CodexAuthMirrorResult] {
+        CodexAuthFileLock.withLock(storageRootURL: storageRootURL) {
+            let leases: [CodexLease]
+            do {
+                leases = try CodexLeaseStore(appSupportURL: storageRootURL).load()
+            } catch {
+                return [CodexAuthMirrorResult(status: .skipped, profileKey: nil, reason: error.localizedDescription)]
+            }
+            return leases.map { lease in
+                do {
+                    let outcome = try CodexLeaseSync.syncHome(lease, appSupportURL: storageRootURL)
+                    return CodexAuthMirrorResult(
+                        status: outcome == .rotated ? .synced : .skipped,
+                        profileKey: lease.profileKey,
+                        reason: outcome == .rotated ? nil : outcome.rawValue
+                    )
+                } catch {
+                    return CodexAuthMirrorResult(
+                        status: .skipped,
+                        profileKey: lease.profileKey,
+                        reason: error.localizedDescription
+                    )
+                }
+            }
         }
     }
 
@@ -77,6 +118,13 @@ final class CodexAuthMirrorService: @unchecked Sendable {
                 profileKey: nil,
                 reason: matches.isEmpty ? "no matching profile" : "ambiguous matching profiles"
             )
+        }
+        // A leased profile is written only from its lease home.
+        guard let leasedKeys = try? CodexLeaseStore(appSupportURL: storageRootURL).leasedProfileKeys() else {
+            return CodexAuthMirrorResult(status: .skipped, profileKey: match.sourceProfileKey, reason: "lease store unreadable")
+        }
+        if let profileKey = match.sourceProfileKey, leasedKeys.contains(profileKey) {
+            return CodexAuthMirrorResult(status: .skipped, profileKey: profileKey, reason: "leased profile")
         }
 
         do {
@@ -106,7 +154,26 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         _ = syncActiveAuth()
     }
 
+    private func syncLeasedHomesIfChanged() {
+        let signatures = leaseHomeSignatures()
+        guard signatures != leaseSignatures else { return }
+        leaseSignatures = signatures
+        _ = syncLeasedHomes()
+    }
+
+    private func leaseHomeSignatures() -> [String: FileSignature?] {
+        let leases = (try? CodexLeaseStore(appSupportURL: storageRootURL).load()) ?? []
+        return Dictionary(
+            leases.map { ($0.profileKey + "\u{0}" + $0.home, fileSignature(at: $0.authURL)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
     private func fileSignature() -> FileSignature? {
+        fileSignature(at: authURL)
+    }
+
+    private func fileSignature(at authURL: URL) -> FileSignature? {
         guard let attrs = try? fileManager.attributesOfItem(atPath: authURL.path),
               let modified = attrs[.modificationDate] as? Date,
               let size = attrs[.size] as? NSNumber else {
@@ -160,13 +227,14 @@ final class CodexAuthMirrorService: @unchecked Sendable {
     }
 }
 
+/// The app side of `CodexAuthStoreLock`, so app writes and the CLI's lease, return and switch
+/// writes never interleave.
 enum CodexAuthFileLock {
-    private static let lock = NSRecursiveLock()
-
-    static func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        lock.lock()
-        defer { lock.unlock() }
-        return try body()
+    static func withLock<T>(
+        storageRootURL: URL = AppStorage.rootURL,
+        _ body: () throws -> T
+    ) rethrows -> T {
+        try CodexAuthStoreLock.withLock(appSupportURL: storageRootURL, body)
     }
 }
 

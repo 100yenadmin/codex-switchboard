@@ -225,6 +225,52 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
+    func testLeasedAccountIsNeverRefreshedByTheApp() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            return Self.response(
+                request,
+                status: 401,
+                json: ["detail": ["code": "token_expired"]]
+            )
+        }
+
+        let accounts = await makeService(
+            tokenUpdate: tokenUpdate,
+            leasedProfileKeys: ["profile-weekly"]
+        ).loadAll()
+
+        let account = try XCTUnwrap(accounts.first)
+        XCTAssertEqual(account.errorMessage, UsageService.leasedRefreshDeferredError)
+        XCTAssertFalse(UsageService.isExpiredOrRevokedAuthError(account.errorMessage))
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 0)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
+    func testUnreadableLeaseStorePausesEveryRefresh() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            return Self.response(
+                request,
+                status: 401,
+                json: ["detail": ["code": "token_expired"]]
+            )
+        }
+
+        let accounts = await makeService(tokenUpdate: tokenUpdate, leasedProfileKeys: nil).loadAll()
+
+        let account = try XCTUnwrap(accounts.first)
+        XCTAssertEqual(account.errorMessage, UsageService.leaseStoreUnreadableError)
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 0)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
     func testProfileRemovedDuringRefreshIsNotRestoredInMemory() async throws {
         let tokenUpdate = TokenUpdateRecorder()
         MockURLProtocol.handler = { request in
@@ -257,7 +303,8 @@ final class UsageServiceIntegrationTests: XCTestCase {
     private func makeService(
         tokenUpdate: TokenUpdateRecorder,
         accessToken: String? = "old-access",
-        tokenUpdater: UsageService.TokenUpdater? = nil
+        tokenUpdater: UsageService.TokenUpdater? = nil,
+        leasedProfileKeys: Set<String>? = []
     ) -> UsageService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -287,7 +334,8 @@ final class UsageServiceIntegrationTests: XCTestCase {
                     refreshToken: refreshToken,
                     expiresAt: expiresAt
                 )
-            }
+            },
+            leasedProfileKeys: { leasedProfileKeys }
         )
     }
 

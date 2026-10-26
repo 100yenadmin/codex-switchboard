@@ -1,3 +1,4 @@
+import CodexSwitchboardCore
 import Foundation
 
 /// Fetches best-effort Codex usage data from chatgpt.com.
@@ -21,8 +22,12 @@ final class UsageService: @unchecked Sendable {
     private let session: URLSession
     private let profileLoader: () -> AccountProfileCollection
     private let tokenUpdater: TokenUpdater
+    /// nil when the lease store cannot be read; refresh then pauses for every account.
+    private let leasedProfileKeys: () -> Set<String>?
     private static let refreshFailedError = "Refresh failed - re-login required"
     private static let refreshTemporarilyUnavailableError = "Refresh temporarily unavailable"
+    static let leasedRefreshDeferredError = "Leased - the lease holder refreshes this token"
+    static let leaseStoreUnreadableError = "Lease store unreadable - token refresh paused"
 
     init(
         session: URLSession = .shared,
@@ -36,7 +41,12 @@ final class UsageService: @unchecked Sendable {
                 ) else {
                     throw AccountProfileTokenUpdateError.profileChanged
                 }
+                // A lease taken after the grant was sent holds the token just spent;
+                // hand its home the rotation too, so the chain keeps one head.
+                let leaseHome = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
+                    .lease(forProfileKey: profileKey)?.authURL
                 try ActiveCodexAuthStore.updateMatching(
+                    authURLs: ActiveCodexAuthStore.defaultAuthURLs() + (leaseHome.map { [$0] } ?? []),
                     email: email,
                     accountID: accountID,
                     accessToken: accessToken,
@@ -54,11 +64,15 @@ final class UsageService: @unchecked Sendable {
                     expectedRefreshToken: expectedRefreshToken
                 )
             }
+        },
+        leasedProfileKeys: @escaping () -> Set<String>? = {
+            try? CodexLeaseStore(appSupportURL: AppStorage.rootURL).leasedProfileKeys()
         }
     ) {
         self.session = session
         self.profileLoader = profileLoader
         self.tokenUpdater = tokenUpdater
+        self.leasedProfileKeys = leasedProfileKeys
     }
 
     private enum RefreshResult {
@@ -120,6 +134,18 @@ final class UsageService: @unchecked Sendable {
             let accessToken = profile["access"] as? String
             let accessTokenMissing = accessToken?.isEmpty != false
             guard accessTokenMissing || Self.shouldAttemptTokenRefresh(usage) else { continue }
+            // A leased account's refresh token belongs to its lease home. Spending it here
+            // would log that home out, so the mirror brings its rotations back instead.
+            // Read right before the grant, so a lease taken during the usage fetch still counts.
+            let leasedKeys = leasedProfileKeys()
+            guard let leasedKeys, !leasedKeys.contains(key) else {
+                usages[key] = [
+                    "error": leasedKeys == nil
+                        ? Self.leaseStoreUnreadableError
+                        : Self.leasedRefreshDeferredError,
+                ]
+                continue
+            }
 
             switch await refreshProfile(profileKey: key, profile: profile) {
             case .unavailable:
