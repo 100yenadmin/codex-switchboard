@@ -69,13 +69,14 @@ Exit codes, for `check-switch` and `swap`; any nonzero means the main CLI was no
 For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys:
 
 ```bash
+set -o pipefail
 python3 scripts/codex-logins.py check-switch --profile-key "$HANDLE" \
   && codex-switchboard switch --profile-key "$HANDLE" --surface cli --json | jq '{error}' \
   && codex-switchboard status --json --surface cli \
-  | jq --arg h "$HANDLE" '(.surfaces[] | select(.kind == "cli") | .active_profile_key) as $k | {matched: ([.accounts[] | select(.profile_key == $k) | .handle] == [$h])}'
+  | jq -e --arg h "$HANDLE" '(.surfaces[] | select(.kind == "cli") | .active_profile_key) as $k | [.accounts[] | select(.profile_key == $k) | .handle] == [$h]'
 ```
 
-If `matched` is not `true`, treat the switch as failed and report the blocker. Use `--surface desktop` or `--surface both` only when that target was requested. Add `--stop-consumers` only after explicit authorization.
+If the chain exits nonzero or prints `false`, treat the switch as failed and report the blocker. Use `--surface desktop` or `--surface both` only when that target was requested. Add `--stop-consumers` only after explicit authorization.
 
 ## Auto-swap
 

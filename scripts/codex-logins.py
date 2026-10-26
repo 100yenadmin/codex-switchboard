@@ -123,9 +123,10 @@ def registry_lock():
 
 
 def app_support_dir():
-    """Switchboard's storage folder, found the way its CLI finds it."""
-    override = os.environ.get("CODEX_SWITCHBOARD_APP_SUPPORT", "").strip()
-    if override:
+    """Switchboard's storage folder, found the way its CLI finds it: an override is used exactly as given, since a
+    trimmed one would lock a different .auth.lock than the CLI's."""
+    override = os.environ.get("CODEX_SWITCHBOARD_APP_SUPPORT", "")
+    if override.strip():
         return override
     namespace = os.environ.get("CODEX_SWITCHBOARD_STORAGE_NAMESPACE")
     if namespace is not None:

@@ -2,6 +2,12 @@
 
 All notable changes to Codex Switchboard will be documented here.
 
+## Unreleased
+
+- `switch` refuses every key of a leased or registry-reserved seat (the same account id and email under another profile key), refuses every switch while the codex-logins registry cannot be read or reserves a key Switchboard no longer lists, and accepts a handle for `--profile-key`. Its `account_leased` and `surface_is_lease_home` refusals no longer name the lease holder.
+- `scripts/codex-logins.py` moves into this repository with its tests. `check-switch` exits 0 only when an account may become the main CLI account (1 reserved, 2 registry missing, unreadable or stale, 3 leased, 4 Switchboard's state unreadable); `swap [--dry-run]` moves the main CLI to the best account that passes, by handle, and confirms it (exits 0/2/4/5/6/7); `register` reserves a login under Switchboard's `.auth.lock`. It prints accounts by handle and never prints registry free text.
+- The `codex-switchboard` skill routes main-CLI swaps through `codex-logins.py`; `docs/agent-leases.md` is a one-page runbook for lanes that lease accounts.
+
 ## 1.0.13
 
 - Added agent leases: `codex-switchboard lease`, `return`, `leases` and `swap-lease` lend one paid, inactive account's captured auth to a separate `CODEX_HOME` and take it back. A refresh token is single-use, so a leased account has exactly one live holder: `switch`, `autoswap run-once`, auto-swap candidate ranking, in-app switches, sign-ins and removals all leave it alone, the app never refreshes its token, and the auth mirror writes every rotation in a lease home back to the stored profile and account list.

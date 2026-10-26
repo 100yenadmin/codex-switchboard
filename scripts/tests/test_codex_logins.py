@@ -272,6 +272,14 @@ total += 1
 print("%s %-72s got %d%s\n%s" % ("PASS" if ok else "FAIL", "status shows labels and handles, never free text", got,
                                  "  LEAK" if leak else "", text))
 
+# The CLI uses the override untrimmed; a trimmed one would put register's lock on another file.
+os.environ["CODEX_SWITCHBOARD_APP_SUPPORT"] = work + "/spaced "
+ok = cl.app_support_dir() == work + "/spaced "
+os.environ["CODEX_SWITCHBOARD_APP_SUPPORT"] = work
+fails += not ok
+total += 1
+print("%s %-72s" % ("PASS" if ok else "FAIL", "storage override used exactly as the CLI uses it"))
+
 _, dry, _ = run(["swap", "--dry-run"])
 ok = h(FREE) in dry and h(MAIN) in dry
 fails += not ok
