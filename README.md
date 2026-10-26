@@ -108,7 +108,7 @@ Codex Switchboard is local-first and never syncs tokens or exposes a remote serv
 | `~/Library/Application Support/CodexSwitchboard/.auth.lock` | Lock shared by the app and CLI for auth writes |
 | `~/Library/Application Support/CodexSwitchboard/refresh-reservations.json` | The app's in-flight token refreshes (no tokens), so a lease never starts mid-refresh |
 | `<lease home>/lease.json` | Marks the home as a lease home: lease id, holder and time only |
-| `<lease home>/config.toml` | Written by `lease` when absent: file credential store, and no `CODEX_HOME` for nested commands |
+| `<lease home>/config.toml` | Written by `lease` when absent: the file credential store, and `CODEX_HOME` for nested commands set to a path that does not exist |
 | `<lease home>/holder.lock` | `flock` a holder process keeps for its lifetime; `lease`, `return`, `swap-lease` and `switch` refuse while it is held |
 | `<lease home>/auth.json.lock` | `flock` shared with a lease home's holder around each read, refresh and write of its `auth.json` |
 | `<lease home>/auth.json.stopped` | Written by a holder that stopped after a credential failure; Switchboard leaves a quarantined home alone and never deletes it |

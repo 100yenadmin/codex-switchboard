@@ -56,9 +56,19 @@ final class UsageService: @unchecked Sendable {
                 // app's own CODEX_HOME names one. Without a readable lease store any CODEX_HOME
                 // could be one, so only ~/.codex, which is never a lease home, is written.
                 let leases = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL).load()
+                let reservedHomes = CodexReservedLogins.homes()
+                let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
                 let authURLs = leases.map { leases in
                     ActiveCodexAuthStore.defaultAuthURLs().filter { authURL in
-                        !leases.contains { CodexLease.sameHome($0.home, authURL.deletingLastPathComponent().path) }
+                        let home = authURL.deletingLastPathComponent()
+                        guard !leases.contains(where: { CodexLease.sameHome($0.home, home.path) }) else { return false }
+                        if CodexLease.sameHome(home.path, defaultHome) { return true }
+                        // Nor a reserved login's home, any lane home (it has holder.lock) or a quarantined
+                        // home: each belongs to its own holder even when no lease names it.
+                        guard let reservedHomes,
+                              !reservedHomes.contains(where: { CodexLease.sameHome($0, home.path) }) else { return false }
+                        return CodexFileProbe.isMissing(home.appendingPathComponent(CodexLeaseHome.holderLockFileName))
+                            && !CodexLeaseHome.isQuarantined(home: home.path)
                     }
                 } ?? ActiveCodexAuthStore.defaultAuthURLs(environment: [:])
                 try? ActiveCodexAuthStore.updateMatching(
@@ -112,7 +122,8 @@ final class UsageService: @unchecked Sendable {
 
         static let live = RefreshGate(
             reserve: { profileKey, expectedRefreshToken in
-                CodexAuthFileLock.withLock {
+                // A grant is admitted only under the cross-process lock; without it, skip this cycle.
+                (try? CodexAuthFileLock.withRequiredLock { () -> RefreshGate.Decision in
                     guard let leased = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
                         .leasedProfileKeys() else {
                         return .leaseStoreUnreadable
@@ -130,11 +141,14 @@ final class UsageService: @unchecked Sendable {
                     do {
                         try CodexRefreshReservations(appSupportURL: AppStorage.rootURL)
                             .reserve(profileKey: profileKey)
+                    } catch is CodexRefreshReservations.HeldElsewhere {
+                        // Another Switchboard app is refreshing this account; its rotation arrives next poll.
+                        return .stale
                     } catch {
                         return .leaseStoreUnreadable
                     }
                     return .granted
-                }
+                }) ?? .stale
             },
             release: { profileKey in
                 CodexAuthFileLock.withLock {

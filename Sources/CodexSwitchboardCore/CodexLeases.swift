@@ -206,6 +206,9 @@ public enum CodexAuthStoreLock {
         defer { state.lock.unlock() }
         if state.depth == 0 {
             state.descriptor = try acquire(appSupportURL: appSupportURL, timeout: timeout)
+        } else if state.descriptor < 0 {
+            // Nested in a best-effort hold that never got the file lock.
+            throw POSIXError(.ENOLCK)
         }
         state.depth += 1
         defer { release() }
@@ -716,15 +719,29 @@ public final class CodexRefreshReservations {
         url = appSupportURL.appendingPathComponent(Self.fileName)
     }
 
+    /// Thrown by `reserve` while another process's grant for the account may still be in flight.
+    public struct HeldElsewhere: Error {}
+
+    /// One grant per account at a time: a second app must not send the same token while the first
+    /// one's rotation is not stored yet.
     public func reserve(profileKey: String, pid: Int32 = Darwin.getpid(), now: Date = Date()) throws {
         var reservations = load()
+        if let existing = reservations[profileKey], existing.pid != pid,
+           Self.isRunning(existing.pid) || now.timeIntervalSince1970 - existing.since < Self.maxAge {
+            throw HeldElsewhere()
+        }
         reservations[profileKey] = Reservation(since: now.timeIntervalSince1970, pid: pid)
         try save(reservations)
     }
 
-    public func release(profileKey: String) throws {
+    private static func isRunning(_ pid: Int32) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    public func release(profileKey: String, pid: Int32 = Darwin.getpid()) throws {
         var reservations = load()
-        guard reservations.removeValue(forKey: profileKey) != nil else { return }
+        guard reservations[profileKey]?.pid == pid else { return }
+        reservations.removeValue(forKey: profileKey)
         try save(reservations)
     }
 
@@ -752,12 +769,15 @@ public final class CodexRefreshReservations {
 /// so the CLI refuses to lease while one runs.
 public enum CodexLeaseMirrorMarker {
     public static let fileName = "lease-mirror.json"
+    /// 2: the app also refuses to sign in to or remove a leased account. An app that records 1
+    /// predates that and counts as not lease-aware.
+    static let leaseSupport = 2
 
     public static func record(appSupportURL: URL, pid: Int32 = Darwin.getpid()) throws {
         try CodexAtomicFile.writeJSON(
             [
                 "pid": Int(pid),
-                "lease_support": 1,
+                "lease_support": leaseSupport,
                 "started_at": ISO8601DateFormatter().string(from: Date()),
             ],
             to: appSupportURL.appendingPathComponent(fileName)
@@ -766,7 +786,7 @@ public enum CodexLeaseMirrorMarker {
 
     public static func recordedPID(appSupportURL: URL) -> Int32? {
         guard let root = readJSON(appSupportURL.appendingPathComponent(fileName)),
-              (root["lease_support"] as? Int ?? 0) >= 1,
+              (root["lease_support"] as? Int ?? 0) >= leaseSupport,
               let pid = root["pid"] as? Int else {
             return nil
         }
@@ -787,8 +807,8 @@ public enum CodexFileProbe {
     }
 }
 
-enum CodexAtomicFile {
-    static func writeJSON(_ object: Any, to url: URL, permissions: Int = 0o600) throws {
+public enum CodexAtomicFile {
+    public static func writeJSON(_ object: Any, to url: URL, permissions: Int = 0o600) throws {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         try write(data, to: url, permissions: permissions)
     }
@@ -796,7 +816,7 @@ enum CodexAtomicFile {
     /// Writes durably: a new temporary file beside the destination, `F_FULLFSYNC`, a rename over the
     /// destination, then a sync of the folder. A process killed at any point leaves the old file or
     /// the new one; after a power loss the same holds as far as the drive honours the full sync.
-    static func write(_ data: Data, to url: URL, permissions: Int = 0o600) throws {
+    public static func write(_ data: Data, to url: URL, permissions: Int = 0o600) throws {
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: directory,

@@ -461,7 +461,7 @@ private struct SwapLeaseOptions {
             throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
         }
         if let profileKey, excluded.contains(profileKey) {
-            throw CLIError.usage("--profile-key \(profileKey) is also excluded.", jsonPreferred: false)
+            throw CLIError.usage("--profile-key is also excluded.", jsonPreferred: false)
         }
         return SwapLeaseOptions(
             json: json,
@@ -1094,10 +1094,19 @@ private final class CLISwitchService {
                 details: nil
             )
         }
-        // An unreadable registry does not stop a switch; a home a holder ever used has holder.lock.
-        let reservedHomes = (try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL))?.homes ?? []
+        // A missing registry reserves nothing. An unreadable one blocks only a switch into a home other
+        // than ~/.codex, which is never a reserved login's home.
+        let reservedHomes = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL).homes
+        let defaultHome = paths.homeURL.appendingPathComponent(".codex").path
         for surface in surfaces {
             let surfaceHome = URL(fileURLWithPath: surface.authStorePath).deletingLastPathComponent().path
+            if reservedHomes == nil, !CodexLease.sameHome(surfaceHome, defaultHome) {
+                throw CLIError.refused(
+                    code: "reserved_registry_unreadable",
+                    message: "The codex-logins registry cannot be read, so Switchboard cannot tell whether the \(surface.kind.rawValue) auth store is a reserved login's home; fix the registry or unset CODEX_HOME before switching.",
+                    details: nil
+                )
+            }
             if let lease = leases.first(where: { CodexLease.sameHome($0.home, surfaceHome) }) {
                 throw CLIError.refused(
                     code: "surface_is_lease_home",
@@ -1105,7 +1114,7 @@ private final class CLISwitchService {
                     details: nil
                 )
             }
-            if reservedHomes.contains(where: { CodexLease.sameHome($0, surfaceHome) }) {
+            if (reservedHomes ?? []).contains(where: { CodexLease.sameHome($0, surfaceHome) }) {
                 throw CLIError.refused(
                     code: "surface_is_reserved_home",
                     message: "The \(surface.kind.rawValue) auth store is a reserved login's home in the codex-logins registry; unset CODEX_HOME before switching.",
@@ -1272,8 +1281,9 @@ private struct ReservedLogins {
 /// reserves nothing here: `holder.lock` still marks every home a holder has used, and a reserved
 /// account only shares its quota with a switch, not its token chain.
 public enum CodexReservedLogins {
-    public static func homes(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String] {
-        load(homeURL: homeURL)?.homes ?? []
+    /// Nil when the registry exists but cannot be read.
+    public static func homes(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String]? {
+        load(homeURL: homeURL)?.homes
     }
 
     public static func profileKeys(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> Set<String> {
@@ -1321,42 +1331,9 @@ private final class CLILeaseService {
             if let existing = leases.first(where: { CodexLease.sameHome($0.home, requestedHome) }) {
                 throw refused("home_already_leased", "\(requestedHome) already holds the lease of \(existing.holder).")
             }
-            try ensureNotReserved(profileKey: profileKey, home: requestedHome)
-            if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
-                .isReserved(profileKey: profileKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
-                throw refused(
-                    "refresh_in_progress",
-                    "Switchboard is refreshing the token of \(handle) right now; lease again in a few seconds."
-                )
-            }
-            let surfaces = surfaceService.statuses(scope: .all)
-            if surfaces.contains(where: { $0.activeProfileKey == profileKey }) {
-                throw refused(
-                    "active_account",
-                    "\(handle) is the active CLI or Desktop account; lease an account no surface is using."
-                )
-            }
-            if let unknown = surfaces.first(where: { $0.detected && !$0.supportsFileSwitching }) {
-                throw refused(
-                    "surface_identity_unknown",
-                    "The \(unknown.displayName) keeps its sign-in in a \(unknown.authStoreMode) store, so Switchboard cannot tell which account it uses and could lease that account."
-                )
-            }
-            try ensureLeasableAccount(profileKey: profileKey)
-            try ensureAppMirrorsLeases()
-
+            let (profile, profileAuth) = try ensureCanLend(profileKey: profileKey, into: requestedHome)
             let configURL = URL(fileURLWithPath: requestedHome).appendingPathComponent("config.toml")
-            let configText = try? String(contentsOf: configURL, encoding: .utf8)
-            let mode = CodexCredentialStoreMode.resolve(config: configText, surface: .cli)
-            guard mode == "file" else {
-                throw CLIError.unsupportedMode(surface: "lease home", mode: mode, path: requestedHome, jsonPreferred: true)
-            }
-
-            let profile = try CapturedProfileStore(paths: paths).profile(sourceProfileKey: profileKey)
-            guard let profileAuth = StoredAuth.load(from: profile.authURL), profileAuth.hasCompleteTokens else {
-                throw CLIError.failure(message: "Captured profile is missing valid redacted identity fields.", jsonPreferred: true)
-            }
-            try ensureStoredCopiesAgree(profileKey: profileKey, profileAuth: profileAuth)
+            let configText = try leaseConfigText(at: configURL, home: requestedHome)
 
             if CodexLeaseHome.isQuarantined(home: requestedHome) {
                 throw quarantined(requestedHome)
@@ -1617,6 +1594,8 @@ private final class CLILeaseService {
                 throw quarantined(current.home)
             }
             let excludedKeys = Set(try excludedGiven.map { try resolveAccount($0) })
+            // An unusable registry makes nothing leasable; say so instead of no_candidate.
+            try ensureRegistryUsable()
             let candidates = annotateLeasable(accountStore.accounts())
             let targetKey: String
             if let requestedKey {
@@ -1637,7 +1616,7 @@ private final class CLILeaseService {
                 throw refused("same_account", "\(targetHandle) is already the account leased at \(current.home).")
             }
             // Check the target before giving anything back, so a refusal leaves the lane as it was.
-            try ensureNotReserved(profileKey: targetKey, home: nil)
+            try ensureNotReserved(profileKey: targetKey, home: current.home)
             if let target = candidates.first(where: { $0.profileKey == targetKey }), !target.leasable {
                 try ensureLeasableAccount(profileKey: targetKey)
                 let (code, reason) = target.leased
@@ -1647,15 +1626,11 @@ private final class CLILeaseService {
                         : ("not_usable", "it has no usable quota left")
                 throw refused(code, "\(targetHandle) cannot be leased now: \(reason).")
             }
-            try ensureLeasableAccount(profileKey: targetKey)
-            if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
-                .isReserved(profileKey: targetKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
-                throw refused(
-                    "refresh_in_progress",
-                    "Switchboard is refreshing the token of \(targetHandle) right now; swap again in a few seconds."
-                )
-            }
-            try ensureAppMirrorsLeases()
+            _ = try ensureCanLend(profileKey: targetKey, into: current.home)
+            _ = try leaseConfigText(
+                at: URL(fileURLWithPath: current.home).appendingPathComponent("config.toml"),
+                home: current.home
+            )
 
             return try withHolder(current.home) {
                 try ensureMarkerMatches(current)
@@ -1704,8 +1679,11 @@ private final class CLILeaseService {
     }
 
     /// A key given on the command line, shown without its email: handles stay, keys become handles.
+    /// A well-formed handle is shown as given; anything else, which may embed an email, by its handle.
     private static func display(_ given: String) -> String {
-        given.hasPrefix("acct_") ? given : CodexAccountHandle.handle(for: given)
+        given.range(of: "^acct_[0-9a-f]{12}$", options: .regularExpression) != nil
+            ? given
+            : CodexAccountHandle.handle(for: given)
     }
 
     private func refused(_ code: String, _ message: String, details: [String]? = nil) -> CLIError {
@@ -1806,7 +1784,24 @@ private final class CLILeaseService {
         )
     }
 
+    private func ensureRegistryUsable() throws {
+        _ = try usableRegistry()
+    }
+
     private func ensureNotReserved(profileKey: String, home: String?) throws {
+        let reserved = try usableRegistry()
+        if reserved.profileKeys.contains(profileKey) {
+            throw refused(
+                "reserved_account",
+                "\(CodexAccountHandle.handle(for: profileKey)) is reserved in the codex-logins registry for its own consumer."
+            )
+        }
+        if let home, reserved.homes.contains(where: { CodexLease.sameHome($0, home) }) {
+            throw refused("home_reserved", "\(home) is a reserved login's home in the codex-logins registry.")
+        }
+    }
+
+    private func usableRegistry() throws -> ReservedLogins {
         let reserved: ReservedLogins
         do {
             reserved = try ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
@@ -1822,15 +1817,112 @@ private final class CLILeaseService {
                 "\(paths.reservedLoginsURL.path) reserves an account Switchboard no longer lists under that key (a new sign-in can re-key an account); refusing to guess which account it means. Register that login again, then lease."
             )
         }
-        if reserved.profileKeys.contains(profileKey) {
+        return reserved
+    }
+
+    /// Everything about the account and the surfaces that lease requires, checked again by swap-lease
+    /// before it gives the lane's account back, so that a refusal leaves the lane as it was.
+    private func ensureCanLend(profileKey: String, into home: String) throws -> (CapturedProfile, StoredAuth) {
+        let handle = CodexAccountHandle.handle(for: profileKey)
+        try ensureNotReserved(profileKey: profileKey, home: home)
+        if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
+            .isReserved(profileKey: profileKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
             throw refused(
-                "reserved_account",
-                "\(CodexAccountHandle.handle(for: profileKey)) is reserved in the codex-logins registry for its own consumer."
+                "refresh_in_progress",
+                "Switchboard is refreshing the token of \(handle) right now; try again in a few seconds."
             )
         }
-        if let home, reserved.homes.contains(where: { CodexLease.sameHome($0, home) }) {
-            throw refused("home_reserved", "\(home) is a reserved login's home in the codex-logins registry.")
+        let surfaces = surfaceService.statuses(scope: .all)
+        if surfaces.contains(where: { $0.activeProfileKey == profileKey }) {
+            throw refused(
+                "active_account",
+                "\(handle) is the active CLI or Desktop account; lease an account no surface is using."
+            )
         }
+        if let unknown = surfaces.first(where: { $0.detected && !$0.supportsFileSwitching }) {
+            throw refused(
+                "surface_identity_unknown",
+                "The \(unknown.displayName) keeps its sign-in in a \(unknown.authStoreMode) store, so Switchboard cannot tell which account it uses and could lease that account."
+            )
+        }
+        try ensureLeasableAccount(profileKey: profileKey)
+        try ensureOneKeyPerSeat(profileKey: profileKey)
+        try ensureAppMirrorsLeases()
+        let profile = try CapturedProfileStore(paths: paths).profile(sourceProfileKey: profileKey)
+        guard let profileAuth = StoredAuth.load(from: profile.authURL), profileAuth.hasCompleteTokens else {
+            throw CLIError.failure(message: "Captured profile is missing valid redacted identity fields.", jsonPreferred: true)
+        }
+        try ensureStoredCopiesAgree(profileKey: profileKey, profileAuth: profileAuth)
+        return (profile, profileAuth)
+    }
+
+    /// Every check of a lease runs on its profile key, so a seat listed under a second key would let
+    /// that key be switched to, refreshed or leased while its chain is out.
+    private func ensureOneKeyPerSeat(profileKey: String) throws {
+        guard let profiles = readJSON(paths.accountsURL)?["profiles"] as? [String: [String: Any]],
+              let entry = profiles[profileKey],
+              let accountID = entry["accountId"] as? String, !accountID.isEmpty,
+              let email = (entry["email"] as? String)?.lowercased(), !email.isEmpty else {
+            return
+        }
+        let others = profiles.filter { key, value in
+            key != profileKey
+                && value["accountId"] as? String == accountID
+                && (value["email"] as? String)?.lowercased() == email
+        }
+        guard others.isEmpty else {
+            throw refused(
+                "duplicate_account_keys",
+                "Switchboard lists \(CodexAccountHandle.handle(for: profileKey))'s seat under more than one key. Remove the extra entry in the Switchboard app, then lease."
+            )
+        }
+    }
+
+    /// The config.toml a lease relies on: absent (lease writes its own), or one that keeps Codex on the
+    /// file store and gives nested commands a CODEX_HOME of their own. Anything else is refused, since
+    /// a keychain store moves the chain out of sight and a nested `codex` would share it.
+    private func leaseConfigText(at configURL: URL, home: String) throws -> String? {
+        if CodexFileProbe.isMissing(configURL) { return nil }
+        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else {
+            throw refused(
+                "home_config_unsafe",
+                "\(configURL.path) cannot be read, so Switchboard cannot check it. Move it away, then lease again."
+            )
+        }
+        let mode = CodexCredentialStoreMode.resolve(config: text, surface: .cli)
+        guard mode == "file" else {
+            throw CLIError.unsupportedMode(surface: "lease home", mode: mode, path: home, jsonPreferred: true)
+        }
+        guard Self.keepsLeaseOnFileStore(text), Self.givesNestedCommandsTheirOwnHome(text) else {
+            throw refused(
+                "home_config_unsafe",
+                "\(configURL.path) must set cli_auth_credentials_store = \"file\" and, under [shell_environment_policy], set CODEX_HOME to a path that does not exist, so a nested codex cannot share this home's sign-in. Add both, or move the file away so lease writes its own."
+            )
+        }
+        return text
+    }
+
+    static func keepsLeaseOnFileStore(_ config: String) -> Bool {
+        config.range(of: #"(?m)^\s*cli_auth_credentials_store\s*=\s*"file""#, options: .regularExpression) != nil
+    }
+
+    static func givesNestedCommandsTheirOwnHome(_ config: String) -> Bool {
+        var section = ""
+        for rawLine in config.split(separator: "\n") {
+            let line = (rawLine.split(separator: "#", maxSplits: 1).first.map(String.init) ?? "")
+                .trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                section = line.replacingOccurrences(of: " ", with: "")
+                continue
+            }
+            if section == "[shell_environment_policy]", line.hasPrefix("set"), line.contains("CODEX_HOME") {
+                return true
+            }
+            if section == "[shell_environment_policy.set]", line.hasPrefix("CODEX_HOME") {
+                return true
+            }
+        }
+        return false
     }
 
     /// The captured profile is what lease copies. If its token differs from the account list's, an

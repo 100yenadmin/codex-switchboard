@@ -99,7 +99,7 @@ final class CodexAccountCaptureService: @unchecked Sendable {
 
         let tokenResponse = try await exchangeCode(code, verifier: verifier)
         let identity = try identity(from: tokenResponse.idToken)
-        let (localProfileKey, profileName) = try CodexAuthFileLock.withLock { () throws -> (String, String) in
+        let (localProfileKey, profileName) = try CodexAuthFileLock.withRequiredLock { () throws -> (String, String) in
             let localProfileKey = try plannedLocalProfileKey(identity: identity)
             try LeasedAccountGuard.rejectIfLeased(
                 profileKeys: [localProfileKey],
@@ -169,7 +169,7 @@ final class CodexAccountCaptureService: @unchecked Sendable {
         let tokenResponse = try await exchangeCode(code, verifier: verifier)
         let identity = try identity(from: tokenResponse.idToken)
         try validate(identity: identity, matches: target)
-        let (localProfileKey, profileName) = try CodexAuthFileLock.withLock { () throws -> (String, String) in
+        let (localProfileKey, profileName) = try CodexAuthFileLock.withRequiredLock { () throws -> (String, String) in
             let localProfileKey = try plannedLocalProfileKey(identity: identity, target: target)
             try LeasedAccountGuard.rejectIfLeased(
                 profileKeys: Set([localProfileKey] + [target.profileKey].compactMap { $0 }),
@@ -775,7 +775,7 @@ final class LocalAccountRemovalService: @unchecked Sendable {
             throw LocalAccountRemovalError.missingProfileKey
         }
 
-        return try CodexAuthFileLock.withLock {
+        return try CodexAuthFileLock.withRequiredLock {
             let profiles = AccountProfileStore.loadLocalProfiles()
             let removeKeys = profileKeysToRemove(from: profiles, profileKey: profileKey, account: account)
             try LeasedAccountGuard.rejectIfLeased(
@@ -918,6 +918,7 @@ enum CodexAccountSwitchError: LocalizedError {
     case accountLeased(holder: String)
     case destinationIsLeaseHome(holder: String)
     case destinationIsReservedHome
+    case reservedRegistryUnreadable
     case destinationIsLaneHome
     case leaseStoreUnreadable
     case capturedProfileIdentityMismatch(
@@ -945,6 +946,8 @@ enum CodexAccountSwitchError: LocalizedError {
             return "The Codex auth store is the lease home of \(holder); switch canceled. Unset CODEX_HOME or return that lease first."
         case .destinationIsReservedHome:
             return "The Codex auth store is a reserved login's home in the codex-logins registry; switch canceled. Unset CODEX_HOME first."
+        case .reservedRegistryUnreadable:
+            return "The codex-logins registry cannot be read, so the Codex auth store may be a reserved login's home; switch canceled. Fix the registry or unset CODEX_HOME first."
         case .destinationIsLaneHome:
             return "The Codex auth store is in a lane home (it has \(CodexLeaseHome.holderLockFileName)), which only its holder or a lease writes; switch canceled. Unset CODEX_HOME first."
         case .leaseStoreUnreadable:
@@ -1080,7 +1083,13 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         }
         if let destination {
             let home = destination.deletingLastPathComponent()
-            if CodexReservedLogins.homes().contains(where: { CodexLease.sameHome($0, home.path) }) {
+            let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+            // An unreadable registry blocks only a switch into a home other than ~/.codex.
+            guard let reservedHomes = CodexReservedLogins.homes()
+                    ?? (CodexLease.sameHome(home.path, defaultHome.path) ? [] : nil) else {
+                throw CodexAccountSwitchError.reservedRegistryUnreadable
+            }
+            if reservedHomes.contains(where: { CodexLease.sameHome($0, home.path) }) {
                 throw CodexAccountSwitchError.destinationIsReservedHome
             }
             if !CodexFileProbe.isMissing(home.appendingPathComponent(CodexLeaseHome.holderLockFileName)) {

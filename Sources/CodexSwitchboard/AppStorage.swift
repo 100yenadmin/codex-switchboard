@@ -1,3 +1,4 @@
+import CodexSwitchboardCore
 import Foundation
 
 enum AppStorage {
@@ -59,17 +60,11 @@ enum AppStorage {
         try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
     }
 
+    /// Durable and atomic: a process killed at any point leaves the old file or the new one, never
+    /// neither, so a stored rotation is never only in a temporary file.
     static func writeJSON(_ object: Any, to url: URL, permissions: Int = 0o600) throws {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         try ensureDirectory(url.deletingLastPathComponent(), permissions: 0o700)
-        let tempURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: tempURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: tempURL.path)
-        if fileManager.fileExists(atPath: url.path) {
-            try fileManager.removeItem(at: url)
-        }
-        try fileManager.moveItem(at: tempURL, to: url)
+        try CodexAtomicFile.writeJSON(object, to: url, permissions: permissions)
     }
 
     static func readJSON(_ url: URL) -> [String: Any]? {

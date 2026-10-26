@@ -140,6 +140,14 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         if let profileKey = match.sourceProfileKey, leasedKeys.contains(profileKey) {
             return CodexAuthMirrorResult(status: .skipped, profileKey: profileKey, reason: "leased profile")
         }
+        // A refresh always moves the access token's expiry forward. Live auth that expires before the
+        // stored copy is the older link of the chain, for example after the app stored a rotation and
+        // could not pass it on; copying it back would replace the stored successor with a spent token.
+        if liveAuth.refreshToken != match.auth.refreshToken,
+           liveAuth.accessExpiresAt > 0,
+           liveAuth.accessExpiresAt < match.auth.accessExpiresAt {
+            return CodexAuthMirrorResult(status: .skipped, profileKey: match.sourceProfileKey, reason: "live auth is older than the stored copy")
+        }
 
         do {
             try copyAuth(liveAuth.root, to: match.authURL)
@@ -264,6 +272,15 @@ enum CodexAuthFileLock {
         _ body: () throws -> T
     ) rethrows -> T {
         try CodexAuthStoreLock.withLock(appSupportURL: storageRootURL, body)
+    }
+
+    /// For writes that must not overlap a CLI lease, return or switch: fails instead of running
+    /// with the in-process lock alone.
+    static func withRequiredLock<T>(
+        storageRootURL: URL = AppStorage.rootURL,
+        _ body: () throws -> T
+    ) throws -> T {
+        try CodexAuthStoreLock.withRequiredLock(appSupportURL: storageRootURL, body)
     }
 }
 
