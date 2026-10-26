@@ -17,7 +17,7 @@ switch. K may be a profile key or a Switchboard handle (acct_ + 12 hex). An acco
 reserved or leased one is refused too, since Switchboard can list one seat under two keys.
 
 swap exits: 0 switched (with --dry-run: an account passes); 2 or 4 as for check-switch; 5 no account passes;
-6 Switchboard refused or failed the switch; 7 the switch did not take.
+6 Switchboard refused or failed the switch; 7 the switch did not take or cannot be confirmed.
 
 Nothing here prints an email, account id, profile key, holder name, token, or the registry's free text (consumer,
 owner, notes, home path): accounts appear by handle and reserved logins by their purpose label. register takes
@@ -169,8 +169,8 @@ def cs_json(*args):
     """A Switchboard command's JSON object. Refusal(4) if it cannot run, fails or prints anything else."""
     try:
         r = cs_run(*args)
-    except (OSError, subprocess.SubprocessError) as e:
-        raise Refusal(4, "%s could not run (%s)" % (args[0], type(e).__name__))
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        raise Refusal(4, "%s could not run or printed something that is not text (%s)" % (args[0], type(e).__name__))
     if r.returncode != 0:
         raise Refusal(4, "%s failed (exit %d)" % (args[0], r.returncode))
     try:
@@ -191,8 +191,7 @@ def email_of(account):
 
 
 def switchboard_state():
-    """(accounts, leased handles, active CLI profile key or None, every surface's active key). Refusal(4) on anything
-    unexpected.
+    """(accounts, leased handles, active CLI profile key or None, the surfaces). Refusal(4) on anything unexpected.
 
     `leases --json` fails when the lease store cannot be read, while `status --json` would show no leases, so leases
     come from the first and are cross-checked with the second's per-account flag."""
@@ -213,8 +212,7 @@ def switchboard_state():
     surfaces = status.get("surfaces") if isinstance(status.get("surfaces"), list) else []
     active = next((s.get("active_profile_key") for s in surfaces
                    if isinstance(s, dict) and s.get("kind") == "cli" and s.get("active_profile_key")), None)
-    actives = {s.get("active_profile_key") for s in surfaces if isinstance(s, dict)} - {None, ""}
-    return accounts, leased, active, actives
+    return accounts, leased, active, [s for s in surfaces if isinstance(s, dict)]
 
 
 def verdict(given, reserved, accounts, leased):
@@ -252,7 +250,10 @@ def refuse(code, message):
 
 
 def switchboard():
-    r = cs_run("status", "--json", "--surface", "cli")
+    try:
+        r = cs_run("status", "--json", "--surface", "cli")
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        sys.exit("switchboard status could not run (%s)" % type(e).__name__)
     if r.returncode != 0:
         sys.exit("switchboard status failed (exit %d)" % r.returncode)
     d = json.loads(r.stdout)
@@ -352,7 +353,7 @@ def cmd_register(a):
     # too: a switch to this account either finishes first, and is seen here, or sees the reservation.
     with auth_store_lock(), registry_lock():
         try:
-            accounts, leased, _, actives = switchboard_state()
+            accounts, leased, _, surfaces = switchboard_state()
             hits = [(i, x) for i, x in enumerate(accounts, 1) if email_of(x) == email]
             leased_seat = len(hits) == 1 and verdict(hits[0][1]["profile_key"], set(), accounts, leased)[0] == 3
         except Refusal as r:
@@ -361,7 +362,12 @@ def cmd_register(a):
             sys.exit("refused: %d Switchboard accounts match this login (need exactly 1)" % len(hits))
         num, acct = hits[0]
         key = acct["profile_key"]
-        if key in actives or email in {email_of(x) for x in accounts if x["profile_key"] in actives}:
+        if any(s.get("detected") is True and s.get("supports_file_switching") is not True for s in surfaces):
+            sys.exit("refused: a CLI or Desktop surface keeps its sign-in in a keychain or auto store, so Switchboard "
+                     "cannot tell which account it is on; register once every surface uses the file store")
+        actives = {s.get("active_profile_key") for s in surfaces} - {None, ""}
+        active_emails = {str(s.get("active_email") or "").strip().lower() for s in surfaces} - {""}
+        if key in actives or email in active_emails or email in {email_of(x) for x in accounts if x["profile_key"] in actives}:
             sys.exit("refused: this login is Switchboard #%d, the account a CLI or Desktop surface is on; "
                      "move that surface off it first (codex-logins.py swap)" % num)
         if acct.get("is_free_plan"):
@@ -422,9 +428,9 @@ def cmd_swap(a):
     # Switchboard re-checks leases and the registry by seat under its own lock before it writes.
     try:
         r = cs_run("switch", "--profile-key", chosen["handle"], "--surface", "cli", "--json")
-    except (OSError, subprocess.SubprocessError) as e:
-        # A switch killed on timeout may or may not have written, so its outcome cannot be confirmed.
-        return refuse(7, "the switch to %s did not finish (%s), so it cannot be confirmed" % (chosen["handle"], type(e).__name__))
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        # A switch killed on timeout, or one whose output cannot be decoded, may or may not have written.
+        return refuse(7, "the switch to %s did not finish cleanly (%s), so it cannot be confirmed" % (chosen["handle"], type(e).__name__))
     if r.returncode != 0:
         try:
             error = json.loads(r.stdout or r.stderr).get("error")

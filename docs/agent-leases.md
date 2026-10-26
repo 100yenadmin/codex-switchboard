@@ -71,4 +71,5 @@ python3 scripts/codex-logins.py register --purpose LABEL --home DIR --consumer T
 ```
 
 `LABEL` is a lowercase label; it is the only registry text the tool prints. Registration refuses the account a CLI
-or Desktop surface is on, a leased account, a free-plan account, and an account reserved under another label.
+or Desktop surface is on, a leased account, a free-plan account, and an account reserved under another label, and
+refuses while a surface keeps its sign-in in a keychain, where Switchboard cannot see which account it is on.

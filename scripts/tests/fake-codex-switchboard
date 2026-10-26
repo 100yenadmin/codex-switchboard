@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fake codex-switchboard for the codex-logins tests. Each command's output comes from $FAKE_CS_FIXTURE:
-{"status": <obj> | "!exit" | "!garbage" | "!list", "leases": ..., "switch": "!ok" | "!exit" | "!noop" | "!hang"}.
+{"status": <obj> | "!exit" | "!garbage" | "!list", "leases": ..., "switch": "!ok" | "!exit" | "!noop" | "!hang"};
+"!badutf8" prints bytes that are not UTF-8.
 A successful switch records its --profile-key in the fixture's "switched" list and makes that account the CLI's
 active one. Exits 99 if CODEX_HOME reaches it."""
 import hashlib
@@ -31,6 +32,9 @@ if cmd == "switch":
                 s["active_profile_key"] = key
     with open(path, "w") as f:
         json.dump(fx, f)
+    if out == "!badutf8":
+        sys.stdout.buffer.write(b"\xff\xfe{")
+        sys.exit(0)
     if out == "!exit":
         print(json.dumps({"error": "consumers_running", "message": "a@example.invalid is busy"}))
         sys.exit(2)
@@ -39,6 +43,9 @@ if cmd == "switch":
 if out == "!exit":
     print(json.dumps({"error": "lease_store_unreadable"}))
     sys.exit(2)
+if out == "!badutf8":
+    sys.stdout.buffer.write(b"\xff\xfe{")
+    sys.exit(0)
 if out == "!garbage":
     print("not json {")
     sys.exit(0)
