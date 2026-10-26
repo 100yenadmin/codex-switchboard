@@ -1162,6 +1162,41 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
     }
 
+    func testSwitchRefusesEveryKeyOfALeasedOrReservedSeat() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let liveAuth = fixture.home.appendingPathComponent(".codex/auth.json")
+        let before = try Data(contentsOf: liveAuth)
+
+        // A later sign-in lists the leased seat under a second key.
+        try fixture.addKey("profile-k2", sameSeatAs: "profile-k")
+        let leased = fixture.run(["switch", "--profile-key", "profile-k2", "--surface", "cli", "--json"])
+        XCTAssertEqual(leased.json["error"] as? String, "account_leased", leased.text)
+
+        try fixture.writeRegistry([["purpose": "bench", "profile_key": "profile-b", "codex_home": "~/bench-home"]])
+        try fixture.addKey("profile-b2", sameSeatAs: "profile-b")
+        for key in ["profile-b", "profile-b2"] {
+            let reserved = fixture.run(["switch", "--profile-key", key, "--surface", "cli", "--json"])
+            XCTAssertEqual(reserved.json["error"] as? String, "reserved_account", "\(key): \(reserved.text)")
+            XCTAssertFalse(reserved.text.contains("example.invalid"), reserved.text)
+        }
+
+        // A reservation whose key Switchboard no longer lists could be any seat, so no switch goes ahead.
+        try fixture.writeRegistry([["purpose": "bench", "profile_key": "profile-gone", "codex_home": "~/bench-home"]])
+        let stale = fixture.run(["switch", "--profile-key", "profile-b", "--surface", "cli", "--json"])
+        XCTAssertEqual(stale.json["error"] as? String, "reserved_registry_stale", stale.text)
+
+        // An unreadable registry stops a switch into ~/.codex as well.
+        try Data("{not json".utf8).write(to: fixture.home.appendingPathComponent(".config/codex-logins/registry.json"))
+        let unreadable = fixture.run(["switch", "--profile-key", "profile-b", "--surface", "cli", "--json"])
+        XCTAssertEqual(unreadable.json["error"] as? String, "reserved_registry_unreadable", unreadable.text)
+
+        XCTAssertEqual(try Data(contentsOf: liveAuth), before)
+    }
+
     func testSwitchIntoAnotherHomeNeedsAReadableRegistry() throws {
         let other = fixture.root.appendingPathComponent("other-codex-home", isDirectory: true)
         try fixture.writeAuth(account: "a", generation: 1, to: other.appendingPathComponent("auth.json"))
@@ -1490,6 +1525,16 @@ private struct LeaseFixture {
 
     func permissions(of url: URL) -> Int? {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber)?.intValue
+    }
+
+    /// Lists `existing`'s seat (same email and account id) under one more key in the account list.
+    func addKey(_ key: String, sameSeatAs existing: String) throws {
+        let accountsURL = appSupport.appendingPathComponent("accounts.json")
+        var root = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: accountsURL)) as? [String: Any])
+        var profiles = try XCTUnwrap(root["profiles"] as? [String: Any])
+        profiles[key] = profiles[existing]
+        root["profiles"] = profiles
+        try CodexAtomicFile.writeJSON(root, to: accountsURL)
     }
 
     func writeRegistry(_ logins: [[String: Any]]) throws {

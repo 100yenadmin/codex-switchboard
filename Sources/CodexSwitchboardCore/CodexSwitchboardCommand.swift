@@ -135,8 +135,11 @@ private final class CommandRunner {
 
     private func switchProfile(_ args: [String]) throws -> CommandResult {
         let options = try SwitchOptions.parse(args)
+        // A handle names an account without its email, so callers can pass one instead of the key.
+        let profileKey = CodexAccountHandle.resolve(options.profileKey, among: accountStore.accounts().map(\.profileKey))
+            ?? options.profileKey
         let outcome = try switchService.switchProfile(
-            profileKey: options.profileKey,
+            profileKey: profileKey,
             scope: options.surface,
             stopConsumers: options.stopConsumers
         )
@@ -364,6 +367,7 @@ private final class CommandRunner {
     private static let helpText = """
     codex-switchboard status --json [--surface all|desktop|cli] [--paid-only] [--usable-only] [--leasable-only]
     codex-switchboard switch --profile-key <key> --surface desktop|cli|both --json [--stop-consumers]
+        (<key> may be a profile key or a handle)
     codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
     codex-switchboard return --profile-key <key> --home <dir> --json
     codex-switchboard leases --json
@@ -1104,28 +1108,48 @@ private final class CLISwitchService {
     }
 
     /// A leased account has exactly one live holder, its lease home, and a lease home is never a switch target.
+    /// A registry-reserved account belongs to its own consumer. Both are matched by seat, so another key that
+    /// Switchboard lists for the same seat is refused too.
     private func ensureSwitchable(profileKey: String, surfaces: [SurfaceStatusPayload]) throws {
+        let handle = CodexAccountHandle.handle(for: profileKey)
+        let seat = seatKeys(of: profileKey)
         let leases = try paths.leaseStore.load()
-        if let lease = leases.first(where: { $0.profileKey == profileKey }) {
+        if let lease = leases.first(where: { seat.contains($0.profileKey) }) {
             throw CLIError.refused(
                 code: "account_leased",
-                message: "\(CodexAccountHandle.handle(for: profileKey)) is leased to \(lease.holder); return the lease before switching to it.",
+                message: "\(handle) is leased to \(lease.holder)\(lease.profileKey == profileKey ? "" : " under another key of its seat"); return the lease before switching to it.",
                 details: nil
             )
         }
-        // A missing registry reserves nothing. An unreadable one blocks only a switch into a home other
-        // than ~/.codex, which is never a reserved login's home.
-        let reservedHomes = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL).homes
-        let defaultHome = paths.homeURL.appendingPathComponent(".codex").path
+        // A missing registry reserves nothing. One that cannot be read, or that reserves a key Switchboard no
+        // longer lists, cannot say which seat it reserves, so every switch waits until it is fixed.
+        let registry: ReservedLogins
+        do {
+            registry = try ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
+        } catch {
+            throw CLIError.refused(
+                code: "reserved_registry_unreadable",
+                message: "The codex-logins registry cannot be read or lists a login without a profile_key, so Switchboard cannot tell whether \(handle) is reserved; fix the registry before switching.",
+                details: nil
+            )
+        }
+        let listed = Set((readJSON(paths.accountsURL)?["profiles"] as? [String: Any])?.keys.map { $0 } ?? [])
+        if !registry.staleKeys(among: listed).isEmpty {
+            throw CLIError.refused(
+                code: "reserved_registry_stale",
+                message: "The codex-logins registry reserves a key Switchboard no longer lists (a new sign-in can re-key an account), so Switchboard cannot tell whether \(handle) is that account; register that login again before switching.",
+                details: nil
+            )
+        }
+        if !registry.profileKeys.isDisjoint(with: seat) {
+            throw CLIError.refused(
+                code: "reserved_account",
+                message: "\(handle) is reserved in the codex-logins registry for its own consumer.",
+                details: nil
+            )
+        }
         for surface in surfaces {
             let surfaceHome = URL(fileURLWithPath: surface.authStorePath).deletingLastPathComponent().path
-            if reservedHomes == nil, !CodexLease.sameHome(surfaceHome, defaultHome) {
-                throw CLIError.refused(
-                    code: "reserved_registry_unreadable",
-                    message: "The codex-logins registry cannot be read, so Switchboard cannot tell whether the \(surface.kind.rawValue) auth store is a reserved login's home; fix the registry or unset CODEX_HOME before switching.",
-                    details: nil
-                )
-            }
             if let lease = leases.first(where: { CodexLease.sameHome($0.home, surfaceHome) }) {
                 throw CLIError.refused(
                     code: "surface_is_lease_home",
@@ -1133,7 +1157,7 @@ private final class CLISwitchService {
                     details: nil
                 )
             }
-            if (reservedHomes ?? []).contains(where: { CodexLease.sameHome($0, surfaceHome) }) {
+            if registry.homes.contains(where: { CodexLease.sameHome($0, surfaceHome) }) {
                 throw CLIError.refused(
                     code: "surface_is_reserved_home",
                     message: "The \(surface.kind.rawValue) auth store is a reserved login's home in the codex-logins registry; unset CODEX_HOME before switching.",
@@ -1148,6 +1172,20 @@ private final class CLISwitchService {
                 )
             }
         }
+    }
+
+    /// Every key the account list holds for `profileKey`'s seat (same account id and email), itself included.
+    private func seatKeys(of profileKey: String) -> Set<String> {
+        guard let profiles = readJSON(paths.accountsURL)?["profiles"] as? [String: [String: Any]],
+              let entry = profiles[profileKey],
+              let accountID = entry["accountId"] as? String, !accountID.isEmpty,
+              let email = (entry["email"] as? String)?.lowercased(), !email.isEmpty else {
+            return [profileKey]
+        }
+        let same = profiles.filter { _, value in
+            value["accountId"] as? String == accountID && (value["email"] as? String)?.lowercased() == email
+        }
+        return Set(same.keys).union([profileKey])
     }
 
     private func rollback(destinations: [URL], previousAuth: [String: Data?]) {
