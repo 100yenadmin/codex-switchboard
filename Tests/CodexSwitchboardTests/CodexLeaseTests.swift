@@ -373,11 +373,84 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertFalse(CodexLeaseMirrorMarker.isReady(runningAppPIDs: [42, 43], recordedPID: 42))
     }
 
+    func testStatusMarksWhichAccountsAgentsCanLease() throws {
+        func leasable(_ output: (exitCode: Int32, text: String, json: [String: Any])) -> [String: Bool] {
+            let accounts = output.json["accounts"] as? [[String: Any]] ?? []
+            return Dictionary(uniqueKeysWithValues: accounts.compactMap { account in
+                (account["profile_key"] as? String).map { ($0, account["leasable"] as? Bool ?? false) }
+            })
+        }
+        XCTAssertEqual(
+            leasable(fixture.run(["status", "--json"])),
+            ["profile-a": false, "profile-k": true, "profile-b": true, "profile-f": false]
+        )
+
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        XCTAssertEqual(leasable(fixture.run(["status", "--json", "--leasable-only"])), ["profile-b": true])
+
+        let lease = try XCTUnwrap((fixture.run(["leases", "--json"]).json["leases"] as? [[String: Any]])?.first)
+        XCTAssertEqual(lease["plan"] as? String, "pro")
+        XCTAssertEqual(lease["session_free_percent"] as? Double, 95)
+        XCTAssertEqual(lease["weekly_free_percent"] as? Double, 95)
+    }
+
+    func testSwapLeaseMovesTheLaneToTheBestFreeAccount() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let homeAuth = home.appendingPathComponent("auth.json")
+        try fixture.writeAuth(account: "k", generation: 2, to: homeAuth)
+
+        let swapped = fixture.run(["swap-lease", "--home", home.path, "--json"])
+
+        XCTAssertEqual(swapped.exitCode, 0, swapped.text)
+        XCTAssertEqual(swapped.json["returned_profile_key"] as? String, "profile-k")
+        XCTAssertEqual(swapped.json["return_sync"] as? String, "rotated")
+        XCTAssertEqual(swapped.json["leased_profile_key"] as? String, "profile-b")
+        XCTAssertEqual(swapped.json["holder"] as? String, "bench")
+        XCTAssertEqual(fixture.refreshToken(in: homeAuth), "refresh-b-1")
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-b"])
+
+        let none = fixture.run(["swap-lease", "--home", home.path, "--exclude-profile-key", "profile-k", "--json"])
+        XCTAssertEqual(none.json["error"] as? String, "no_candidate")
+        XCTAssertEqual(fixture.refreshToken(in: homeAuth), "refresh-b-1")
+    }
+
+    func testSwapLeaseRefusalLeavesTheLaneAsItWas() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let homeAuth = home.appendingPathComponent("auth.json")
+
+        let free = fixture.run(["swap-lease", "--home", home.path, "--profile-key", "profile-f", "--json"])
+        XCTAssertEqual(free.json["error"] as? String, "free_plan")
+        let active = fixture.run(["swap-lease", "--home", home.path, "--profile-key", "profile-a", "--json"])
+        XCTAssertEqual(active.json["error"] as? String, "active_account")
+
+        let consumer = try fixture.startFakeCodex(codexHome: home)
+        defer { consumer.terminate() }
+        let busy = fixture.run(["swap-lease", "--home", home.path, "--json"])
+        XCTAssertEqual(busy.json["error"] as? String, "home_in_use")
+
+        XCTAssertEqual(fixture.refreshToken(in: homeAuth), "refresh-k-1")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+    }
+
     func testHelpListsLeaseCommands() {
         let help = fixture.run(["--help"])
         XCTAssertTrue(help.text.contains("lease --profile-key <key> --home <dir> --holder <name> --json"))
         XCTAssertTrue(help.text.contains("return --profile-key <key> --home <dir> --json"))
         XCTAssertTrue(help.text.contains("leases --json"))
+        XCTAssertTrue(help.text.contains("swap-lease --home <dir> [--profile-key <key>]"))
     }
 }
 

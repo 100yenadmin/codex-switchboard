@@ -97,14 +97,16 @@ Add `--stop-consumers` only when the caller explicitly authorized stopping runni
 
 A lease lends one account's captured auth to a separate `CODEX_HOME`, so an automated lane runs on its own account without touching the main CLI or Desktop sign-in. While a lease is active its home is the account's only live holder: `switch`, `autoswap`, and the app's own switching and token refresh all leave the account alone, and the Switchboard app writes every token rotation in the home back to the stored profile. `return` writes the latest token back and clears the lease.
 
-1. Pick a paid, usable account that no surface is using. `--usable-only` already leaves out leased accounts:
+1. See which accounts you can lease. `leasable: true` means unleased, a known paid plan, usable quota, no re-login needed, and not the active account of any surface:
 
 ```bash
-codex-switchboard status --json --surface all --paid-only --usable-only \
-  | jq '{active: [.surfaces[] | .active_profile_key], accounts: [.accounts[] | {profile_key, plan, needs_relogin, session_free_percent, weekly_free_percent, score, leased}]}'
+codex-switchboard status --json --leasable-only \
+  | jq '[.accounts[] | {profile_key, plan, session_free_percent, weekly_free_percent, score}]'
 ```
 
-Choose a `profile_key` that is not in `active`.
+Drop `--leasable-only` to see every account with its `plan`, free percentages, `leased`, `lease_holder` and `leasable`.
+
+Choose the highest `score`.
 
 2. Lease it into a dedicated, empty directory. The CLI creates the directory with mode `0700` and writes `auth.json` with mode `0600`:
 
@@ -124,7 +126,16 @@ codex-switchboard leases --json \
 
 `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
 
-5. When every process in the lane has exited, return the lease:
+5. When the lane's account runs low, swap it between runs, after every Codex process in the home has exited:
+
+```bash
+codex-switchboard swap-lease --home "$LANE_HOME" --json \
+  | jq '{returned_profile_key, return_sync, leased_profile_key, holder}'
+```
+
+This returns the current account (writing its latest token back) and leases the best leasable account into the same home. Pass `--profile-key K` to choose the account, or `--exclude-profile-key K` (repeatable) to skip accounts reserved for something else. A refusal before the return leaves the lane as it was; `swap_incomplete` means the return happened but the new lease failed, so the home holds no account.
+
+6. When every process in the lane has exited for good, return the lease:
 
 ```bash
 codex-switchboard return --profile-key "$PROFILE_KEY" --home "$LANE_HOME" --json \
@@ -144,6 +155,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `home_not_allowed` | The home is `~`, a Switchboard surface home such as `~/.codex`, or inside Switchboard's storage. |
 | `app_not_lease_aware` | A running Switchboard app predates leases and would refresh the leased token itself. Update or quit it. |
 | `refresh_in_progress` | The app is refreshing this account's token right now. Lease again in a few seconds. |
+| `no_lease_at_home`, `no_candidate`, `same_account`, `not_usable`, `swap_incomplete` | `swap-lease`: no lease at that home, no other leasable account, the target is already there, the target has no quota left, or the swap stopped halfway. |
 | `home_in_use` | `return` found processes holding files open in the home (pid and program name in `details`). Stop them first. |
 | `account_leased`, `surface_is_lease_home` | `switch` refused a leased account, or a surface whose auth store is a lease home. |
 | `lease_store_unreadable` | Switchboard could not read `leases.json`; every writer fails closed. |

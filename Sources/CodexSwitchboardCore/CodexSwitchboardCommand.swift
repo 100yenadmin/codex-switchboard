@@ -87,6 +87,8 @@ private final class CommandRunner {
             return try returnLease(Array(arguments.dropFirst()))
         case "leases":
             return try leases(Array(arguments.dropFirst()))
+        case "swap-lease":
+            return try swapLease(Array(arguments.dropFirst()))
         case "doctor":
             return try doctor(Array(arguments.dropFirst()))
         case "autoswap":
@@ -101,9 +103,10 @@ private final class CommandRunner {
     private func status(_ args: [String]) throws -> CommandResult {
         let options = try StatusOptions.parse(args)
         let surfaces = surfaceService.statuses(scope: options.surface)
-        let accounts = accountStore.accounts()
+        let accounts = leaseService.annotateLeasable(accountStore.accounts())
             .filter { !options.paidOnly || !$0.isFreePlan }
             .filter { !options.usableOnly || ($0.usableForCodex && !$0.leased) }
+            .filter { !options.leasableOnly || $0.leasable }
             .sorted { lhs, rhs in
                 if lhs.score == rhs.score {
                     return lhs.profileKey < rhs.profileKey
@@ -142,6 +145,17 @@ private final class CommandRunner {
         let options = try ReturnOptions.parse(args)
         let outcome = try leaseService.returnLease(profileKey: options.profileKey, home: options.home)
         return CommandResult(payload: .leaseReturn(outcome), json: options.json, exitCode: 0)
+    }
+
+    private func swapLease(_ args: [String]) throws -> CommandResult {
+        let options = try SwapLeaseOptions.parse(args)
+        let outcome = try leaseService.swapLease(
+            home: options.home,
+            to: options.profileKey,
+            excluding: options.excludedProfileKeys,
+            holder: options.holder
+        )
+        return CommandResult(payload: .leaseSwap(outcome), json: options.json, exitCode: 0)
     }
 
     private func leases(_ args: [String]) throws -> CommandResult {
@@ -329,11 +343,12 @@ private final class CommandRunner {
     }
 
     private static let helpText = """
-    codex-switchboard status --json [--surface all|desktop|cli] [--paid-only] [--usable-only]
+    codex-switchboard status --json [--surface all|desktop|cli] [--paid-only] [--usable-only] [--leasable-only]
     codex-switchboard switch --profile-key <key> --surface desktop|cli|both --json [--stop-consumers]
     codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
     codex-switchboard return --profile-key <key> --home <dir> --json
     codex-switchboard leases --json
+    codex-switchboard swap-lease --home <dir> [--profile-key <key>] [--exclude-profile-key <key>]... [--holder <name>] --json
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
     codex-switchboard autoswap enable --surface cli|desktop|both --json [--trigger-session-free <percent>] [--target-min-session-free <percent>]
     codex-switchboard autoswap disable --surface cli|desktop|both --json
@@ -391,15 +406,54 @@ private struct StatusOptions {
     let surface: SurfaceScope
     let paidOnly: Bool
     let usableOnly: Bool
+    let leasableOnly: Bool
 
     static func parse(_ args: [String]) throws -> StatusOptions {
         var parser = ArgumentParser(args)
         let json = parser.takeFlag("--json")
         let paidOnly = parser.takeFlag("--paid-only")
         let usableOnly = parser.takeFlag("--usable-only")
+        let leasableOnly = parser.takeFlag("--leasable-only")
         let surface = try parser.takeSurface(default: .all, allowed: [.all, .desktop, .cli])
         try parser.finish()
-        return StatusOptions(json: json, surface: surface, paidOnly: paidOnly, usableOnly: usableOnly)
+        return StatusOptions(
+            json: json,
+            surface: surface,
+            paidOnly: paidOnly,
+            usableOnly: usableOnly,
+            leasableOnly: leasableOnly
+        )
+    }
+}
+
+private struct SwapLeaseOptions {
+    let json: Bool
+    let home: String
+    let profileKey: String?
+    let excludedProfileKeys: Set<String>
+    let holder: String?
+
+    static func parse(_ args: [String]) throws -> SwapLeaseOptions {
+        var parser = ArgumentParser(args)
+        let json = parser.takeFlag("--json")
+        let home = try parser.takeRequiredValue("--home")
+        let profileKey = parser.takeOptionalValue("--profile-key")
+        let excluded = try parser.takeAllValues("--exclude-profile-key")
+        let holder = parser.takeOptionalValue("--holder")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        try parser.finish()
+        if profileKey?.isEmpty == true {
+            throw CLIError.usage("Missing value for --profile-key.", jsonPreferred: false)
+        }
+        if let holder, holder.isEmpty || holder.count > 200 {
+            throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
+        }
+        return SwapLeaseOptions(
+            json: json,
+            home: home,
+            profileKey: profileKey,
+            excludedProfileKeys: Set(excluded),
+            holder: holder
+        )
     }
 }
 
@@ -576,6 +630,17 @@ private struct ArgumentParser {
         args.remove(at: index)
         guard index < args.count else { return "" }
         return args.remove(at: index)
+    }
+
+    mutating func takeAllValues(_ flag: String) throws -> [String] {
+        var values: [String] = []
+        while let value = takeOptionalValue(flag) {
+            guard !value.isEmpty else {
+                throw CLIError.usage("Missing value for \(flag).", jsonPreferred: false)
+            }
+            values.append(value)
+        }
+        return values
     }
 
     mutating func takeOptionalDouble(_ flag: String) throws -> Double? {
@@ -1287,11 +1352,19 @@ private final class CLILeaseService {
     func list() throws -> LeasesPayload {
         let leases = try paths.leaseStore.load()
         let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
+        let accounts = accountStore.accounts()
         return LeasesPayload(
             generatedAt: Date(),
             leases: leases.map { lease in
-                LeaseStatusPayload(
+                let account = accounts.first { $0.profileKey == lease.profileKey }
+                return LeaseStatusPayload(
                     profileKey: lease.profileKey,
+                    plan: account?.plan,
+                    sessionFreePercent: account?.sessionFreePercent,
+                    weeklyFreePercent: account?.weeklyFreePercent,
+                    usableForCodex: account?.usableForCodex ?? false,
+                    needsRelogin: account?.needsRelogin ?? false,
+                    score: account?.score,
                     home: lease.home,
                     holder: lease.holder,
                     leasedAt: lease.leasedAt,
@@ -1304,6 +1377,105 @@ private final class CLILeaseService {
                 )
             }
         )
+    }
+
+    /// Marks the accounts an agent could lease now: unleased, a known paid plan, usable quota, no
+    /// re-login needed, and not the active account of any surface.
+    func annotateLeasable(_ accounts: [AccountPayload]) -> [AccountPayload] {
+        let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
+        return accounts.map { account in
+            var account = account
+            account.leasable = !account.leased
+                && account.isKnownPaidPlan
+                && account.usableForCodex
+                && !account.needsRelogin
+                && !activeKeys.contains(account.profileKey)
+            return account
+        }
+    }
+
+    /// Returns the account leased at `home` and leases another into the same home, for a lane whose
+    /// account runs low. Every process in the home must have stopped: a live Codex holds the old
+    /// token in memory.
+    func swapLease(
+        home rawHome: String,
+        to requestedKey: String?,
+        excluding excludedKeys: Set<String>,
+        holder newHolder: String?
+    ) throws -> LeaseSwapPayload {
+        let requestedHome = URL(fileURLWithPath: (rawHome as NSString).expandingTildeInPath, isDirectory: true)
+            .standardizedFileURL.path
+
+        return try CodexAuthStoreLock.withRequiredLock(appSupportURL: paths.appSupportURL) {
+            let leases = try paths.leaseStore.load()
+            guard let current = leases.first(where: { CodexLease.sameHome($0.home, requestedHome) }) else {
+                throw CLIError.refused(
+                    code: "no_lease_at_home",
+                    message: "\(requestedHome) holds no lease; use lease for its first account.",
+                    details: nil
+                )
+            }
+            let candidates = annotateLeasable(accountStore.accounts())
+            let targetKey: String
+            if let requestedKey {
+                targetKey = requestedKey
+            } else {
+                guard let best = candidates
+                    .filter({ $0.leasable && $0.profileKey != current.profileKey && !excludedKeys.contains($0.profileKey) })
+                    .max(by: { ($0.score, $0.sessionFreePercent) < ($1.score, $1.sessionFreePercent) }) else {
+                    throw CLIError.refused(
+                        code: "no_candidate",
+                        message: "No other paid, usable, unleased account is free to lease.",
+                        details: nil
+                    )
+                }
+                targetKey = best.profileKey
+            }
+            guard targetKey != current.profileKey else {
+                throw CLIError.refused(
+                    code: "same_account",
+                    message: "profile_key \(targetKey) is already the account leased at \(current.home).",
+                    details: nil
+                )
+            }
+            // Check the target before giving anything back, so a refusal leaves the lane as it was.
+            if let target = candidates.first(where: { $0.profileKey == targetKey }), !target.leasable {
+                try ensureLeasableAccount(profileKey: targetKey)
+                let (code, reason) = target.leased
+                    ? ("already_leased", "it is already leased")
+                    : target.usableForCodex
+                        ? ("active_account", "it is the active CLI or Desktop account")
+                        : ("not_usable", "it has no usable quota left")
+                throw CLIError.refused(
+                    code: code,
+                    message: "profile_key \(targetKey) cannot be leased now: \(reason).",
+                    details: nil
+                )
+            }
+            try ensureLeasableAccount(profileKey: targetKey)
+            try ensureAppMirrorsLeases()
+
+            let returned = try returnLease(profileKey: current.profileKey, home: current.home)
+            let leased: LeasePayload
+            do {
+                leased = try lease(profileKey: targetKey, home: current.home, holder: newHolder ?? current.holder)
+            } catch {
+                throw CLIError.refused(
+                    code: "swap_incomplete",
+                    message: "Returned profile_key \(current.profileKey) from \(current.home), but leasing \(targetKey) failed: \(error.localizedDescription) The home now holds no account.",
+                    details: nil
+                )
+            }
+            return LeaseSwapPayload(
+                generatedAt: Date(),
+                home: leased.home,
+                holder: leased.holder,
+                returnedProfileKey: returned.profileKey,
+                returnSync: returned.sync,
+                leasedProfileKey: leased.profileKey,
+                leasedAt: leased.leasedAt
+            )
+        }
     }
 
     private func ensureLeaseHomeAllowed(_ home: String) throws {
@@ -1670,6 +1842,7 @@ private struct AccountPayload: Codable {
     let score: Double
     var leased = false
     var leaseHolder: String?
+    var leasable = false
 
     enum CodingKeys: String, CodingKey {
         case profileKey = "profile_key"
@@ -1686,6 +1859,7 @@ private struct AccountPayload: Codable {
         case score
         case leased
         case leaseHolder = "lease_holder"
+        case leasable
     }
 
     /// A plan Switchboard has seen and that is not free. An unknown plan is not proof of a paid one.
@@ -1948,6 +2122,12 @@ private struct LeaseReturnPayload: Codable {
 
 private struct LeaseStatusPayload: Codable {
     let profileKey: String
+    let plan: String?
+    let sessionFreePercent: Double?
+    let weeklyFreePercent: Double?
+    let usableForCodex: Bool
+    let needsRelogin: Bool
+    let score: Double?
     let home: String
     let holder: String
     let leasedAt: Date
@@ -1957,12 +2137,38 @@ private struct LeaseStatusPayload: Codable {
 
     enum CodingKeys: String, CodingKey {
         case profileKey = "profile_key"
+        case plan
+        case sessionFreePercent = "session_free_percent"
+        case weeklyFreePercent = "weekly_free_percent"
+        case usableForCodex = "usable_for_codex"
+        case needsRelogin = "needs_relogin"
+        case score
         case home
         case holder
         case leasedAt = "leased_at"
         case homeAuthPresent = "home_auth_present"
         case homeMatchesStoredProfile = "home_matches_stored_profile"
         case activeOnSurface = "active_on_surface"
+    }
+}
+
+private struct LeaseSwapPayload: Codable {
+    let generatedAt: Date
+    let home: String
+    let holder: String
+    let returnedProfileKey: String
+    let returnSync: String
+    let leasedProfileKey: String
+    let leasedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case home
+        case holder
+        case returnedProfileKey = "returned_profile_key"
+        case returnSync = "return_sync"
+        case leasedProfileKey = "leased_profile_key"
+        case leasedAt = "leased_at"
     }
 }
 
@@ -2080,6 +2286,7 @@ private enum EncodablePayload {
     case lease(LeasePayload)
     case leaseReturn(LeaseReturnPayload)
     case leases(LeasesPayload)
+    case leaseSwap(LeaseSwapPayload)
     case doctor(DoctorPayload)
     case autoSwapStatus(AutoSwapStatusPayload)
     case autoSwapRun(AutoSwapRunPayload)
@@ -2193,6 +2400,8 @@ private enum Output {
                 text = encodeJSON(value)
             case let .leases(value):
                 text = encodeJSON(value)
+            case let .leaseSwap(value):
+                text = encodeJSON(value)
             case let .doctor(value):
                 text = encodeJSON(value)
             case let .autoSwapStatus(value):
@@ -2222,6 +2431,8 @@ private enum Output {
         case let .leases(value):
             text = (["leases: \(value.leases.count)"] + value.leases.map { "\($0.holder) \($0.home)" })
                 .joined(separator: "\n")
+        case let .leaseSwap(value):
+            text = "swapped the lease at \(value.home) for \(value.holder), returned sync: \(value.returnSync)"
         case let .doctor(value):
             text = "consumers_running: \(value.consumersRunning), unsupported_surfaces: \(value.unsupportedSurfaces.map(\.rawValue).joined(separator: ","))"
         case let .autoSwapStatus(value):
