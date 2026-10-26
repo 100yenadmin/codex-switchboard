@@ -354,6 +354,7 @@ private final class CommandRunner {
     codex-switchboard return --profile-key <key> --home <dir> --json
     codex-switchboard leases --json
     codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... --json
+        (lease commands name accounts by handle, acct_ plus 12 hex digits; <key> may be a handle or a profile key)
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
     codex-switchboard autoswap enable --surface cli|desktop|both --json [--trigger-session-free <percent>] [--target-min-session-free <percent>]
     codex-switchboard autoswap disable --surface cli|desktop|both --json
