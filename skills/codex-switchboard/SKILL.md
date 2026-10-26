@@ -189,7 +189,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `account_leased`, `surface_is_lease_home` | `switch` refused a leased account, or a surface whose auth store is a lease home. |
 | `surface_is_reserved_home`, `surface_is_lane_home` | `switch` refused a surface whose auth store is a registry-reserved login's home, or a lane home (it has `holder.lock`). Unset `CODEX_HOME`. A `switch` into a home other than `~/.codex` also refuses `reserved_registry_unreadable` while the registry cannot be read. |
 | `lease_store_unreadable` | Switchboard could not read `leases.json`; every writer fails closed. |
-| `storage_namespace_invalid` | Any command: `CODEX_SWITCHBOARD_STORAGE_NAMESPACE` is set but is not a single folder name, so the CLI stops instead of using the default storage. Unset it or fix it. |
+| `storage_namespace_invalid` | Any command: `CODEX_SWITCHBOARD_STORAGE_NAMESPACE` is set (even empty) but is not a single folder name, so the CLI stops instead of using the default storage. Unset it or fix it. |
 
 ## Pressure Scenario
 

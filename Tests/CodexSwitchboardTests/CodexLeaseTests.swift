@@ -1320,14 +1320,16 @@ final class CodexLeaseTests: XCTestCase {
     func testCLIRefusesAnUnusableStorageNamespace() {
         // Without an app-support override the namespace names the storage folder. An unusable one must
         // not fall back to the default storage, so the command stops before reading anything.
-        let output = CodexSwitchboardCommand.execute(
-            arguments: ["status", "--json"],
-            environment: ["CODEX_SWITCHBOARD_STORAGE_NAMESPACE": "a/b", "PATH": "/usr/bin:/bin"],
-            homeURL: fixture.home
-        )
-        let text = output.stdout ?? output.stderr ?? ""
-        XCTAssertNotEqual(output.exitCode, 0)
-        XCTAssertTrue(text.contains("storage_namespace_invalid"), text)
+        for unusable in ["a/b", "", "  "] {
+            let output = CodexSwitchboardCommand.execute(
+                arguments: ["status", "--json"],
+                environment: ["CODEX_SWITCHBOARD_STORAGE_NAMESPACE": unusable, "PATH": "/usr/bin:/bin"],
+                homeURL: fixture.home
+            )
+            let text = output.stdout ?? output.stderr ?? ""
+            XCTAssertNotEqual(output.exitCode, 0, "\"\(unusable)\"")
+            XCTAssertTrue(text.contains("storage_namespace_invalid"), text)
+        }
     }
 
     func testHelpListsLeaseCommands() {

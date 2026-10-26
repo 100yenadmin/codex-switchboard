@@ -726,8 +726,9 @@ private struct SwitchboardPaths {
     ) {
         self.homeURL = homeURL
         self.environment = environment
+        // Set at all, even empty, means the caller asked for separate storage: only a usable name gets it.
         let namespace = environment[CodexStorageNamespace.environmentKey]
-        let namespaceSet = !(namespace?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        let namespaceSet = namespace != nil
         if let override = environment["CODEX_SWITCHBOARD_APP_SUPPORT"],
            !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             appSupportURL = URL(fileURLWithPath: override, isDirectory: true)
