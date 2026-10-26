@@ -225,6 +225,156 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
+    func testTemporaryTokenEndpointFailureDoesNotDemandRelogin() async throws {
+        for status in [429, 503] {
+            let recorder = RequestRecorder()
+            let tokenUpdate = TokenUpdateRecorder()
+            MockURLProtocol.handler = { request in
+                let path = request.url?.path ?? ""
+                recorder.record(path: path)
+                if path == "/oauth/token" {
+                    return Self.response(request, status: status, json: ["error": "temporarily_unavailable"])
+                }
+                return Self.response(request, status: 401, json: ["detail": ["code": "token_expired"]])
+            }
+
+            let accounts = await makeService(tokenUpdate: tokenUpdate).loadAll()
+            let account = try XCTUnwrap(accounts.first)
+
+            XCTAssertEqual(account.errorMessage, "Refresh temporarily unavailable", "HTTP \(status)")
+            XCTAssertFalse(UsageService.requiresRelogin(account.errorMessage))
+            XCTAssertEqual(tokenUpdate.count, 0)
+        }
+    }
+
+    func testUnauthorizedPlainMessageStillAsksForRelogin() async throws {
+        for body in [["message": "Invalid token"], ["detail": "Unauthorized"]] {
+            MockURLProtocol.handler = { request in
+                if request.url?.path == "/oauth/token" {
+                    return Self.response(request, status: 400, json: ["error": "invalid_grant"])
+                }
+                if request.url?.path == "/backend-api/wham/usage" {
+                    return Self.response(request, status: 401, json: body)
+                }
+                return Self.response(request, json: ["accounts": [:]])
+            }
+
+            // The refresh is skipped, so the row shows the usage endpoint's own 401.
+            let service = makeService(tokenUpdate: TokenUpdateRecorder(), refreshGate: UsageService.RefreshGate(
+                reserve: { _, _ in .stale },
+                release: { _ in }
+            ))
+            let accounts = await service.loadAll()
+            let account = try XCTUnwrap(accounts.first)
+
+            XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError(account.errorMessage), "\(body)")
+        }
+    }
+
+    func testLeasedAccountIsNeverRefreshedByTheApp() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            return Self.response(
+                request,
+                status: 401,
+                json: ["detail": ["code": "token_expired"]]
+            )
+        }
+
+        let accounts = await makeService(
+            tokenUpdate: tokenUpdate,
+            leasedProfileKeys: ["profile-weekly"]
+        ).loadAll()
+
+        let account = try XCTUnwrap(accounts.first)
+        XCTAssertEqual(account.errorMessage, UsageService.leasedRefreshDeferredError)
+        XCTAssertFalse(UsageService.isExpiredOrRevokedAuthError(account.errorMessage))
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 0)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
+    func testRefreshSkipsATokenThatMovedOnBeforeTheReservation() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        let expected = ExpectedTokenRecorder()
+        MockURLProtocol.handler = { request in
+            recorder.record(path: request.url?.path ?? "")
+            return Self.response(request, status: 401, json: ["detail": ["code": "token_expired"]])
+        }
+
+        _ = await makeService(
+            tokenUpdate: tokenUpdate,
+            refreshGate: UsageService.RefreshGate(
+                reserve: { _, expectedRefreshToken in
+                    expected.record(expectedRefreshToken)
+                    return .stale
+                },
+                release: { _ in }
+            )
+        ).loadAll()
+
+        XCTAssertEqual(expected.values, ["old-refresh"])
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 0)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
+    func testRefreshReservationSpansTheGrantUntilTheRotationIsStored() async throws {
+        let events = EventRecorder()
+        MockURLProtocol.handler = { request in
+            if request.url?.path == "/oauth/token" {
+                events.record("grant")
+                return Self.response(request, json: [
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3_600,
+                ])
+            }
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer new-access" {
+                return Self.healthyUsageResponse(request)
+            }
+            return Self.response(request, status: 401, json: ["detail": ["code": "token_expired"]])
+        }
+
+        let service = makeService(
+            tokenUpdate: TokenUpdateRecorder(),
+            tokenUpdater: { _, _, _, _, _, _, _, _ in events.record("store") },
+            refreshGate: UsageService.RefreshGate(
+                reserve: { _, _ in
+                    events.record("reserve")
+                    return .granted
+                },
+                release: { _ in events.record("release") }
+            )
+        )
+        _ = await service.loadAll()
+
+        XCTAssertEqual(events.all, ["reserve", "grant", "store", "release"])
+    }
+
+    func testUnreadableLeaseStorePausesEveryRefresh() async throws {
+        let recorder = RequestRecorder()
+        let tokenUpdate = TokenUpdateRecorder()
+        MockURLProtocol.handler = { request in
+            let path = request.url?.path ?? ""
+            recorder.record(path: path)
+            return Self.response(
+                request,
+                status: 401,
+                json: ["detail": ["code": "token_expired"]]
+            )
+        }
+
+        let accounts = await makeService(tokenUpdate: tokenUpdate, leasedProfileKeys: nil).loadAll()
+
+        let account = try XCTUnwrap(accounts.first)
+        XCTAssertEqual(account.errorMessage, UsageService.leaseStoreUnreadableError)
+        XCTAssertEqual(recorder.count(for: "/oauth/token"), 0)
+        XCTAssertEqual(tokenUpdate.count, 0)
+    }
+
     func testProfileRemovedDuringRefreshIsNotRestoredInMemory() async throws {
         let tokenUpdate = TokenUpdateRecorder()
         MockURLProtocol.handler = { request in
@@ -257,7 +407,9 @@ final class UsageServiceIntegrationTests: XCTestCase {
     private func makeService(
         tokenUpdate: TokenUpdateRecorder,
         accessToken: String? = "old-access",
-        tokenUpdater: UsageService.TokenUpdater? = nil
+        tokenUpdater: UsageService.TokenUpdater? = nil,
+        leasedProfileKeys: Set<String>? = [],
+        refreshGate: UsageService.RefreshGate? = nil
     ) -> UsageService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -287,7 +439,14 @@ final class UsageServiceIntegrationTests: XCTestCase {
                     refreshToken: refreshToken,
                     expiresAt: expiresAt
                 )
-            }
+            },
+            refreshGate: refreshGate ?? UsageService.RefreshGate(
+                reserve: { profileKey, _ in
+                    guard let leasedProfileKeys else { return .leaseStoreUnreadable }
+                    return leasedProfileKeys.contains(profileKey) ? .leased : .granted
+                },
+                release: { _ in }
+            )
         )
     }
 
@@ -378,6 +537,23 @@ private final class MockURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
+private final class EventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func record(_ event: String) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    var all: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+}
+
 private final class RequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var counts: [String: Int] = [:]
@@ -409,5 +585,22 @@ private final class TokenUpdateRecorder: @unchecked Sendable {
         self.refreshToken = refreshToken
         self.expiresAt = expiresAt
         lock.unlock()
+    }
+}
+
+private final class ExpectedTokenRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+
+    func record(_ value: String) {
+        lock.lock()
+        recorded.append(value)
+        lock.unlock()
+    }
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
     }
 }

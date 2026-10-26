@@ -265,6 +265,38 @@ final class AccountListVisibilityTests: XCTestCase {
         XCTAssertEqual(account.freePlanResetSeconds, 86_400)
     }
 
+    func testFreePlanReturnWaitsForTheLastExhaustedWindow() {
+        let account = Account(
+            id: "free@example.com|acc-free",
+            profileKey: "free@example.com",
+            email: "free@example.com",
+            workspace: "free",
+            plan: "free",
+            sessionFree: 0,
+            weeklyFree: 0,
+            sessionResetSeconds: 3_600,
+            weeklyResetSeconds: 432_000,
+            quotaWindows: [
+                QuotaWindow(kind: .fiveHour, usedPercent: 100, resetSeconds: 3_600, durationSeconds: 18_000),
+                QuotaWindow(kind: .weekly, usedPercent: 100, resetSeconds: 432_000, durationSeconds: 604_800),
+            ],
+            planRenewalDate: nil,
+            hasError: false,
+            errorMessage: nil
+        )
+
+        XCTAssertEqual(account.freePlanResetSeconds, 432_000)
+    }
+
+    func testLongWindowResetShowsItsDay() {
+        let fiveHour = QuotaWindow(kind: .fiveHour, usedPercent: 10, resetSeconds: 3_600, durationSeconds: 18_000)
+        let weekly = QuotaWindow(kind: .weekly, usedPercent: 10, resetSeconds: 432_000, durationSeconds: 604_800)
+
+        XCTAssertEqual(ResetFormatter.windowReset(fiveHour), ResetFormatter.timeOnly(seconds: 3_600))
+        XCTAssertEqual(ResetFormatter.windowReset(weekly), ResetFormatter.format(seconds: 432_000))
+        XCTAssertNotEqual(ResetFormatter.windowReset(weekly), ResetFormatter.timeOnly(seconds: 432_000))
+    }
+
     func testFreeResetFormatterIncludesReturnContext() {
         let text = ResetFormatter.formatFreeReturn(seconds: 60)
 

@@ -3,19 +3,45 @@ import Foundation
 
 public enum CodexSwitchboardCommand {
     public static func run(arguments: [String]) -> Int32 {
+        let output = execute(arguments: arguments)
+        if let stdout = output.stdout {
+            print(stdout)
+        }
+        if let stderr = output.stderr {
+            fputs("\(stderr)\n", Darwin.stderr)
+        }
+        return output.exitCode
+    }
+
+    /// Runs one command against the given environment and home without printing, for tests.
+    static func execute(
+        arguments: [String],
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeURL: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> CommandOutput {
         do {
-            let runner = CommandRunner(arguments: arguments)
+            let runner = CommandRunner(arguments: arguments, environment: environment, homeURL: homeURL)
             let result = try runner.run()
-            Output.write(result.payload, json: result.json)
-            return result.exitCode
+            return Output.render(result.payload, json: result.json, exitCode: result.exitCode)
         } catch let error as CLIError {
-            Output.writeError(error, json: error.jsonPreferred)
-            return error.exitCode
+            return Output.renderError(error, json: error.jsonPreferred)
+        } catch let error as CodexLeaseStoreError {
+            let refusal = CLIError.refused(
+                code: "lease_store_unreadable",
+                message: error.localizedDescription,
+                details: nil
+            )
+            return Output.renderError(refusal, json: true)
         } catch {
-            Output.writeError(.failure(message: error.localizedDescription, jsonPreferred: true), json: true)
-            return 1
+            return Output.renderError(.failure(message: error.localizedDescription, jsonPreferred: true), json: true)
         }
     }
+}
+
+struct CommandOutput {
+    let exitCode: Int32
+    let stdout: String?
+    let stderr: String?
 }
 
 private struct CommandResult {
@@ -32,20 +58,29 @@ private final class CommandRunner {
     private let switchService: CLISwitchService
     private let autoSwapPolicyStore: AutoSwapPolicyStore
     private let autoSwapAuditStore: AutoSwapAuditStore
+    private let leaseService: CLILeaseService
 
-    init(arguments: [String]) {
+    init(arguments: [String], environment: [String: String], homeURL: URL) {
         self.arguments = arguments
-        paths = SwitchboardPaths()
+        paths = SwitchboardPaths(homeURL: homeURL, environment: environment)
         surfaceService = CLISurfaceService(paths: paths)
         accountStore = CLIAccountStore(paths: paths)
         switchService = CLISwitchService(paths: paths, surfaceService: surfaceService)
         autoSwapPolicyStore = AutoSwapPolicyStore(url: paths.autoSwapPolicyURL)
         autoSwapAuditStore = AutoSwapAuditStore(url: paths.autoSwapAuditURL)
+        leaseService = CLILeaseService(paths: paths, surfaceService: surfaceService, accountStore: accountStore)
     }
 
     func run() throws -> CommandResult {
+        if paths.storageNamespaceInvalid {
+            throw CLIError.refused(
+                code: "storage_namespace_invalid",
+                message: "\(CodexStorageNamespace.environmentKey) must be a folder name without / or :. Nothing was read or changed.",
+                details: nil
+            )
+        }
         guard let command = arguments.first else {
-            throw CLIError.usage("Missing command. Use status, switch, or doctor.", jsonPreferred: false)
+            throw CLIError.usage("Missing command. Use status, switch, lease, return, leases, or doctor.", jsonPreferred: false)
         }
 
         switch command {
@@ -53,6 +88,14 @@ private final class CommandRunner {
             return try status(Array(arguments.dropFirst()))
         case "switch":
             return try switchProfile(Array(arguments.dropFirst()))
+        case "lease":
+            return try lease(Array(arguments.dropFirst()))
+        case "return":
+            return try returnLease(Array(arguments.dropFirst()))
+        case "leases":
+            return try leases(Array(arguments.dropFirst()))
+        case "swap-lease":
+            return try swapLease(Array(arguments.dropFirst()))
         case "doctor":
             return try doctor(Array(arguments.dropFirst()))
         case "autoswap":
@@ -67,15 +110,21 @@ private final class CommandRunner {
     private func status(_ args: [String]) throws -> CommandResult {
         let options = try StatusOptions.parse(args)
         let surfaces = surfaceService.statuses(scope: options.surface)
-        let accounts = accountStore.accounts()
+        let accounts = leaseService.annotateLeasable(accountStore.accounts())
             .filter { !options.paidOnly || !$0.isFreePlan }
-            .filter { !options.usableOnly || $0.usableForCodex }
+            .filter { !options.usableOnly || ($0.usableForCodex && !$0.leased) }
+            .filter { !options.leasableOnly || $0.leasable }
             .sorted { lhs, rhs in
                 if lhs.score == rhs.score {
                     return lhs.profileKey < rhs.profileKey
                 }
                 return lhs.score > rhs.score
             }
+        if options.leasableOnly {
+            // Named by handle only: this view goes into agent transcripts.
+            let payload = LeasableStatusPayload(generatedAt: Date(), accounts: accounts.map(LeasableAccountPayload.init))
+            return CommandResult(payload: .leasableStatus(payload), json: options.json, exitCode: 0)
+        }
         let payload = StatusPayload(
             generatedAt: Date(),
             surfaces: surfaces,
@@ -92,6 +141,38 @@ private final class CommandRunner {
             stopConsumers: options.stopConsumers
         )
         return CommandResult(payload: .switchOutcome(outcome), json: options.json, exitCode: 0)
+    }
+
+    private func lease(_ args: [String]) throws -> CommandResult {
+        let options = try LeaseOptions.parse(args)
+        let outcome = try leaseService.lease(
+            profileKey: options.profileKey,
+            home: options.home,
+            holder: options.holder
+        )
+        return CommandResult(payload: .lease(outcome), json: options.json, exitCode: 0)
+    }
+
+    private func returnLease(_ args: [String]) throws -> CommandResult {
+        let options = try ReturnOptions.parse(args)
+        let outcome = try leaseService.returnLease(profileKey: options.profileKey, home: options.home)
+        return CommandResult(payload: .leaseReturn(outcome), json: options.json, exitCode: 0)
+    }
+
+    private func swapLease(_ args: [String]) throws -> CommandResult {
+        let options = try SwapLeaseOptions.parse(args)
+        let outcome = try leaseService.swapLease(
+            home: options.home,
+            to: options.profileKey,
+            excluding: options.excludedProfileKeys,
+            holder: options.holder
+        )
+        return CommandResult(payload: .leaseSwap(outcome), json: options.json, exitCode: 0)
+    }
+
+    private func leases(_ args: [String]) throws -> CommandResult {
+        let options = try DoctorOptions.parse(args)
+        return CommandResult(payload: .leases(try leaseService.list()), json: options.json, exitCode: 0)
     }
 
     private func doctor(_ args: [String]) throws -> CommandResult {
@@ -177,7 +258,7 @@ private final class CommandRunner {
             let planned = AutoSwapDecisionEngine.evaluate(
                 policy: policy,
                 surface: surface.autoSwapSurface,
-                accounts: accounts.map(\.autoSwapAccount),
+                accounts: autoSwapAccounts(accounts),
                 history: history
             )
             guard planned.decision == .wouldSwitch,
@@ -260,8 +341,15 @@ private final class CommandRunner {
         ))
     }
 
+    /// A reserved login's account belongs to its one consumer, so auto-swap never picks it: a switch
+    /// would spend that consumer's quota. A manual `switch` may still choose it.
+    private func autoSwapAccounts(_ accounts: [AccountPayload]) -> [AutoSwapAccount] {
+        let reserved = (try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL))?.profileKeys ?? []
+        return accounts.map { $0.autoSwapAccount(reserved: reserved.contains($0.profileKey)) }
+    }
+
     private func autoswapDecisions(policy: AutoSwapPolicy, scope: SurfaceScope) -> [AutoSwapDecision] {
-        let accounts = accountStore.accounts().map(\.autoSwapAccount)
+        let accounts = autoSwapAccounts(accountStore.accounts())
         let history = autoSwapAuditStore.load()
         return surfaceService.statuses(scope: scope).map { surface in
             AutoSwapDecisionEngine.evaluate(
@@ -274,8 +362,13 @@ private final class CommandRunner {
     }
 
     private static let helpText = """
-    codex-switchboard status --json [--surface all|desktop|cli] [--paid-only] [--usable-only]
+    codex-switchboard status --json [--surface all|desktop|cli] [--paid-only] [--usable-only] [--leasable-only]
     codex-switchboard switch --profile-key <key> --surface desktop|cli|both --json [--stop-consumers]
+    codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
+    codex-switchboard return --profile-key <key> --home <dir> --json
+    codex-switchboard leases --json
+    codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... --json
+        (lease commands name accounts by handle, acct_ plus 12 hex digits; <key> may be a handle or a profile key)
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
     codex-switchboard autoswap enable --surface cli|desktop|both --json [--trigger-session-free <percent>] [--target-min-session-free <percent>]
     codex-switchboard autoswap disable --surface cli|desktop|both --json
@@ -333,15 +426,57 @@ private struct StatusOptions {
     let surface: SurfaceScope
     let paidOnly: Bool
     let usableOnly: Bool
+    let leasableOnly: Bool
 
     static func parse(_ args: [String]) throws -> StatusOptions {
         var parser = ArgumentParser(args)
         let json = parser.takeFlag("--json")
         let paidOnly = parser.takeFlag("--paid-only")
         let usableOnly = parser.takeFlag("--usable-only")
+        let leasableOnly = parser.takeFlag("--leasable-only")
         let surface = try parser.takeSurface(default: .all, allowed: [.all, .desktop, .cli])
         try parser.finish()
-        return StatusOptions(json: json, surface: surface, paidOnly: paidOnly, usableOnly: usableOnly)
+        return StatusOptions(
+            json: json,
+            surface: surface,
+            paidOnly: paidOnly,
+            usableOnly: usableOnly,
+            leasableOnly: leasableOnly
+        )
+    }
+}
+
+private struct SwapLeaseOptions {
+    let json: Bool
+    let home: String
+    let profileKey: String?
+    let excludedProfileKeys: Set<String>
+    let holder: String
+
+    static func parse(_ args: [String]) throws -> SwapLeaseOptions {
+        var parser = ArgumentParser(args)
+        let json = parser.takeFlag("--json")
+        let home = try parser.takeRequiredValue("--home")
+        let profileKey = parser.takeOptionalValue("--profile-key")
+        let excluded = try parser.takeAllValues("--exclude-profile-key")
+        let holder = try parser.takeRequiredValue("--holder").trimmingCharacters(in: .whitespacesAndNewlines)
+        try parser.finish()
+        if let profileKey, profileKey.isEmpty || profileKey.hasPrefix("--") {
+            throw CLIError.usage("Missing value for --profile-key.", jsonPreferred: false)
+        }
+        if holder.isEmpty || holder.count > 200 || holder.hasPrefix("--") {
+            throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
+        }
+        if let profileKey, excluded.contains(profileKey) {
+            throw CLIError.usage("--profile-key is also excluded.", jsonPreferred: false)
+        }
+        return SwapLeaseOptions(
+            json: json,
+            home: home,
+            profileKey: profileKey,
+            excludedProfileKeys: Set(excluded),
+            holder: holder
+        )
     }
 }
 
@@ -364,6 +499,42 @@ private struct SwitchOptions {
             surface: surface,
             stopConsumers: stopConsumers
         )
+    }
+}
+
+private struct LeaseOptions {
+    let json: Bool
+    let profileKey: String
+    let home: String
+    let holder: String
+
+    static func parse(_ args: [String]) throws -> LeaseOptions {
+        var parser = ArgumentParser(args)
+        let json = parser.takeFlag("--json")
+        let profileKey = try parser.takeRequiredValue("--profile-key")
+        let home = try parser.takeRequiredValue("--home")
+        let holder = try parser.takeRequiredValue("--holder")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try parser.finish()
+        guard !holder.isEmpty, holder.count <= 200 else {
+            throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
+        }
+        return LeaseOptions(json: json, profileKey: profileKey, home: home, holder: holder)
+    }
+}
+
+private struct ReturnOptions {
+    let json: Bool
+    let profileKey: String
+    let home: String
+
+    static func parse(_ args: [String]) throws -> ReturnOptions {
+        var parser = ArgumentParser(args)
+        let json = parser.takeFlag("--json")
+        let profileKey = try parser.takeRequiredValue("--profile-key")
+        let home = try parser.takeRequiredValue("--home")
+        try parser.finish()
+        return ReturnOptions(json: json, profileKey: profileKey, home: home)
     }
 }
 
@@ -458,14 +629,16 @@ private struct AutoSwapRunOptions {
 }
 
 private struct ArgumentParser {
-    private var args: [String]
+    /// Each argument with its original position, so a value is only ever the token right after its
+    /// option, even once flags between them have been taken.
+    private var args: [(position: Int, value: String)]
 
     init(_ args: [String]) {
-        self.args = args
+        self.args = args.enumerated().map { ($0.offset, $0.element) }
     }
 
     mutating func takeFlag(_ flag: String) -> Bool {
-        guard let index = args.firstIndex(of: flag) else { return false }
+        guard let index = args.firstIndex(where: { $0.value == flag }) else { return false }
         args.remove(at: index)
         return true
     }
@@ -478,10 +651,21 @@ private struct ArgumentParser {
     }
 
     mutating func takeOptionalValue(_ flag: String) -> String? {
-        guard let index = args.firstIndex(of: flag) else { return nil }
-        args.remove(at: index)
-        guard index < args.count else { return "" }
-        return args.remove(at: index)
+        guard let index = args.firstIndex(where: { $0.value == flag }) else { return nil }
+        let position = args.remove(at: index).position
+        guard index < args.count, args[index].position == position + 1 else { return "" }
+        return args.remove(at: index).value
+    }
+
+    mutating func takeAllValues(_ flag: String) throws -> [String] {
+        var values: [String] = []
+        while let value = takeOptionalValue(flag) {
+            guard !value.isEmpty, !value.hasPrefix("--") else {
+                throw CLIError.usage("Missing value for \(flag).", jsonPreferred: false)
+            }
+            values.append(value)
+        }
+        return values
     }
 
     mutating func takeOptionalDouble(_ flag: String) throws -> Double? {
@@ -514,7 +698,8 @@ private struct ArgumentParser {
 
     func finish() throws {
         guard args.isEmpty else {
-            throw CLIError.usage("Unexpected arguments: \(args.joined(separator: " "))", jsonPreferred: false)
+            // Never echoed: a stray value can be a profile key, which embeds an email.
+            throw CLIError.usage("\(args.count) unexpected argument(s); each option takes its value right after it.", jsonPreferred: false)
         }
     }
 }
@@ -522,6 +707,7 @@ private struct ArgumentParser {
 private struct SwitchboardPaths {
     let fileManager = FileManager.default
     let homeURL: URL
+    let environment: [String: String]
     let appSupportURL: URL
     let profilesURL: URL
     let backupsURL: URL
@@ -529,15 +715,31 @@ private struct SwitchboardPaths {
     let snapshotURL: URL
     let autoSwapPolicyURL: URL
     let autoSwapAuditURL: URL
+    let leaseStore: CodexLeaseStore
+    /// The namespace variable is set but names no usable folder. Falling back to the default storage
+    /// would defeat the isolation it asks for, so every command refuses.
+    let storageNamespaceInvalid: Bool
 
-    init(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    init(
+        homeURL: URL = FileManager.default.homeDirectoryForCurrentUser,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
         self.homeURL = homeURL
-        if let override = ProcessInfo.processInfo.environment["CODEX_SWITCHBOARD_APP_SUPPORT"],
+        self.environment = environment
+        // Set at all, even empty, means the caller asked for separate storage: only a usable name gets it.
+        let namespace = environment[CodexStorageNamespace.environmentKey]
+        let namespaceSet = namespace != nil
+        if let override = environment["CODEX_SWITCHBOARD_APP_SUPPORT"],
            !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             appSupportURL = URL(fileURLWithPath: override, isDirectory: true)
+            storageNamespaceInvalid = false
         } else {
             appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("CodexSwitchboard", isDirectory: true)
+                .appendingPathComponent(
+                    CodexStorageNamespace.validated(namespace) ?? CodexStorageNamespace.defaultName,
+                    isDirectory: true
+                )
+            storageNamespaceInvalid = namespaceSet && CodexStorageNamespace.validated(namespace) == nil
         }
         profilesURL = appSupportURL.appendingPathComponent("profiles", isDirectory: true)
         backupsURL = appSupportURL.appendingPathComponent("backups", isDirectory: true)
@@ -545,6 +747,30 @@ private struct SwitchboardPaths {
         snapshotURL = appSupportURL.appendingPathComponent("accounts-snapshot.json")
         autoSwapPolicyURL = appSupportURL.appendingPathComponent("auto-swap-policy.json")
         autoSwapAuditURL = appSupportURL.appendingPathComponent("auto-swap-events.json")
+        leaseStore = CodexLeaseStore(appSupportURL: appSupportURL)
+    }
+
+    /// The codex-logins registry of reserved logins.
+    var reservedLoginsURL: URL {
+        homeURL.appendingPathComponent(".config/codex-logins/registry.json")
+    }
+
+    /// How long lease, return and swap-lease wait for another Switchboard process to release `.auth.lock`.
+    var storeLockTimeout: TimeInterval {
+        environment["CODEX_SWITCHBOARD_STORE_LOCK_TIMEOUT_SECONDS"].flatMap(Double.init) ?? 60
+    }
+
+    /// How long lease, return and swap-lease wait for a lease home's holder to release its auth lock.
+    var homeLockTimeout: TimeInterval {
+        environment["CODEX_SWITCHBOARD_HOME_LOCK_TIMEOUT_SECONDS"].flatMap(Double.init) ?? 30
+    }
+
+    /// Whether this storage is one a Switchboard app could be using, as opposed to a test or scratch copy.
+    var isAppStorage: Bool {
+        let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return CodexLease.homeSpellings(appSupportURL.path).contains { spelling in
+            CodexLease.homeSpellings(applicationSupport.path).contains { spelling.hasPrefix($0 + "/") }
+        }
     }
 
     func codexHome(for kind: SurfaceKind) -> URL {
@@ -552,7 +778,7 @@ private struct SwitchboardPaths {
         case .desktop:
             return homeURL.appendingPathComponent(".codex", isDirectory: true)
         case .cli:
-            if let value = ProcessInfo.processInfo.environment["CODEX_HOME"],
+            if let value = environment["CODEX_HOME"],
                !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return URL(fileURLWithPath: value)
             }
@@ -664,7 +890,7 @@ private final class CLISurfaceService {
     }
 
     private func cliExecutablePath() -> String? {
-        let envPath = ProcessInfo.processInfo.environment["PATH"] ?? ""
+        let envPath = paths.environment["PATH"] ?? ""
         let candidates = envPath.split(separator: ":").map {
             URL(fileURLWithPath: String($0)).appendingPathComponent("codex").path
         } + [
@@ -694,11 +920,20 @@ private final class CLIAccountStore {
         capturedProfiles = CapturedProfileStore(paths: paths)
     }
 
+    /// Status stays readable when the lease store is not; every writer re-reads it and fails closed.
     func accounts() -> [AccountPayload] {
-        if let snapshot = snapshotAccounts(), !snapshot.isEmpty {
-            return snapshot
+        let leases = (try? paths.leaseStore.load()) ?? []
+        let snapshot = snapshotAccounts() ?? []
+        return (snapshot.isEmpty ? profileFallbackAccounts() : snapshot).map { account in
+            var account = account
+            account.handle = CodexAccountHandle.handle(for: account.profileKey)
+            if let lease = leases.first(where: { $0.profileKey == account.profileKey }) {
+                account.leased = true
+                account.leaseHolder = lease.holder
+                account.leaseQuarantined = CodexLeaseHome.isQuarantined(home: lease.home)
+            }
+            return account
         }
-        return profileFallbackAccounts()
     }
 
     private func snapshotAccounts() -> [AccountPayload]? {
@@ -767,6 +1002,7 @@ private final class CLISwitchService {
         surfaces: [SurfaceStatusPayload],
         stopConsumers: Bool
     ) throws -> SwitchPayload {
+        try ensureSwitchable(profileKey: profileKey, surfaces: surfaces)
         let profileStore = CapturedProfileStore(paths: paths)
         let profile = try profileStore.profile(sourceProfileKey: profileKey)
         try validateCapturedProfile(profile)
@@ -814,27 +1050,31 @@ private final class CLISwitchService {
             destinations.append((surface, destination))
         }
 
-        let sourceData = try Data(contentsOf: profile.authURL)
-        let previousAuth = destinations.reduce(into: [String: Data?]()) { result, destination in
-            result[destination.url.path] = try? Data(contentsOf: destination.url)
-        }
-        var mutatedDestinations: [URL] = []
-        do {
-            for (surface, destination) in destinations {
-                try backupLiveAuth(at: destination, target: profile)
-                try paths.writeData(sourceData, to: destination, permissions: 0o600)
-                mutatedDestinations.append(destination)
-                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-                written.append(SwitchSurfacePayload(
-                    kind: surface.kind,
-                    authStorePath: destination.path,
-                    authStoreMode: surface.authStoreMode,
-                    sharedAuthStore: surface.sharedAuthStore
-                ))
+        try CodexAuthStoreLock.withRequiredLock(appSupportURL: paths.appSupportURL) {
+            // A lease taken while consumers were being checked must still win.
+            try ensureSwitchable(profileKey: profileKey, surfaces: surfaces)
+            let sourceData = try Data(contentsOf: profile.authURL)
+            let previousAuth = destinations.reduce(into: [String: Data?]()) { result, destination in
+                result[destination.url.path] = try? Data(contentsOf: destination.url)
             }
-        } catch {
-            rollback(destinations: mutatedDestinations, previousAuth: previousAuth)
-            throw error
+            var mutatedDestinations: [URL] = []
+            do {
+                for (surface, destination) in destinations {
+                    try backupLiveAuth(at: destination, target: profile)
+                    try paths.writeData(sourceData, to: destination, permissions: 0o600)
+                    mutatedDestinations.append(destination)
+                    try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+                    written.append(SwitchSurfacePayload(
+                        kind: surface.kind,
+                        authStorePath: destination.path,
+                        authStoreMode: surface.authStoreMode,
+                        sharedAuthStore: surface.sharedAuthStore
+                    ))
+                }
+            } catch {
+                rollback(destinations: mutatedDestinations, previousAuth: previousAuth)
+                throw error
+            }
         }
 
         for surface in surfaces {
@@ -861,6 +1101,53 @@ private final class CLISwitchService {
             accountID: profile.accountID,
             surfaces: written
         )
+    }
+
+    /// A leased account has exactly one live holder, its lease home, and a lease home is never a switch target.
+    private func ensureSwitchable(profileKey: String, surfaces: [SurfaceStatusPayload]) throws {
+        let leases = try paths.leaseStore.load()
+        if let lease = leases.first(where: { $0.profileKey == profileKey }) {
+            throw CLIError.refused(
+                code: "account_leased",
+                message: "\(CodexAccountHandle.handle(for: profileKey)) is leased to \(lease.holder); return the lease before switching to it.",
+                details: nil
+            )
+        }
+        // A missing registry reserves nothing. An unreadable one blocks only a switch into a home other
+        // than ~/.codex, which is never a reserved login's home.
+        let reservedHomes = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL).homes
+        let defaultHome = paths.homeURL.appendingPathComponent(".codex").path
+        for surface in surfaces {
+            let surfaceHome = URL(fileURLWithPath: surface.authStorePath).deletingLastPathComponent().path
+            if reservedHomes == nil, !CodexLease.sameHome(surfaceHome, defaultHome) {
+                throw CLIError.refused(
+                    code: "reserved_registry_unreadable",
+                    message: "The codex-logins registry cannot be read, so Switchboard cannot tell whether the \(surface.kind.rawValue) auth store is a reserved login's home; fix the registry or unset CODEX_HOME before switching.",
+                    details: nil
+                )
+            }
+            if let lease = leases.first(where: { CodexLease.sameHome($0.home, surfaceHome) }) {
+                throw CLIError.refused(
+                    code: "surface_is_lease_home",
+                    message: "The \(surface.kind.rawValue) auth store is the lease home of \(lease.holder); unset CODEX_HOME or return that lease first.",
+                    details: nil
+                )
+            }
+            if (reservedHomes ?? []).contains(where: { CodexLease.sameHome($0, surfaceHome) }) {
+                throw CLIError.refused(
+                    code: "surface_is_reserved_home",
+                    message: "The \(surface.kind.rawValue) auth store is a reserved login's home in the codex-logins registry; unset CODEX_HOME before switching.",
+                    details: nil
+                )
+            }
+            if !CodexFileProbe.isMissing(URL(fileURLWithPath: surfaceHome).appendingPathComponent(CodexLeaseHome.holderLockFileName)) {
+                throw CLIError.refused(
+                    code: "surface_is_lane_home",
+                    message: "The \(surface.kind.rawValue) auth store is in a lane home (it has \(CodexLeaseHome.holderLockFileName)), which only its holder or a lease writes; unset CODEX_HOME before switching.",
+                    details: nil
+                )
+            }
+        }
     }
 
     private func rollback(destinations: [URL], previousAuth: [String: Data?]) {
@@ -968,6 +1255,819 @@ private final class CLISwitchService {
     }
 }
 
+/// Logins the codex-logins registry sets aside for one consumer each, such as a benchmark director with
+/// its own device-code home. Lending one would share its rate limit with another consumer, so none is
+/// ever leased, and no lease goes into a registered home.
+private struct ReservedLogins {
+    let profileKeys: Set<String>
+    let homes: [String]
+
+    struct Unreadable: Error {}
+
+    /// A missing registry reserves nothing. One that does not parse, or lists a login without a
+    /// profile key, throws, so that callers fail closed as `codex-logins.py check-switch` does.
+    static func load(from url: URL, homeURL: URL) throws -> ReservedLogins {
+        guard !CodexFileProbe.isMissing(url) else {
+            return ReservedLogins(profileKeys: [], homes: [])
+        }
+        guard let root = readJSON(url), let logins = root["logins"] as? [[String: Any]] else {
+            throw Unreadable()
+        }
+        var profileKeys = Set<String>()
+        var homes: [String] = []
+        for login in logins {
+            guard let profileKey = login["profile_key"] as? String, !profileKey.isEmpty else {
+                throw Unreadable()
+            }
+            profileKeys.insert(profileKey)
+            if let home = login["codex_home"] as? String, !home.isEmpty {
+                homes.append(home == "~" || home.hasPrefix("~/")
+                    ? homeURL.path + home.dropFirst()
+                    : home)
+            }
+        }
+        return ReservedLogins(profileKeys: profileKeys, homes: homes)
+    }
+
+    /// Reservations whose key no Switchboard account has any more, for example after a new sign-in
+    /// re-keyed the account. While one exists, nothing can tell which account it means.
+    func staleKeys(among accountKeys: Set<String>) -> Set<String> {
+        profileKeys.subtracting(accountKeys)
+    }
+}
+
+/// The codex-logins registry, for the app's switch and auto-swap checks. An unreadable registry
+/// reserves nothing here: `holder.lock` still marks every home a holder has used, and a reserved
+/// account only shares its quota with a switch, not its token chain.
+public enum CodexReservedLogins {
+    /// Nil when the registry exists but cannot be read.
+    public static func homes(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String]? {
+        load(homeURL: homeURL)?.homes
+    }
+
+    public static func profileKeys(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> Set<String> {
+        load(homeURL: homeURL)?.profileKeys ?? []
+    }
+
+    private static func load(homeURL: URL) -> ReservedLogins? {
+        try? ReservedLogins.load(
+            from: homeURL.appendingPathComponent(".config/codex-logins/registry.json"),
+            homeURL: homeURL
+        )
+    }
+}
+
+/// Lends one account's captured auth to a separate CODEX_HOME and takes it back. A refresh token is
+/// single-use, so two live copies of one chain log each other out: a lease home must be the account's
+/// only live holder, and the stored profile must end up with the home's latest rotated token.
+///
+/// Every operation on a home holds, in this order, Switchboard's `.auth.lock`, the home's
+/// `holder.lock` (taken without waiting, so a live run refuses it), and the home's `auth.json.lock`.
+/// Output names accounts by handle: profile keys embed the account's email.
+private final class CLILeaseService {
+    private let paths: SwitchboardPaths
+    private let surfaceService: CLISurfaceService
+    private let accountStore: CLIAccountStore
+    private let fileManager = FileManager.default
+
+    init(paths: SwitchboardPaths, surfaceService: CLISurfaceService, accountStore: CLIAccountStore) {
+        self.paths = paths
+        self.surfaceService = surfaceService
+        self.accountStore = accountStore
+    }
+
+    func lease(profileKey given: String, home rawHome: String, holder: String) throws -> LeasePayload {
+        let requestedHome = Self.standardized(rawHome)
+        try ensureLeaseHomeAllowed(requestedHome)
+
+        return try withStoreLock {
+            let leases = try paths.leaseStore.load()
+            let profileKey = try resolveAccount(given)
+            let handle = CodexAccountHandle.handle(for: profileKey)
+            if let existing = leases.first(where: { $0.profileKey == profileKey }) {
+                throw refused("already_leased", "\(handle) is already leased to \(existing.holder) at \(existing.home).")
+            }
+            if let existing = leases.first(where: { CodexLease.sameHome($0.home, requestedHome) }) {
+                throw refused("home_already_leased", "\(requestedHome) already holds the lease of \(existing.holder).")
+            }
+            let (profile, profileAuth) = try ensureCanLend(profileKey: profileKey, into: requestedHome)
+            let configURL = URL(fileURLWithPath: requestedHome).appendingPathComponent("config.toml")
+            let configText = try leaseConfigText(at: configURL, home: requestedHome)
+
+            if CodexLeaseHome.isQuarantined(home: requestedHome) {
+                throw quarantined(requestedHome)
+            }
+            try paths.ensureDirectory(URL(fileURLWithPath: requestedHome, isDirectory: true), permissions: 0o700)
+            let home = CodexLease.normalizedHome(requestedHome)
+            let authURL = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("auth.json")
+
+            return try withHolder(home) {
+                try ensureNotInUse(home)
+                return try withHomeLock(home) {
+                    if CodexLeaseHome.isQuarantined(home: home) {
+                        throw quarantined(home)
+                    }
+                    let alreadyHeld = try homeAlreadyHolds(profileAuth, at: authURL)
+                    var lease = CodexLease(
+                        profileKey: profileKey,
+                        home: home,
+                        holder: holder,
+                        profileDirectory: profile.profileURL.lastPathComponent,
+                        state: alreadyHeld ? .active : .leasing,
+                        authWritten: alreadyHeld
+                    )
+                    // The marker first, then the journal, then config.toml, then auth.json: a crash at any
+                    // point leaves a home that return recognises, and the chain is lent only last.
+                    try CodexLeaseMarker(lease: lease).write(home: home)
+                    try paths.leaseStore.save(leases + [lease])
+                    var configWritten = false
+                    do {
+                        if configText == nil {
+                            try CodexAtomicFile.write(Data(Self.leaseConfig.utf8), to: configURL)
+                            configWritten = true
+                        }
+                        if !alreadyHeld {
+                            try CodexAtomicFile.write(try Data(contentsOf: profile.authURL), to: authURL)
+                        }
+                    } catch {
+                        try? paths.leaseStore.save(leases)
+                        throw error
+                    }
+                    if !alreadyHeld {
+                        lease.state = .active
+                        lease.authWritten = true
+                        do {
+                            try paths.leaseStore.save(leases + [lease])
+                        } catch {
+                            // The home holds the chain while the journal still says leasing, so a holder that
+                            // later empties the home would make return drop the chain. Return it before use.
+                            throw refused(
+                                "lease_incomplete",
+                                "\(handle)'s auth was written to \(home), but the lease could not be marked active: \(error.localizedDescription) Do not use the home; run return for it."
+                            )
+                        }
+                    }
+                    return LeasePayload(
+                        generatedAt: Date(),
+                        handle: handle,
+                        leaseID: lease.leaseID,
+                        home: home,
+                        holder: holder,
+                        leasedAt: lease.leasedAt,
+                        authStorePath: authURL.path,
+                        authWritten: !alreadyHeld,
+                        configWritten: configWritten
+                    )
+                }
+            }
+        }
+    }
+
+    /// Return is also the only recovery path: it always re-reads the home, so repeating a return that
+    /// crashed brings back any rotation made since.
+    func returnLease(profileKey given: String, home rawHome: String) throws -> LeaseReturnPayload {
+        let requestedHome = Self.standardized(rawHome)
+
+        return try withStoreLock {
+            let leases = try paths.leaseStore.load()
+            let profileKey = CodexAccountHandle.resolve(given, among: leases.map(\.profileKey)) ?? given
+            guard let lease = leases.first(where: { $0.profileKey == profileKey }) else {
+                throw refused("not_leased", "\(Self.display(given)) has no active lease.")
+            }
+            guard CodexLease.sameHome(lease.home, requestedHome) else {
+                throw refused(
+                    "home_mismatch",
+                    "\(CodexAccountHandle.handle(for: profileKey)) is leased at \(lease.home), not \(requestedHome)."
+                )
+            }
+            // From here until the entry is removed the lease is returning, which every reader treats as
+            // leased. A return that stops on any refusal, a busy holder included, is redone later from a
+            // fresh read of the home.
+            var returning = lease
+            var journal = leases
+            if returning.state != .returning {
+                returning.state = .returning
+                journal = leases.map { $0.leaseID == lease.leaseID ? returning : $0 }
+                try paths.leaseStore.save(journal)
+            }
+            return try withHolder(returning.home) {
+                try ensureMarkerMatches(returning)
+                try ensureNotInUse(returning.home)
+                return try withHomeLock(returning.home) {
+                    try finishReturn(returning, leases: journal)
+                }
+            }
+        }
+    }
+
+    /// Copies the home's tokens into the stored profile, tombstones the home's auth and removes the
+    /// lease. Callers hold all three locks.
+    private func finishReturn(_ lease: CodexLease, leases: [CodexLease]) throws -> LeaseReturnPayload {
+        let handle = CodexAccountHandle.handle(for: lease.profileKey)
+        if CodexLeaseHome.isQuarantined(home: lease.home) {
+            throw quarantined(lease.home)
+        }
+
+        let outcome: CodexLeaseSyncOutcome
+        if let tombstone = CodexLeaseTombstone.leaseID(at: lease.authURL) {
+            guard tombstone == lease.leaseID || !lease.authWritten else {
+                throw refused(
+                    "home_auth_missing",
+                    "\(lease.authURL.path) holds an earlier lease's tombstone, so this lease's token is not there. Nothing was changed; the lease stays returning."
+                )
+            }
+            outcome = .homeReturned
+        } else if CodexFileProbe.isMissing(lease.authURL) || CodexLeaseHome.holdsNoTokens(authURL: lease.authURL) {
+            // A lease that never left leasing lent nothing, so there is nothing to copy. Any other lease's
+            // chain is now somewhere Switchboard cannot see, such as a keychain store.
+            guard !lease.authWritten else {
+                throw refused(
+                    "home_auth_missing",
+                    "\(lease.authURL.path) is gone or holds no token, so the home's latest token may be somewhere Switchboard cannot see. Nothing was changed; the lease stays returning and the account stays unleasable."
+                )
+            }
+            outcome = .homeAuthMissing
+        } else {
+            let synced = try CodexLeaseSync.syncHome(lease, appSupportURL: paths.appSupportURL)
+            switch synced {
+            case .rotated, .unchanged:
+                try CodexLeaseTombstone.write(leaseID: lease.leaseID, to: lease.authURL)
+            case .homeReturned:
+                break
+            case .homeAuthMissing:
+                throw refused(
+                    "home_auth_missing",
+                    "\(lease.authURL.path) disappeared during the return. Nothing was changed; the lease stays returning."
+                )
+            case .homeQuarantined:
+                throw quarantined(lease.home)
+            case .identityMismatch:
+                throw refused(
+                    "home_holds_other_account",
+                    "\(lease.authURL.path) now holds a different account. Nothing was synced or removed; the lease stays returning."
+                )
+            case .homeAuthUnreadable:
+                throw refused(
+                    "home_auth_unreadable",
+                    "\(lease.authURL.path) cannot be read as Codex auth. Nothing was removed; the lease stays returning."
+                )
+            case .storedProfileMissing:
+                throw refused(
+                    "stored_profile_missing",
+                    "The captured profile for \(handle) is gone, so the lease home holds the only copy. Nothing was removed; the lease stays returning."
+                )
+            }
+            outcome = synced
+        }
+
+        try paths.leaseStore.save(leases.filter { $0.leaseID != lease.leaseID })
+        return LeaseReturnPayload(
+            generatedAt: Date(),
+            handle: handle,
+            leaseID: lease.leaseID,
+            home: lease.home,
+            holder: lease.holder,
+            leasedAt: lease.leasedAt,
+            sync: outcome.rawValue,
+            homeAuthTombstoned: outcome == .rotated || outcome == .unchanged
+        )
+    }
+
+    func list() throws -> LeasesPayload {
+        let leases = try paths.leaseStore.load()
+        let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
+        let accounts = accountStore.accounts()
+        return LeasesPayload(
+            generatedAt: Date(),
+            leases: leases.map { lease in
+                let account = accounts.first { $0.profileKey == lease.profileKey }
+                return LeaseStatusPayload(
+                    handle: CodexAccountHandle.handle(for: lease.profileKey),
+                    leaseID: lease.leaseID,
+                    state: lease.state.rawValue,
+                    plan: account?.plan,
+                    sessionFreePercent: account?.sessionFreePercent,
+                    weeklyFreePercent: account?.weeklyFreePercent,
+                    usableForCodex: account?.usableForCodex ?? false,
+                    needsRelogin: account?.needsRelogin ?? false,
+                    score: account?.score,
+                    home: lease.home,
+                    holder: lease.holder,
+                    leasedAt: lease.leasedAt,
+                    homeAuthPresent: fileManager.fileExists(atPath: lease.authURL.path),
+                    homeMatchesStoredProfile: CodexLeaseSync.homeMatchesStoredProfile(
+                        lease,
+                        appSupportURL: paths.appSupportURL
+                    ),
+                    holderRunning: CodexHomeHolderLock.isHeld(home: lease.home),
+                    activeOnSurface: activeKeys.contains(lease.profileKey),
+                    quarantined: CodexLeaseHome.isQuarantined(home: lease.home),
+                    quarantinedSince: CodexLeaseHome.quarantinedSince(home: lease.home)
+                )
+            }
+        )
+    }
+
+    /// Marks the accounts an agent could lease now: unleased (a returning lease counts), not reserved,
+    /// a known paid plan, usable quota, no re-login needed, and not the active account of any surface.
+    /// Nothing is leasable while the lease store or the reserved-login registry cannot be read, or while
+    /// the registry reserves a key no account has.
+    func annotateLeasable(_ accounts: [AccountPayload]) -> [AccountPayload] {
+        let storeReadable = (try? paths.leaseStore.load()) != nil
+        let reserved = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
+        let registryUsable = reserved.map { $0.staleKeys(among: Set(accounts.map(\.profileKey))).isEmpty } ?? false
+        let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
+        let reservations = CodexRefreshReservations(appSupportURL: paths.appSupportURL)
+        let appPIDs = Set(runningSwitchboardAppPIDs())
+        return accounts.map { account in
+            var account = account
+            account.reserved = reserved?.profileKeys.contains(account.profileKey) ?? false
+            account.leasable = storeReadable
+                && registryUsable
+                && !account.reserved
+                && !account.leased
+                && account.isKnownPaidPlan
+                && account.usableForCodex
+                && !account.needsRelogin
+                && !activeKeys.contains(account.profileKey)
+                && !reservations.isReserved(profileKey: account.profileKey, runningAppPIDs: appPIDs)
+            return account
+        }
+    }
+
+    /// Returns the account leased at `home` and leases another into the same home, for a lane whose
+    /// account runs low, under one hold of the home's locks. Only the lease's holder swaps it, since its
+    /// run records name the account each run used; the check is advisory and catches mistakes. The new
+    /// lease keeps that holder.
+    func swapLease(
+        home rawHome: String,
+        to requestedKey: String?,
+        excluding excludedGiven: Set<String>,
+        holder: String
+    ) throws -> LeaseSwapPayload {
+        let requestedHome = Self.standardized(rawHome)
+
+        return try withStoreLock {
+            let leases = try paths.leaseStore.load()
+            guard let current = leases.first(where: { CodexLease.sameHome($0.home, requestedHome) }) else {
+                throw refused("no_lease_at_home", "\(requestedHome) holds no lease; use lease for its first account.")
+            }
+            guard current.holder == holder else {
+                throw refused("holder_mismatch", "\(current.home) is leased to \(current.holder); only that holder swaps its account.")
+            }
+            if CodexLeaseHome.isQuarantined(home: current.home) {
+                throw quarantined(current.home)
+            }
+            let excludedKeys = Set(try excludedGiven.map { try resolveAccount($0) })
+            // An unusable registry makes nothing leasable; say so instead of no_candidate.
+            try ensureRegistryUsable()
+            let candidates = annotateLeasable(accountStore.accounts())
+            let targetKey: String
+            if let requestedKey {
+                targetKey = try resolveAccount(requestedKey)
+                guard !excludedKeys.contains(targetKey) else {
+                    throw CLIError.usage("--profile-key \(Self.display(requestedKey)) is also excluded.", jsonPreferred: false)
+                }
+            } else {
+                guard let best = candidates
+                    .filter({ $0.leasable && $0.profileKey != current.profileKey && !excludedKeys.contains($0.profileKey) })
+                    .max(by: { ($0.score, $0.sessionFreePercent) < ($1.score, $1.sessionFreePercent) }) else {
+                    throw refused("no_candidate", "No other paid, usable, unleased account is free to lease.")
+                }
+                targetKey = best.profileKey
+            }
+            let targetHandle = CodexAccountHandle.handle(for: targetKey)
+            guard targetKey != current.profileKey else {
+                throw refused("same_account", "\(targetHandle) is already the account leased at \(current.home).")
+            }
+            // Check the target before giving anything back, so a refusal leaves the lane as it was.
+            try ensureNotReserved(profileKey: targetKey, home: current.home)
+            if let target = candidates.first(where: { $0.profileKey == targetKey }), !target.leasable {
+                try ensureLeasableAccount(profileKey: targetKey)
+                if target.leased {
+                    throw refused("already_leased", "\(targetHandle) cannot be leased now: it is already leased.")
+                }
+                // Names the precise reason, such as an active account or an app refresh in flight.
+                _ = try ensureCanLend(profileKey: targetKey, into: current.home)
+                throw refused("not_usable", "\(targetHandle) cannot be leased now: it has no usable quota left.")
+            }
+            try ensureLeaseHomeAllowed(current.home)
+            _ = try ensureCanLend(profileKey: targetKey, into: current.home)
+            _ = try leaseConfigText(
+                at: URL(fileURLWithPath: current.home).appendingPathComponent("config.toml"),
+                home: current.home
+            )
+
+            return try withHolder(current.home) {
+                try ensureMarkerMatches(current)
+                try ensureNotInUse(current.home)
+                return try withHomeLock(current.home) {
+                    let returned = try returnLease(profileKey: current.profileKey, home: current.home)
+                    let leased: LeasePayload
+                    do {
+                        leased = try lease(profileKey: targetKey, home: current.home, holder: current.holder)
+                    } catch CLIError.refused(code: "lease_incomplete", let message, let details) {
+                        throw CLIError.refused(
+                            code: "lease_incomplete",
+                            message: "Returned \(returned.handle) from \(current.home). \(message)",
+                            details: details
+                        )
+                    } catch {
+                        throw refused(
+                            "swap_incomplete",
+                            "Returned \(returned.handle) from \(current.home), but leasing \(targetHandle) failed: \(error.localizedDescription) The home now holds no account."
+                        )
+                    }
+                    return LeaseSwapPayload(
+                        generatedAt: Date(),
+                        home: leased.home,
+                        holder: leased.holder,
+                        returnedHandle: returned.handle,
+                        returnSync: returned.sync,
+                        leasedHandle: leased.handle,
+                        leaseID: leased.leaseID,
+                        leasedAt: leased.leasedAt
+                    )
+                }
+            }
+        }
+    }
+
+    /// What lease writes into a home without a config.toml. The file store keeps the chain in the home
+    /// (a keychain store would move it out of sight). A nested `codex` started by a tool inherits
+    /// CODEX_HOME, so it gets a path that does not exist and fails at startup instead of becoming a
+    /// second holder of this home's sign-in.
+    static let leaseConfig = """
+    # Written by Codex Switchboard for a lease of this home.
+    cli_auth_credentials_store = "file"
+
+    [shell_environment_policy]
+    set = { CODEX_HOME = "/var/empty/codex-switchboard-lease-no-nested-codex" }
+
+    """
+
+    private static func standardized(_ rawHome: String) -> String {
+        URL(fileURLWithPath: (rawHome as NSString).expandingTildeInPath, isDirectory: true).standardizedFileURL.path
+    }
+
+    /// A key given on the command line, shown without its email: handles stay, keys become handles.
+    /// A well-formed handle is shown as given; anything else, which may embed an email, by its handle.
+    private static func display(_ given: String) -> String {
+        given.range(of: "^acct_[0-9a-f]{12}$", options: .regularExpression) != nil
+            ? given
+            : CodexAccountHandle.handle(for: given)
+    }
+
+    private func refused(_ code: String, _ message: String, details: [String]? = nil) -> CLIError {
+        CLIError.refused(code: code, message: message, details: details)
+    }
+
+    private func resolveAccount(_ given: String) throws -> String {
+        guard let profileKey = CodexAccountHandle.resolve(given, among: accountStore.accounts().map(\.profileKey)) else {
+            throw refused("unknown_profile", "\(Self.display(given)) is not in Switchboard's account list.")
+        }
+        return profileKey
+    }
+
+    private func withStoreLock<T>(_ body: () throws -> T) throws -> T {
+        do {
+            return try CodexAuthStoreLock.withRequiredLock(appSupportURL: paths.appSupportURL, timeout: paths.storeLockTimeout, body)
+        } catch let error as POSIXError where error.code == .EBUSY {
+            throw refused(
+                "auth_store_locked",
+                "Another Switchboard process kept \(CodexAuthStoreLock.fileName) locked for \(Int(paths.storeLockTimeout)) s. Nothing was changed; try again."
+            )
+        }
+    }
+
+    /// Takes the home's `holder.lock` without waiting and keeps it for the whole operation.
+    private func withHolder<T>(_ home: String, _ body: () throws -> T) throws -> T {
+        do {
+            return try CodexHomeHolderLock.withLock(home: home, body)
+        } catch CodexHomeAuthLockError.busy {
+            let holders = (try? consumerProcesses(usingHome: home)) ?? []
+            throw refused(
+                "home_in_use",
+                "A process holds \(home)/\(CodexLeaseHome.holderLockFileName): a run is live there. Nothing was changed.",
+                details: holders.map { "\($0.pid) \(programName(of: $0.command))" }
+            )
+        } catch let error as CodexHomeAuthLockError {
+            throw refused("home_lock_unavailable", "\(error.localizedDescription) Nothing was changed.")
+        }
+    }
+
+    /// Takes the home holder's auth lock, waiting up to the configured timeout.
+    private func withHomeLock<T>(_ home: String, _ body: () throws -> T) throws -> T {
+        do {
+            return try CodexHomeAuthLock.withLock(home: home, timeout: paths.homeLockTimeout, body)
+        } catch CodexHomeAuthLockError.busy {
+            throw refused(
+                "home_locked",
+                "The process holding \(home) kept \(CodexLeaseHome.lockFileName) locked for \(Int(paths.homeLockTimeout)) s, probably while refreshing its token. Nothing was changed; try again."
+            )
+        } catch let error as CodexHomeAuthLockError {
+            throw refused("home_lock_unavailable", "\(error.localizedDescription) Nothing was changed.")
+        }
+    }
+
+    /// A process started without `holder.lock` (a bare `CODEX_HOME=<home> codex`) is caught here: it
+    /// keeps files open in the home, or names the home in its environment.
+    private func ensureNotInUse(_ home: String) throws {
+        let consumers: [ProcessInfoPayload]
+        do {
+            consumers = try consumerProcesses(usingHome: home)
+        } catch {
+            throw refused(
+                "home_scan_failed",
+                "Could not check which processes use \(home): \(error.localizedDescription) Nothing was changed."
+            )
+        }
+        guard consumers.isEmpty else {
+            // Only pid and program name: a full command line can carry a prompt with secrets in it.
+            throw refused(
+                "home_in_use",
+                "Processes are still using \(home); stop them, then try again.",
+                details: consumers.map { "\($0.pid) \(programName(of: $0.command))" }
+            )
+        }
+    }
+
+    /// The journal names the lease at a home; the home's `lease.json`, when present, must name the same
+    /// lease, so a copied or re-used home is not mistaken for this one.
+    private func ensureMarkerMatches(_ lease: CodexLease) throws {
+        let marker: CodexLeaseMarker?
+        do {
+            marker = try CodexLeaseMarker.read(home: lease.home)
+        } catch {
+            throw refused("lease_marker_unreadable", "\(lease.home)/\(CodexLeaseHome.markerFileName) cannot be read. Nothing was changed.")
+        }
+        if let marker, marker.leaseID != lease.leaseID {
+            throw refused(
+                "lease_id_mismatch",
+                "\(lease.home)/\(CodexLeaseHome.markerFileName) names another lease than the journal does. Nothing was changed."
+            )
+        }
+    }
+
+    private func quarantined(_ home: String) -> CLIError {
+        refused(
+            "home_quarantined",
+            "\(home) holds \(CodexLeaseHome.stoppedSentinelName): its holder stopped after a credential failure, so the token chain there may be spent. Nothing was synced, written or removed. Only the holder's owner removes that file, after diagnosis."
+        )
+    }
+
+    private func ensureRegistryUsable() throws {
+        _ = try usableRegistry()
+    }
+
+    private func ensureNotReserved(profileKey: String, home: String?) throws {
+        let reserved = try usableRegistry()
+        if reserved.profileKeys.contains(profileKey) {
+            throw refused(
+                "reserved_account",
+                "\(CodexAccountHandle.handle(for: profileKey)) is reserved in the codex-logins registry for its own consumer."
+            )
+        }
+        if let home, reserved.homes.contains(where: { CodexLease.sameHome($0, home) }) {
+            throw refused("home_reserved", "\(home) is a reserved login's home in the codex-logins registry.")
+        }
+    }
+
+    private func usableRegistry() throws -> ReservedLogins {
+        let reserved: ReservedLogins
+        do {
+            reserved = try ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
+        } catch {
+            throw refused(
+                "reserved_registry_unreadable",
+                "\(paths.reservedLoginsURL.path) cannot be read or lists a login without a profile_key; refusing to guess which accounts are reserved."
+            )
+        }
+        if !reserved.staleKeys(among: Set(accountStore.accounts().map(\.profileKey))).isEmpty {
+            throw refused(
+                "reserved_registry_stale",
+                "\(paths.reservedLoginsURL.path) reserves an account Switchboard no longer lists under that key (a new sign-in can re-key an account); refusing to guess which account it means. Register that login again, then lease."
+            )
+        }
+        return reserved
+    }
+
+    /// Everything about the account and the surfaces that lease requires, checked again by swap-lease
+    /// before it gives the lane's account back, so that a refusal leaves the lane as it was.
+    private func ensureCanLend(profileKey: String, into home: String) throws -> (CapturedProfile, StoredAuth) {
+        let handle = CodexAccountHandle.handle(for: profileKey)
+        try ensureNotReserved(profileKey: profileKey, home: home)
+        if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
+            .isReserved(profileKey: profileKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
+            throw refused(
+                "refresh_in_progress",
+                "Switchboard is refreshing the token of \(handle) right now; try again in a few seconds."
+            )
+        }
+        let surfaces = surfaceService.statuses(scope: .all)
+        if surfaces.contains(where: { $0.activeProfileKey == profileKey }) {
+            throw refused(
+                "active_account",
+                "\(handle) is the active CLI or Desktop account; lease an account no surface is using."
+            )
+        }
+        if let unknown = surfaces.first(where: { $0.detected && !$0.supportsFileSwitching }) {
+            throw refused(
+                "surface_identity_unknown",
+                "The \(unknown.displayName) keeps its sign-in in a \(unknown.authStoreMode) store, so Switchboard cannot tell which account it uses and could lease that account."
+            )
+        }
+        try ensureLeasableAccount(profileKey: profileKey)
+        try ensureOneKeyPerSeat(profileKey: profileKey)
+        try ensureAppMirrorsLeases()
+        let profile = try CapturedProfileStore(paths: paths).profile(sourceProfileKey: profileKey)
+        guard let profileAuth = StoredAuth.load(from: profile.authURL), profileAuth.hasCompleteTokens else {
+            throw CLIError.failure(message: "Captured profile is missing valid redacted identity fields.", jsonPreferred: true)
+        }
+        try ensureStoredCopiesAgree(profileKey: profileKey, profileAuth: profileAuth)
+        return (profile, profileAuth)
+    }
+
+    /// Every check of a lease runs on its profile key, so a seat listed under a second key would let
+    /// that key be switched to, refreshed or leased while its chain is out.
+    private func ensureOneKeyPerSeat(profileKey: String) throws {
+        guard let profiles = readJSON(paths.accountsURL)?["profiles"] as? [String: [String: Any]],
+              let entry = profiles[profileKey],
+              let accountID = entry["accountId"] as? String, !accountID.isEmpty,
+              let email = (entry["email"] as? String)?.lowercased(), !email.isEmpty else {
+            return
+        }
+        let others = profiles.filter { key, value in
+            key != profileKey
+                && value["accountId"] as? String == accountID
+                && (value["email"] as? String)?.lowercased() == email
+        }
+        guard others.isEmpty else {
+            throw refused(
+                "duplicate_account_keys",
+                "Switchboard lists \(CodexAccountHandle.handle(for: profileKey))'s seat under more than one key. Remove the account in the Switchboard app, which removes every key of the seat, sign in to it again, then lease."
+            )
+        }
+    }
+
+    /// The config.toml a lease relies on: absent (lease writes its own), or one that keeps Codex on the
+    /// file store and gives nested commands a CODEX_HOME of their own. Anything else is refused, since
+    /// a keychain store moves the chain out of sight and a nested `codex` would share it.
+    private func leaseConfigText(at configURL: URL, home: String) throws -> String? {
+        if CodexFileProbe.isMissing(configURL) { return nil }
+        guard let text = try? String(contentsOf: configURL, encoding: .utf8) else {
+            throw refused(
+                "home_config_unsafe",
+                "\(configURL.path) cannot be read, so Switchboard cannot check it. Move it away, then lease again."
+            )
+        }
+        let mode = CodexCredentialStoreMode.resolve(config: text, surface: .cli)
+        guard mode == "file" else {
+            throw CLIError.unsupportedMode(surface: "lease home", mode: mode, path: home, jsonPreferred: true)
+        }
+        guard Self.keepsLeaseOnFileStore(text),
+              let nested = Self.nestedCodexHome(text),
+              !CodexLease.sameHome(nested, home),
+              CodexFileProbe.isMissing(URL(fileURLWithPath: nested)) else {
+            throw refused(
+                "home_config_unsafe",
+                "\(configURL.path) must set cli_auth_credentials_store = \"file\" and, under [shell_environment_policy], set CODEX_HOME to a path that does not exist, so a nested codex cannot share this home's sign-in. Add both, or move the file away so lease writes its own."
+            )
+        }
+        return text
+    }
+
+    static func keepsLeaseOnFileStore(_ config: String) -> Bool {
+        config.range(of: #"(?m)^\s*cli_auth_credentials_store\s*=\s*"file""#, options: .regularExpression) != nil
+    }
+
+    /// The `CODEX_HOME` that `[shell_environment_policy]` sets for commands Codex runs, if any.
+    static func nestedCodexHome(_ config: String) -> String? {
+        var section = ""
+        for rawLine in config.split(separator: "\n") {
+            let line = (rawLine.split(separator: "#", maxSplits: 1).first.map(String.init) ?? "")
+                .trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                section = line.replacingOccurrences(of: " ", with: "")
+                continue
+            }
+            let pattern: String
+            switch section {
+            case "[shell_environment_policy]" where line.hasPrefix("set"):
+                pattern = #"[{,]\s*CODEX_HOME\s*=\s*"([^"]+)""#
+            case "[shell_environment_policy.set]":
+                pattern = #"^CODEX_HOME\s*=\s*"([^"]+)""#
+            default:
+                continue
+            }
+            if let match = line.range(of: pattern, options: .regularExpression) {
+                let assignment = String(line[match])
+                if let open = assignment.firstIndex(of: "\""), let close = assignment.lastIndex(of: "\""), open < close {
+                    let value = String(assignment[assignment.index(after: open)..<close])
+                    // A TOML escape would make Codex read a different path than the one checked here.
+                    return value.contains("\\") ? nil : value
+                }
+            }
+        }
+        return nil
+    }
+
+    /// The captured profile is what lease copies. If its token differs from the account list's, an
+    /// earlier write stopped halfway and the captured token may already be spent.
+    private func ensureStoredCopiesAgree(profileKey: String, profileAuth: StoredAuth) throws {
+        guard let root = readJSON(paths.accountsURL),
+              let entry = (root["profiles"] as? [String: Any])?[profileKey] as? [String: Any],
+              let listed = entry["refresh"] as? String, !listed.isEmpty else {
+            return
+        }
+        guard listed == profileAuth.refreshToken else {
+            throw refused(
+                "stored_copies_disagree",
+                "Switchboard's stored copies of \(CodexAccountHandle.handle(for: profileKey)) hold different tokens, so the one lease would copy may be spent. Open Switchboard so it refreshes the account, then lease again."
+            )
+        }
+    }
+
+    private func ensureLeaseHomeAllowed(_ home: String) throws {
+        func refuse(_ reason: String) -> CLIError {
+            refused("home_not_allowed", "Cannot lease into \(home): \(reason)")
+        }
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: home, isDirectory: &isDirectory), !isDirectory.boolValue {
+            throw refuse("it is not a directory.")
+        }
+        if home == "/" || CodexLease.sameHome(home, paths.homeURL.path) {
+            throw refuse("use a dedicated directory.")
+        }
+        for kind in [SurfaceKind.desktop, .cli] where CodexLease.sameHome(home, paths.codexHome(for: kind).path) {
+            throw refuse("it is the \(kind.displayName) home. Unset CODEX_HOME when it points at the lease home.")
+        }
+        let storage = CodexLease.homeSpellings(paths.appSupportURL.path)
+        if CodexLease.homeSpellings(home).contains(where: { spelling in
+            storage.contains { spelling == $0 || spelling.hasPrefix($0 + "/") }
+        }) {
+            throw refuse("it is inside Switchboard's app storage.")
+        }
+    }
+
+    private func ensureLeasableAccount(profileKey: String) throws {
+        let handle = CodexAccountHandle.handle(for: profileKey)
+        guard let account = accountStore.accounts().first(where: { $0.profileKey == profileKey }) else {
+            throw refused("unknown_profile", "\(handle) is not in Switchboard's account list.")
+        }
+        if account.isFreePlan {
+            throw refused("free_plan", "\(handle) is a free-plan account.")
+        }
+        if !account.isKnownPaidPlan {
+            throw refused(
+                "plan_unknown",
+                "\(handle) has no known paid plan yet; open Switchboard to refresh usage, then lease again."
+            )
+        }
+        if account.needsRelogin {
+            throw refused("needs_relogin", "\(handle) needs a new sign-in.")
+        }
+    }
+
+    /// A running app that predates leases would keep refreshing a leased token itself, which logs the
+    /// lease home out. Only a lease-aware app that recorded its pid may run during a lease.
+    private func ensureAppMirrorsLeases() throws {
+        guard paths.isAppStorage else { return }
+        let ready = CodexLeaseMirrorMarker.isReady(
+            runningAppPIDs: runningSwitchboardAppPIDs(),
+            recordedPID: CodexLeaseMirrorMarker.recordedPID(appSupportURL: paths.appSupportURL)
+        )
+        guard ready else {
+            throw refused(
+                "app_not_lease_aware",
+                "A running Codex Switchboard app does not mirror leases: it predates them or uses other storage, and it would refresh the leased token itself. Update or quit the app, then lease again."
+            )
+        }
+    }
+
+    /// Never overwrites another sign-in: only an exact copy of the stored token, or a return's
+    /// tombstone, counts as free to write over.
+    private func homeAlreadyHolds(_ profileAuth: StoredAuth, at authURL: URL) throws -> Bool {
+        guard fileManager.fileExists(atPath: authURL.path) else { return false }
+        if CodexLeaseTombstone.leaseID(at: authURL) != nil {
+            return false
+        }
+        guard let homeAuth = StoredAuth.load(from: authURL) else {
+            throw refused("home_auth_unreadable", "\(authURL.path) exists and cannot be read as Codex auth; move it away first.")
+        }
+        if homeAuth.hasSameTokens(as: profileAuth) {
+            return true
+        }
+        if homeAuth.identity.matches(profileAuth.identity) {
+            throw refused(
+                "home_holds_other_login",
+                "\(authURL.path) holds a separate sign-in for this account; leasing over it would discard that sign-in."
+            )
+        }
+        throw refused("home_holds_other_account", "\(authURL.path) holds a different account's auth.")
+    }
+}
+
 private struct LocalProfileCollection {
     let profiles: [String: [String: Any]]
     let orderedKeys: [String]
@@ -1011,7 +2111,7 @@ private final class CapturedProfileStore {
     func profile(sourceProfileKey: String) throws -> CapturedProfile {
         let matches = profiles().filter { $0.sourceProfileKey == sourceProfileKey }
         guard let newest = matches.max(by: { $0.freshnessDate < $1.freshnessDate }) else {
-            throw CLIError.failure(message: "Captured auth was not found for profile_key \(sourceProfileKey).", jsonPreferred: true)
+            throw CLIError.failure(message: "Captured auth was not found for \(CodexAccountHandle.handle(for: sourceProfileKey)).", jsonPreferred: true)
         }
         return newest
     }
@@ -1084,7 +2184,7 @@ private struct CapturedProfile {
     let freshnessDate: Date
 }
 
-private struct StoredAuth {
+struct StoredAuth {
     let root: [String: Any]
     let idToken: String
     let accessToken: String
@@ -1092,9 +2192,17 @@ private struct StoredAuth {
     let accountID: String
     let email: String
     let subject: String
+    /// Access-token expiry in milliseconds, the unit `accounts.json` and profile metadata use.
+    let accessExpiresAt: Int?
 
     var hasCompleteTokens: Bool {
         !idToken.isEmpty && !accessToken.isEmpty && !refreshToken.isEmpty
+    }
+
+    func hasSameTokens(as other: StoredAuth) -> Bool {
+        idToken == other.idToken
+            && accessToken == other.accessToken
+            && refreshToken == other.refreshToken
     }
 
     static func load(from url: URL) -> StoredAuth? {
@@ -1107,6 +2215,7 @@ private struct StoredAuth {
         let refreshToken = tokens["refresh_token"] as? String ?? ""
         let idPayload = decodePayload(idToken)
         let authPayload = idPayload?["https://api.openai.com/auth"] as? [String: Any]
+        let accessExpiry = (decodePayload(accessToken)?["exp"] as? Double) ?? (idPayload?["exp"] as? Double)
         return StoredAuth(
             root: root,
             idToken: idToken,
@@ -1116,11 +2225,12 @@ private struct StoredAuth {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
             email: ((idPayload?["email"] as? String) ?? "").lowercased(),
             subject: ((idPayload?["sub"] as? String) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            accessExpiresAt: accessExpiry.map { Int($0 * 1_000) }
         )
     }
 
-    func matchesStableIdentity(_ other: StoredAuth, capturedProfile: CapturedProfile) -> Bool {
+    fileprivate func matchesStableIdentity(_ other: StoredAuth, capturedProfile: CapturedProfile) -> Bool {
         CodexAuthIdentity(
             subject: subject,
             accountID: accountID.isEmpty ? capturedProfile.accountID : accountID,
@@ -1129,7 +2239,7 @@ private struct StoredAuth {
         .matches(other.identity)
     }
 
-    private var identity: CodexAuthIdentity {
+    var identity: CodexAuthIdentity {
         CodexAuthIdentity(subject: subject, accountID: accountID, email: email)
     }
 
@@ -1230,9 +2340,16 @@ private struct AccountPayload: Codable {
     let nextResetAt: Date?
     let isFreePlan: Bool
     let score: Double
+    var handle = ""
+    var leased = false
+    var leaseHolder: String?
+    var leaseQuarantined = false
+    var reserved = false
+    var leasable = false
 
     enum CodingKeys: String, CodingKey {
         case profileKey = "profile_key"
+        case handle
         case email
         case workspace
         case plan
@@ -1244,6 +2361,17 @@ private struct AccountPayload: Codable {
         case nextResetAt = "next_reset_at"
         case isFreePlan = "is_free_plan"
         case score
+        case leased
+        case leaseHolder = "lease_holder"
+        case leaseQuarantined = "lease_quarantined"
+        case reserved
+        case leasable
+    }
+
+    /// A plan Switchboard has seen and that is not free. An unknown plan is not proof of a paid one.
+    var isKnownPaidPlan: Bool {
+        let normalized = plan.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !isFreePlan && !["", "?", "unknown"].contains(normalized)
     }
 
     init(
@@ -1402,7 +2530,7 @@ private extension SurfaceStatusPayload {
 }
 
 private extension AccountPayload {
-    var autoSwapAccount: AutoSwapAccount {
+    func autoSwapAccount(reserved: Bool) -> AutoSwapAccount {
         AutoSwapAccount(
             profileKey: profileKey,
             sessionFreePercent: sessionFreePercent,
@@ -1410,7 +2538,8 @@ private extension AccountPayload {
             usableForCodex: usableForCodex,
             needsRelogin: needsRelogin,
             isFreePlan: isFreePlan,
-            score: score
+            score: score,
+            isLeased: leased || reserved
         )
     }
 }
@@ -1454,6 +2583,167 @@ private struct SwitchSurfacePayload: Codable {
         case authStorePath = "auth_store_path"
         case authStoreMode = "auth_store_mode"
         case sharedAuthStore = "shared_auth_store"
+    }
+}
+
+private struct LeasePayload: Codable {
+    let generatedAt: Date
+    let handle: String
+    let leaseID: String
+    let home: String
+    let holder: String
+    let leasedAt: Date
+    let authStorePath: String
+    let authWritten: Bool
+    let configWritten: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case handle
+        case leaseID = "lease_id"
+        case home
+        case holder
+        case leasedAt = "leased_at"
+        case authStorePath = "auth_store_path"
+        case authWritten = "auth_written"
+        case configWritten = "config_written"
+    }
+}
+
+private struct LeaseReturnPayload: Codable {
+    let generatedAt: Date
+    let handle: String
+    let leaseID: String
+    let home: String
+    let holder: String
+    let leasedAt: Date
+    let sync: String
+    let homeAuthTombstoned: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case handle
+        case leaseID = "lease_id"
+        case home
+        case holder
+        case leasedAt = "leased_at"
+        case sync
+        case homeAuthTombstoned = "home_auth_tombstoned"
+    }
+}
+
+private struct LeaseStatusPayload: Codable {
+    let handle: String
+    let leaseID: String
+    let state: String
+    let plan: String?
+    let sessionFreePercent: Double?
+    let weeklyFreePercent: Double?
+    let usableForCodex: Bool
+    let needsRelogin: Bool
+    let score: Double?
+    let home: String
+    let holder: String
+    let leasedAt: Date
+    let homeAuthPresent: Bool
+    let homeMatchesStoredProfile: Bool
+    let holderRunning: Bool
+    let activeOnSurface: Bool
+    let quarantined: Bool
+    let quarantinedSince: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case handle
+        case leaseID = "lease_id"
+        case state
+        case plan
+        case sessionFreePercent = "session_free_percent"
+        case weeklyFreePercent = "weekly_free_percent"
+        case usableForCodex = "usable_for_codex"
+        case needsRelogin = "needs_relogin"
+        case score
+        case home
+        case holder
+        case leasedAt = "leased_at"
+        case homeAuthPresent = "home_auth_present"
+        case homeMatchesStoredProfile = "home_matches_stored_profile"
+        case holderRunning = "holder_running"
+        case activeOnSurface = "active_on_surface"
+        case quarantined
+        case quarantinedSince = "quarantined_since"
+    }
+}
+
+private struct LeaseSwapPayload: Codable {
+    let generatedAt: Date
+    let home: String
+    let holder: String
+    let returnedHandle: String
+    let returnSync: String
+    let leasedHandle: String
+    let leaseID: String
+    let leasedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case home
+        case holder
+        case returnedHandle = "returned_handle"
+        case returnSync = "return_sync"
+        case leasedHandle = "leased_handle"
+        case leaseID = "lease_id"
+        case leasedAt = "leased_at"
+    }
+}
+
+/// `status --leasable-only`: what an agent needs to pick an account to lease, named by handle only.
+private struct LeasableAccountPayload: Codable {
+    let handle: String
+    let plan: String
+    let sessionFreePercent: Double
+    let weeklyFreePercent: Double
+    let quotaWindows: [QuotaWindowPayload]
+    let score: Double
+    let nextResetAt: Date?
+
+    enum CodingKeys: String, CodingKey {
+        case handle
+        case plan
+        case sessionFreePercent = "session_free_percent"
+        case weeklyFreePercent = "weekly_free_percent"
+        case quotaWindows = "quota_windows"
+        case score
+        case nextResetAt = "next_reset_at"
+    }
+
+    init(_ account: AccountPayload) {
+        handle = account.handle
+        plan = account.plan
+        sessionFreePercent = account.sessionFreePercent
+        weeklyFreePercent = account.weeklyFreePercent
+        quotaWindows = account.quotaWindows
+        score = account.score
+        nextResetAt = account.nextResetAt
+    }
+}
+
+private struct LeasableStatusPayload: Codable {
+    let generatedAt: Date
+    let accounts: [LeasableAccountPayload]
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case accounts
+    }
+}
+
+private struct LeasesPayload: Codable {
+    let generatedAt: Date
+    let leases: [LeaseStatusPayload]
+
+    enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case leases
     }
 }
 
@@ -1557,7 +2847,12 @@ private struct ProcessInfoPayload: Codable {
 private enum EncodablePayload {
     case text(String)
     case status(StatusPayload)
+    case leasableStatus(LeasableStatusPayload)
     case switchOutcome(SwitchPayload)
+    case lease(LeasePayload)
+    case leaseReturn(LeaseReturnPayload)
+    case leases(LeasesPayload)
+    case leaseSwap(LeaseSwapPayload)
     case doctor(DoctorPayload)
     case autoSwapStatus(AutoSwapStatusPayload)
     case autoSwapRun(AutoSwapRunPayload)
@@ -1583,6 +2878,7 @@ private enum CLIError: LocalizedError {
     case surfaceNotDetected(surface: String, jsonPreferred: Bool)
     case consumersRunning([String], jsonPreferred: Bool)
     case unsupportedMode(surface: String, mode: String, path: String, jsonPreferred: Bool)
+    case refused(code: String, message: String, details: [String]?)
     case failure(message: String, jsonPreferred: Bool)
 
     var errorDescription: String? {
@@ -1595,6 +2891,8 @@ private enum CLIError: LocalizedError {
             return "Codex consumers are running; pass --stop-consumers to terminate them before switching. \(processes.joined(separator: "; "))"
         case let .unsupportedMode(surface, mode, path, _):
             return "Unsupported auth store mode for \(surface): \(mode) at \(path). File-backed switching is supported; keyring, auto, and ephemeral modes are detected but not mutated."
+        case let .refused(_, message, _):
+            return message
         case let .failure(message, _):
             return message
         }
@@ -1610,6 +2908,8 @@ private enum CLIError: LocalizedError {
             return "consumers_running"
         case .unsupportedMode:
             return "unsupported_auth_store_mode"
+        case let .refused(code, _, _):
+            return code
         case .failure:
             return "failure"
         }
@@ -1619,7 +2919,7 @@ private enum CLIError: LocalizedError {
         switch self {
         case .usage:
             return 64
-        case .surfaceNotDetected, .consumersRunning, .unsupportedMode:
+        case .surfaceNotDetected, .consumersRunning, .unsupportedMode, .refused:
             return 2
         case .failure:
             return 1
@@ -1634,6 +2934,8 @@ private enum CLIError: LocalizedError {
              let .unsupportedMode(_, _, _, value),
              let .failure(_, value):
             return value
+        case .refused:
+            return true
         }
     }
 
@@ -1641,6 +2943,8 @@ private enum CLIError: LocalizedError {
         switch self {
         case let .consumersRunning(processes, _):
             return processes
+        case let .refused(_, _, details):
+            return details
         default:
             return nil
         }
@@ -1648,46 +2952,72 @@ private enum CLIError: LocalizedError {
 }
 
 private enum Output {
-    static func write(_ payload: EncodablePayload, json: Bool) {
+    static func render(_ payload: EncodablePayload, json: Bool, exitCode: Int32) -> CommandOutput {
         if json {
+            let text: String
             switch payload {
             case let .status(value):
-                printJSON(value)
+                text = encodeJSON(value)
+            case let .leasableStatus(value):
+                text = encodeJSON(value)
             case let .switchOutcome(value):
-                printJSON(value)
+                text = encodeJSON(value)
+            case let .lease(value):
+                text = encodeJSON(value)
+            case let .leaseReturn(value):
+                text = encodeJSON(value)
+            case let .leases(value):
+                text = encodeJSON(value)
+            case let .leaseSwap(value):
+                text = encodeJSON(value)
             case let .doctor(value):
-                printJSON(value)
+                text = encodeJSON(value)
             case let .autoSwapStatus(value):
-                printJSON(value)
+                text = encodeJSON(value)
             case let .autoSwapRun(value):
-                printJSON(value)
+                text = encodeJSON(value)
             case let .error(value):
-                printJSON(value)
+                text = encodeJSON(value)
             case let .text(value):
-                print(value)
+                text = value
             }
-        } else {
-            switch payload {
-            case let .text(value):
-                print(value)
-            case let .status(value):
-                print("surfaces: \(value.surfaces.count), accounts: \(value.accounts.count)")
-            case let .switchOutcome(value):
-                print("switched \(value.profileKey) on \(value.surfaces.map { $0.kind.rawValue }.joined(separator: ","))")
-            case let .doctor(value):
-                print("consumers_running: \(value.consumersRunning), unsupported_surfaces: \(value.unsupportedSurfaces.map(\.rawValue).joined(separator: ","))")
-            case let .autoSwapStatus(value):
-                print("autoswap_enabled: \(value.policy.enabledSurfaces.map(\.rawValue).sorted().joined(separator: ",")), decisions: \(value.decisions.count)")
-            case let .autoSwapRun(value):
-                let summary = value.decisions.map { "\($0.surface.rawValue):\($0.decision.rawValue)" }.joined(separator: ",")
-                print("autoswap_run: \(summary), consumers: \(value.consumerCount)")
-            case let .error(value):
-                fputs("\(value.message)\n", stderr)
-            }
+            return CommandOutput(exitCode: exitCode, stdout: text, stderr: nil)
         }
+
+        let text: String
+        switch payload {
+        case let .text(value):
+            text = value
+        case let .status(value):
+            text = "surfaces: \(value.surfaces.count), accounts: \(value.accounts.count)"
+        case let .leasableStatus(value):
+            text = (["leasable accounts: \(value.accounts.count)"] + value.accounts.map { "\($0.handle) \($0.plan)" })
+                .joined(separator: "\n")
+        case let .switchOutcome(value):
+            text = "switched \(value.profileKey) on \(value.surfaces.map { $0.kind.rawValue }.joined(separator: ","))"
+        case let .lease(value):
+            text = "leased to \(value.holder) at \(value.home)"
+        case let .leaseReturn(value):
+            text = "returned from \(value.holder) at \(value.home), sync: \(value.sync)"
+        case let .leases(value):
+            text = (["leases: \(value.leases.count)"] + value.leases.map { "\($0.holder) \($0.home)" })
+                .joined(separator: "\n")
+        case let .leaseSwap(value):
+            text = "swapped the lease at \(value.home) for \(value.holder), returned sync: \(value.returnSync)"
+        case let .doctor(value):
+            text = "consumers_running: \(value.consumersRunning), unsupported_surfaces: \(value.unsupportedSurfaces.map(\.rawValue).joined(separator: ","))"
+        case let .autoSwapStatus(value):
+            text = "autoswap_enabled: \(value.policy.enabledSurfaces.map(\.rawValue).sorted().joined(separator: ",")), decisions: \(value.decisions.count)"
+        case let .autoSwapRun(value):
+            let summary = value.decisions.map { "\($0.surface.rawValue):\($0.decision.rawValue)" }.joined(separator: ",")
+            text = "autoswap_run: \(summary), consumers: \(value.consumerCount)"
+        case let .error(value):
+            return CommandOutput(exitCode: exitCode, stdout: nil, stderr: value.message)
+        }
+        return CommandOutput(exitCode: exitCode, stdout: text, stderr: nil)
     }
 
-    static func writeError(_ error: CLIError, json: Bool) {
+    static func renderError(_ error: CLIError, json: Bool) -> CommandOutput {
         let payload = ErrorPayload(
             generatedAt: Date(),
             error: error.code,
@@ -1695,26 +3025,25 @@ private enum Output {
             details: error.details
         )
         if json {
-            printJSON(payload)
-        } else {
-            fputs("\(payload.message)\n", stderr)
+            return CommandOutput(exitCode: error.exitCode, stdout: encodeJSON(payload), stderr: nil)
         }
+        return CommandOutput(exitCode: error.exitCode, stdout: nil, stderr: payload.message)
     }
 
-    private static func printJSON<T: Encodable>(_ value: T) {
+    private static func encodeJSON<T: Encodable>(_ value: T) -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         do {
             let data = try encoder.encode(value)
-            print(String(data: data, encoding: .utf8) ?? "{}")
+            return String(data: data, encoding: .utf8) ?? "{}"
         } catch {
-            print(#"{"error":"encode_failed"}"#)
+            return #"{"error":"encode_failed"}"#
         }
     }
 }
 
-private func readJSON(_ url: URL) -> [String: Any]? {
+func readJSON(_ url: URL) -> [String: Any]? {
     guard let data = try? Data(contentsOf: url) else { return nil }
     return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
 }
@@ -1725,8 +3054,9 @@ private func processLines() -> [String] {
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 }
 
-private func processLinesWithPID() -> [(pid: Int32, command: String)] {
-    runBestEffort("/bin/ps", ["-axo", "pid=,command="])
+/// With `includeEnvironment`, each command is followed by the process's environment, as `ps -E` prints it.
+private func processLinesWithPID(includeEnvironment: Bool = false) -> [(pid: Int32, command: String)] {
+    runBestEffort("/bin/ps", (includeEnvironment ? ["-wwE"] : []) + ["-axo", "pid=,command="])
         .split(separator: "\n")
         .compactMap { line in
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -1737,6 +3067,68 @@ private func processLinesWithPID() -> [(pid: Int32, command: String)] {
             let command = trimmed[split...].trimmingCharacters(in: .whitespaces)
             return (pid, command)
         }
+}
+
+/// Processes still using a lease home: any process holding a file open directly inside it (Codex
+/// keeps its SQLite state there while it runs), and Codex CLI consumers whose environment points
+/// CODEX_HOME at it, where macOS lets `ps -E` show that environment.
+private func consumerProcesses(usingHome home: String) throws -> [ProcessInfoPayload] {
+    let commands = Dictionary(
+        processLinesWithPID().map { ($0.pid, $0.command) },
+        uniquingKeysWith: { first, _ in first }
+    )
+    var pids = Set(try CodexLease.homeSpellings(home).flatMap(openFileHolderPIDs(in:)))
+
+    let assignments = CodexLease.homeSpellings(home).flatMap { ["CODEX_HOME=\($0)", "CODEX_HOME=\($0)/"] }
+    for (pid, environment) in processLinesWithPID(includeEnvironment: true) {
+        guard let command = commands[pid],
+              isCodexConsumerCommand(command.lowercased(), for: [.cli]),
+              assignments.contains(where: { environment.hasSuffix(" \($0)") || environment.contains(" \($0) ") }) else {
+            continue
+        }
+        pids.insert(pid)
+    }
+    pids.remove(Darwin.getpid())
+    return pids.sorted().map { ProcessInfoPayload(pid: $0, command: commands[$0] ?? "") }
+}
+
+/// Owners of numbered file descriptors on files anywhere under `directory`. A working directory or
+/// program text there does not count, so a shell sitting in the home is not a user.
+private func openFileHolderPIDs(in directory: String) throws -> [Int32] {
+    guard FileManager.default.fileExists(atPath: directory) else { return [] }
+    var holders = Set<Int32>()
+    var pid: Int32?
+    // lsof exits 1 even when it lists holders, so its output is read whatever the status; a scan that
+    // cannot start, is killed or times out throws instead of reading as "no holders".
+    let output = try run("/usr/sbin/lsof", ["-w", "-Fpf", "+D", directory], timeout: 30, acceptingFailure: true)
+    for line in output.split(separator: "\n") {
+        if line.hasPrefix("p") {
+            pid = Int32(line.dropFirst())
+        } else if line.hasPrefix("f"), line.dropFirst().allSatisfy(\.isNumber), let pid {
+            holders.insert(pid)
+        }
+    }
+    return Array(holders)
+}
+
+private func runningSwitchboardAppPIDs() -> [Int32] {
+    processLinesWithPID().compactMap { pid, command in
+        isSwitchboardAppCommand(command) ? pid : nil
+    }
+}
+
+/// A Switchboard app process, bundled or a bare build product, but not this CLI (`codex-switchboard`).
+func isSwitchboardAppCommand(_ command: String) -> Bool {
+    let lowercased = command.lowercased()
+    return lowercased.hasSuffix("/codexswitchboard")
+        || lowercased.contains("/codexswitchboard ")
+        || lowercased == "codexswitchboard"
+        || lowercased.hasPrefix("codexswitchboard ")
+}
+
+private func programName(of command: String) -> String {
+    let program = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? command
+    return URL(fileURLWithPath: program).lastPathComponent
 }
 
 private func isCodexConsumerCommand(_ lowercasedCommand: String) -> Bool {
@@ -1801,7 +3193,12 @@ private func isCodexExecutableCommand(_ lowercasedCommand: String) -> Bool {
 }
 
 @discardableResult
-private func run(_ launchPath: String, _ arguments: [String], timeout: TimeInterval = 10) throws -> String {
+private func run(
+    _ launchPath: String,
+    _ arguments: [String],
+    timeout: TimeInterval = 10,
+    acceptingFailure: Bool = false
+) throws -> String {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: launchPath)
     process.arguments = arguments
@@ -1838,7 +3235,11 @@ private func run(_ launchPath: String, _ arguments: [String], timeout: TimeInter
 
     let data = (try? Data(contentsOf: outputURL)) ?? Data()
     let output = String(data: data, encoding: .utf8) ?? ""
-    if process.terminationStatus != 0 {
+    // A killed or timed-out helper never gives an answer, even to a caller that accepts failure.
+    if process.terminationReason == .uncaughtSignal {
+        throw CLIError.failure(message: "\(URL(fileURLWithPath: launchPath).lastPathComponent) was stopped before it finished.", jsonPreferred: true)
+    }
+    if process.terminationStatus != 0 && !acceptingFailure {
         throw CLIError.failure(message: output.trimmingCharacters(in: .whitespacesAndNewlines), jsonPreferred: true)
     }
     return output

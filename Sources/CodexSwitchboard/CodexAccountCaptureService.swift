@@ -1,4 +1,5 @@
 import AppKit
+import CodexSwitchboardCore
 import CryptoKit
 import Foundation
 import Network
@@ -98,18 +99,26 @@ final class CodexAccountCaptureService: @unchecked Sendable {
 
         let tokenResponse = try await exchangeCode(code, verifier: verifier)
         let identity = try identity(from: tokenResponse.idToken)
-        let localProfileKey = try plannedLocalProfileKey(identity: identity)
-        let profileName = try writeCapturedAuth(
-            tokenResponse,
-            identity: identity,
-            sourceProfileKey: localProfileKey
-        )
-        try updateLocalProfiles(
-            tokenResponse,
-            identity: identity,
-            profileKey: localProfileKey,
-            oldProfileKey: nil
-        )
+        let (localProfileKey, profileName) = try CodexAuthFileLock.withRequiredLock { () throws -> (String, String) in
+            let localProfileKey = try plannedLocalProfileKey(identity: identity)
+            try LeasedAccountGuard.rejectIfLeased(
+                profileKeys: [localProfileKey],
+                email: identity.email,
+                accountID: identity.accountID
+            )
+            let profileName = try writeCapturedAuth(
+                tokenResponse,
+                identity: identity,
+                sourceProfileKey: localProfileKey
+            )
+            try updateLocalProfiles(
+                tokenResponse,
+                identity: identity,
+                profileKey: localProfileKey,
+                oldProfileKey: nil
+            )
+            return (localProfileKey, profileName)
+        }
 
         return CapturedCodexAccount(
             profileName: profileName,
@@ -160,18 +169,26 @@ final class CodexAccountCaptureService: @unchecked Sendable {
         let tokenResponse = try await exchangeCode(code, verifier: verifier)
         let identity = try identity(from: tokenResponse.idToken)
         try validate(identity: identity, matches: target)
-        let localProfileKey = try plannedLocalProfileKey(identity: identity, target: target)
-        let profileName = try writeCapturedAuth(
-            tokenResponse,
-            identity: identity,
-            sourceProfileKey: localProfileKey
-        )
-        try updateLocalProfiles(
-            tokenResponse,
-            identity: identity,
-            profileKey: localProfileKey,
-            oldProfileKey: target.profileKey
-        )
+        let (localProfileKey, profileName) = try CodexAuthFileLock.withRequiredLock { () throws -> (String, String) in
+            let localProfileKey = try plannedLocalProfileKey(identity: identity, target: target)
+            try LeasedAccountGuard.rejectIfLeased(
+                profileKeys: Set([localProfileKey] + [target.profileKey].compactMap { $0 }),
+                email: identity.email,
+                accountID: identity.accountID
+            )
+            let profileName = try writeCapturedAuth(
+                tokenResponse,
+                identity: identity,
+                sourceProfileKey: localProfileKey
+            )
+            try updateLocalProfiles(
+                tokenResponse,
+                identity: identity,
+                profileKey: localProfileKey,
+                oldProfileKey: target.profileKey
+            )
+            return (localProfileKey, profileName)
+        }
 
         return CapturedCodexAccount(
             profileName: profileName,
@@ -564,17 +581,9 @@ final class CodexAccountCaptureService: @unchecked Sendable {
         try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
     }
 
+    /// Durable and atomic, so a sign-in killed mid-write keeps the old file or the new one.
     private func writeJSONObject(_ object: Any, to url: URL, permissions: Int) throws {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        let tempURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: tempURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: tempURL.path)
-        if fileManager.fileExists(atPath: url.path) {
-            try fileManager.removeItem(at: url)
-        }
-        try fileManager.moveItem(at: tempURL, to: url)
+        try CodexAtomicFile.writeJSON(object, to: url, permissions: permissions)
     }
 
     private func randomURLSafeString(byteCount: Int) throws -> String {
@@ -699,6 +708,53 @@ enum LocalAccountRemovalError: LocalizedError {
     }
 }
 
+enum LeasedAccountError: LocalizedError {
+    case leased(holder: String)
+    case leaseStoreUnreadable
+
+    var errorDescription: String? {
+        switch self {
+        case let .leased(holder):
+            return "This account is leased to \(holder). Return the lease first; nothing was changed."
+        case .leaseStoreUnreadable:
+            return "The lease store cannot be read; nothing was changed."
+        }
+    }
+}
+
+/// A leased or returning account's chain lives in its lease home, and its return writes back
+/// into the stored profile. A sign-in would replace that profile and a removal would drop it,
+/// so both refuse while the account is in the lease journal. Call under `CodexAuthFileLock`.
+enum LeasedAccountGuard {
+    static func rejectIfLeased(
+        profileKeys: Set<String>,
+        email: String,
+        accountID: String,
+        storageRootURL: URL = AppStorage.rootURL
+    ) throws {
+        let leases: [CodexLease]
+        do {
+            leases = try CodexLeaseStore(appSupportURL: storageRootURL).load()
+        } catch {
+            throw LeasedAccountError.leaseStoreUnreadable
+        }
+        guard !leases.isEmpty else { return }
+        // A capture also drops other keys for the same seat, so those count too.
+        var keys = profileKeys
+        if !accountID.isEmpty {
+            let root = AppStorage.readJSON(storageRootURL.appendingPathComponent("accounts.json"))
+            for (key, value) in root?["profiles"] as? [String: [String: Any]] ?? [:]
+            where (value["accountId"] as? String) == accountID
+                && (value["email"] as? String)?.lowercased() == email.lowercased() {
+                keys.insert(key)
+            }
+        }
+        if let lease = leases.first(where: { keys.contains($0.profileKey) }) {
+            throw LeasedAccountError.leased(holder: lease.holder)
+        }
+    }
+}
+
 final class LocalAccountRemovalService: @unchecked Sendable {
     private let fileManager = FileManager.default
 
@@ -711,19 +767,26 @@ final class LocalAccountRemovalService: @unchecked Sendable {
             throw LocalAccountRemovalError.missingProfileKey
         }
 
-        let backupURL = try makeBackupURL()
-        try backupAccountStore(to: backupURL)
-        let matchingProfiles = capturedProfilesMatching(account: account, profileKey: profileKey)
-        try backupCapturedProfiles(matchingProfiles, to: backupURL)
-        let profiles = AccountProfileStore.loadLocalProfiles()
-        let removeKeys = profileKeysToRemove(from: profiles, profileKey: profileKey, account: account)
-        try AccountProfileStore.remove(profileKeys: removeKeys)
+        return try CodexAuthFileLock.withRequiredLock {
+            let profiles = AccountProfileStore.loadLocalProfiles()
+            let removeKeys = profileKeysToRemove(from: profiles, profileKey: profileKey, account: account)
+            try LeasedAccountGuard.rejectIfLeased(
+                profileKeys: removeKeys,
+                email: account.email,
+                accountID: account.accountID
+            )
+            let backupURL = try makeBackupURL()
+            try backupAccountStore(to: backupURL)
+            let matchingProfiles = capturedProfilesMatching(account: account, profileKey: profileKey)
+            try backupCapturedProfiles(matchingProfiles, to: backupURL)
+            try AccountProfileStore.remove(profileKeys: removeKeys)
 
-        for profileURL in matchingProfiles {
-            try? fileManager.removeItem(at: profileURL)
+            for profileURL in matchingProfiles {
+                try? fileManager.removeItem(at: profileURL)
+            }
+
+            return LocalAccountRemovalResult(backupURL: backupURL)
         }
-
-        return LocalAccountRemovalResult(backupURL: backupURL)
     }
 
     private func profileKeysToRemove(
@@ -821,15 +884,7 @@ final class LocalAccountRemovalService: @unchecked Sendable {
     }
 
     private func writeJSONObject(_ object: Any, to url: URL, permissions: Int) throws {
-        let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
-        let tempURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        try data.write(to: tempURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: tempURL.path)
-        if fileManager.fileExists(atPath: url.path) {
-            try fileManager.removeItem(at: url)
-        }
-        try fileManager.moveItem(at: tempURL, to: url)
+        try CodexAtomicFile.writeJSON(object, to: url, permissions: permissions)
     }
 }
 
@@ -844,6 +899,12 @@ enum CodexAccountSwitchError: LocalizedError {
     case capturedProfileAmbiguous(String)
     case codexDidNotQuit
     case codexAuthConsumersStillRunning([String])
+    case accountLeased(holder: String)
+    case destinationIsLeaseHome(holder: String)
+    case destinationIsReservedHome
+    case reservedRegistryUnreadable
+    case destinationIsLaneHome
+    case leaseStoreUnreadable
     case capturedProfileIdentityMismatch(
         expectedEmail: String,
         actualEmail: String,
@@ -863,6 +924,18 @@ enum CodexAccountSwitchError: LocalizedError {
             return "Codex did not quit; switch canceled."
         case let .codexAuthConsumersStillRunning(processes):
             return "Codex auth consumers are still running; switch canceled: \(processes.joined(separator: ", "))"
+        case let .accountLeased(holder):
+            return "This account is leased to \(holder); switch canceled. Return the lease first."
+        case let .destinationIsLeaseHome(holder):
+            return "The Codex auth store is the lease home of \(holder); switch canceled. Unset CODEX_HOME or return that lease first."
+        case .destinationIsReservedHome:
+            return "The Codex auth store is a reserved login's home in the codex-logins registry; switch canceled. Unset CODEX_HOME first."
+        case .reservedRegistryUnreadable:
+            return "The codex-logins registry cannot be read, so the Codex auth store may be a reserved login's home; switch canceled. Fix the registry or unset CODEX_HOME first."
+        case .destinationIsLaneHome:
+            return "The Codex auth store is in a lane home (it has \(CodexLeaseHome.holderLockFileName)), which only its holder or a lease writes; switch canceled. Unset CODEX_HOME first."
+        case .leaseStoreUnreadable:
+            return "The lease store cannot be read; switch canceled."
         case let .capturedProfileIdentityMismatch(expectedEmail, actualEmail, expectedAccountID, actualAccountID):
             return "Codex auth switch canceled: destination profile changed before copy. Expected \(expectedEmail) / \(expectedAccountID), got \(actualEmail) / \(actualAccountID). Live auth was not overwritten."
         }
@@ -913,7 +986,8 @@ final class CodexAccountSwitchService: @unchecked Sendable {
             throw CodexAccountSwitchError.codexAppMissing
         }
 
-        let profile = try CodexAuthFileLock.withLock {
+        let profile = try CodexAuthFileLock.withRequiredLock {
+            try ensureNotLeased(account)
             authMirrorService.syncActiveAuth()
             return try capturedProfile(for: account)
         }
@@ -928,7 +1002,8 @@ final class CodexAccountSwitchService: @unchecked Sendable {
 
         try terminateCodex()
         didTerminateCodex = true
-        try CodexAuthFileLock.withLock {
+        try CodexAuthFileLock.withRequiredLock {
+            try ensureNotLeased(account, destination: defaultAuthURL)
             try copyReplacing(source: profile.authURL, destination: defaultAuthURL)
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: defaultAuthURL.path)
         }
@@ -948,13 +1023,14 @@ final class CodexAccountSwitchService: @unchecked Sendable {
             throw CodexAccountSwitchError.codexAuthConsumersStillRunning(consumers)
         }
 
-        try CodexAuthFileLock.withLock {
+        try CodexAuthFileLock.withRequiredLock {
             authMirrorService.syncActiveAuth()
             let profile = try capturedProfile(for: account)
             try validateCapturedProfileIdentity(profile, for: account)
         }
 
-        let profile = try CodexAuthFileLock.withLock {
+        let profile = try CodexAuthFileLock.withRequiredLock {
+            try ensureNotLeased(account, destination: cliAuthURL)
             authMirrorService.syncActiveAuth()
             let profile = try capturedProfile(for: account)
             try validateCapturedProfileIdentity(profile, for: account)
@@ -968,6 +1044,42 @@ final class CodexAccountSwitchService: @unchecked Sendable {
             profileName: profile.name,
             sourceProfileKey: profile.sourceProfileKey
         )
+    }
+
+    /// A leased account's lease home is its only live holder: no surface may switch to the account,
+    /// and no switch may write into a lease home, a reserved login's home or any lane home.
+    private func ensureNotLeased(_ account: Account, destination: URL? = nil) throws {
+        let leases: [CodexLease]
+        do {
+            leases = try CodexLeaseStore(appSupportURL: AppStorage.rootURL).load()
+        } catch {
+            throw CodexAccountSwitchError.leaseStoreUnreadable
+        }
+        if let profileKey = account.profileKey,
+           let lease = leases.first(where: { $0.profileKey == profileKey }) {
+            throw CodexAccountSwitchError.accountLeased(holder: lease.holder)
+        }
+        if let destination,
+           let lease = leases.first(where: {
+               CodexLease.sameHome($0.home, destination.deletingLastPathComponent().path)
+           }) {
+            throw CodexAccountSwitchError.destinationIsLeaseHome(holder: lease.holder)
+        }
+        if let destination {
+            let home = destination.deletingLastPathComponent()
+            let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+            // An unreadable registry blocks only a switch into a home other than ~/.codex.
+            guard let reservedHomes = CodexReservedLogins.homes()
+                    ?? (CodexLease.sameHome(home.path, defaultHome.path) ? [] : nil) else {
+                throw CodexAccountSwitchError.reservedRegistryUnreadable
+            }
+            if reservedHomes.contains(where: { CodexLease.sameHome($0, home.path) }) {
+                throw CodexAccountSwitchError.destinationIsReservedHome
+            }
+            if !CodexFileProbe.isMissing(home.appendingPathComponent(CodexLeaseHome.holderLockFileName)) {
+                throw CodexAccountSwitchError.destinationIsLaneHome
+            }
+        }
     }
 
     private func validateCapturedProfileIdentity(_ profile: CapturedCodexProfile, for account: Account) throws {

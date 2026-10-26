@@ -24,6 +24,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
+    /// The fixture window is the only UI in that mode, so closing it ends the app.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        fixtureSnapshotOnly
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if fixtureSnapshotOnly {
             setupFixtureWindow()

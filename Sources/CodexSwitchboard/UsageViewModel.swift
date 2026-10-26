@@ -533,12 +533,19 @@ final class UsageViewModel: ObservableObject {
     }
 
     private func evaluateAutoSwap() {
+        // Without a readable lease store a candidate might be leased, so auto-swap waits.
         guard autoSwapSwitchingSurface == nil,
-              !accounts.isEmpty else {
+              !accounts.isEmpty,
+              let leasedKeys = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL).leasedProfileKeys() else {
             return
         }
+        // A reserved login's account is its consumer's alone: switching to it would spend that quota.
+        let reservedKeys = CodexReservedLogins.profileKeys()
         let autoAccounts = accounts.compactMap {
-            $0.autoSwapAccount(needsRelogin: needsRelogin($0))
+            $0.autoSwapAccount(
+                needsRelogin: needsRelogin($0),
+                isLeased: $0.profileKey.map { leasedKeys.contains($0) || reservedKeys.contains($0) } ?? false
+            )
         }
         let history = autoSwapAuditStore.load()
         var nextDecisions: [CodexSurfaceKind: AutoSwapDecision] = [:]

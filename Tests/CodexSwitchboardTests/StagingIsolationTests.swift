@@ -30,7 +30,24 @@ final class StagingIsolationTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(script.contains("STORAGE_NAMESPACE"))
-        XCTAssertTrue(script.contains("CodexSwitchboardStorageNamespace"))
+        XCTAssertTrue(script.contains(
+            #"plutil -replace CodexSwitchboardStorageNamespace -string "$STORAGE_NAMESPACE" "$PLIST""#
+        ))
+    }
+
+    func testEmptyOrUnusableEnvironmentNamespaceKeepsTheBundleNamespace() {
+        XCTAssertEqual(
+            AppStorage.resolvedStorageNamespace(environmentValue: "", bundleValue: "CodexSwitchboardForkRC"),
+            "CodexSwitchboardForkRC"
+        )
+        XCTAssertEqual(
+            AppStorage.resolvedStorageNamespace(environmentValue: "a/b", bundleValue: "CodexSwitchboardForkRC"),
+            "CodexSwitchboardForkRC"
+        )
+        XCTAssertEqual(
+            AppStorage.resolvedStorageNamespace(environmentValue: "Staging", bundleValue: "CodexSwitchboardForkRC"),
+            "Staging"
+        )
+        XCTAssertEqual(AppStorage.resolvedStorageNamespace(environmentValue: nil, bundleValue: nil), "CodexSwitchboard")
     }
 }

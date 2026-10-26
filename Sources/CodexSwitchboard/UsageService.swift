@@ -1,3 +1,4 @@
+import CodexSwitchboardCore
 import Foundation
 
 /// Fetches best-effort Codex usage data from chatgpt.com.
@@ -21,8 +22,11 @@ final class UsageService: @unchecked Sendable {
     private let session: URLSession
     private let profileLoader: () -> AccountProfileCollection
     private let tokenUpdater: TokenUpdater
+    private let refreshGate: RefreshGate
     private static let refreshFailedError = "Refresh failed - re-login required"
     private static let refreshTemporarilyUnavailableError = "Refresh temporarily unavailable"
+    static let leasedRefreshDeferredError = "Leased - the lease holder refreshes this token"
+    static let leaseStoreUnreadableError = "Lease store unreadable - token refresh paused"
 
     init(
         session: URLSession = .shared,
@@ -36,13 +40,8 @@ final class UsageService: @unchecked Sendable {
                 ) else {
                     throw AccountProfileTokenUpdateError.profileChanged
                 }
-                try ActiveCodexAuthStore.updateMatching(
-                    email: email,
-                    accountID: accountID,
-                    accessToken: accessToken,
-                    refreshToken: refreshToken,
-                    idToken: idToken
-                )
+                // The account store first: once the server has rotated, the new token must be kept
+                // even if a live copy below cannot be written.
                 try AccountProfileStore.updateTokens(
                     profileKey: profileKey,
                     email: email,
@@ -53,12 +52,111 @@ final class UsageService: @unchecked Sendable {
                     expiresAt: expiresAt,
                     expectedRefreshToken: expectedRefreshToken
                 )
+                // A lease home is written only under its holder's lock, below, even when the
+                // app's own CODEX_HOME names one. Without a readable lease store any CODEX_HOME
+                // could be one, so only ~/.codex, which is never a lease home, is written.
+                let leases = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL).load()
+                let reservedHomes = CodexReservedLogins.homes()
+                let defaultHome = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+                let authURLs = leases.map { leases in
+                    ActiveCodexAuthStore.defaultAuthURLs().filter { authURL in
+                        let home = authURL.deletingLastPathComponent()
+                        guard !leases.contains(where: { CodexLease.sameHome($0.home, home.path) }) else { return false }
+                        if CodexLease.sameHome(home.path, defaultHome) { return true }
+                        // Nor a reserved login's home, any lane home (it has holder.lock) or a quarantined
+                        // home: each belongs to its own holder even when no lease names it.
+                        guard let reservedHomes,
+                              !reservedHomes.contains(where: { CodexLease.sameHome($0, home.path) }) else { return false }
+                        return CodexFileProbe.isMissing(home.appendingPathComponent(CodexLeaseHome.holderLockFileName))
+                            && !CodexLeaseHome.isQuarantined(home: home.path)
+                    }
+                } ?? ActiveCodexAuthStore.defaultAuthURLs(environment: [:])
+                try? ActiveCodexAuthStore.updateMatching(
+                    authURLs: authURLs,
+                    email: email,
+                    accountID: accountID,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    idToken: idToken
+                )
+                // A lease can only appear mid-grant if the reservation went stale; that
+                // home then holds the token just spent, so hand it the rotation too, under
+                // its holder's lock. A quarantined home is left for its owner.
+                if let lease = leases?.first(where: { $0.profileKey == profileKey }) {
+                    try? CodexHomeAuthLock.withLock(home: lease.home, timeout: 30) {
+                        guard !CodexLeaseHome.isQuarantined(home: lease.home) else { return }
+                        try ActiveCodexAuthStore.updateMatching(
+                            authURLs: [lease.authURL],
+                            email: email,
+                            accountID: accountID,
+                            accessToken: accessToken,
+                            refreshToken: refreshToken,
+                            idToken: idToken
+                        )
+                    }
+                }
             }
-        }
+        },
+        refreshGate: RefreshGate = .live
     ) {
         self.session = session
         self.profileLoader = profileLoader
         self.tokenUpdater = tokenUpdater
+        self.refreshGate = refreshGate
+    }
+
+    /// Decides whether this app may spend an account's refresh token now. A granted reservation
+    /// lasts until the rotation is stored, so the CLI cannot lease the account mid-grant.
+    struct RefreshGate {
+        enum Decision {
+            case granted
+            case leased
+            case leaseStoreUnreadable
+            /// The stored token is no longer the one the usage poll loaded: a lease or another writer
+            /// moved the chain on, so that token may already be spent. The next poll uses the new one.
+            case stale
+        }
+
+        let reserve: (_ profileKey: String, _ expectedRefreshToken: String) -> Decision
+        let release: (_ profileKey: String) -> Void
+
+        static let live = RefreshGate(
+            reserve: { profileKey, expectedRefreshToken in
+                // A grant is admitted only under the cross-process lock; without it, skip this cycle.
+                (try? CodexAuthFileLock.withRequiredLock { () -> RefreshGate.Decision in
+                    guard let leased = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
+                        .leasedProfileKeys() else {
+                        return .leaseStoreUnreadable
+                    }
+                    if leased.contains(profileKey) {
+                        return .leased
+                    }
+                    // Read under the same lock that admits the grant, so the token sent is the head.
+                    guard AccountProfileStore.canUpdateTokens(
+                        profileKey: profileKey,
+                        expectedRefreshToken: expectedRefreshToken
+                    ) else {
+                        return .stale
+                    }
+                    do {
+                        try CodexRefreshReservations(appSupportURL: AppStorage.rootURL)
+                            .reserve(profileKey: profileKey)
+                    } catch is CodexRefreshReservations.HeldElsewhere {
+                        // Another Switchboard app is refreshing this account; its rotation arrives next poll.
+                        return .stale
+                    } catch {
+                        return .leaseStoreUnreadable
+                    }
+                    return .granted
+                }) ?? .stale
+            },
+            release: { profileKey in
+                CodexAuthFileLock.withLock {
+                    try? CodexRefreshReservations(appSupportURL: AppStorage.rootURL)
+                        .release(profileKey: profileKey)
+                }
+            }
+        )
     }
 
     private enum RefreshResult {
@@ -120,8 +218,24 @@ final class UsageService: @unchecked Sendable {
             let accessToken = profile["access"] as? String
             let accessTokenMissing = accessToken?.isEmpty != false
             guard accessTokenMissing || Self.shouldAttemptTokenRefresh(usage) else { continue }
+            // A leased account's refresh token belongs to its lease home. Spending it here
+            // would log that home out, so the mirror brings its rotations back instead.
+            switch refreshGate.reserve(key, profile["refresh"] as? String ?? "") {
+            case .granted:
+                break
+            case .stale:
+                continue
+            case .leased:
+                usages[key] = ["error": Self.leasedRefreshDeferredError]
+                continue
+            case .leaseStoreUnreadable:
+                usages[key] = ["error": Self.leaseStoreUnreadableError]
+                continue
+            }
+            let refreshResult = await refreshProfile(profileKey: key, profile: profile)
+            refreshGate.release(key)
 
-            switch await refreshProfile(profileKey: key, profile: profile) {
+            switch refreshResult {
             case .unavailable:
                 break
             case .removed:
@@ -374,6 +488,10 @@ final class UsageService: @unchecked Sendable {
             ])
             let (data, urlResponse) = try await session.data(for: request)
             let statusCode = (urlResponse as? HTTPURLResponse)?.statusCode ?? 0
+            // A timeout, rate limit or server error says nothing about the token, so no re-login yet.
+            if statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode) {
+                return .transientFailure
+            }
             guard (200...299).contains(statusCode) else { return .failed }
 
             let response = try JSONDecoder().decode(RefreshedTokenResponse.self, from: data)
@@ -574,12 +692,15 @@ final class UsageService: @unchecked Sendable {
             return error
         }
 
-        if let code = Self.normalizedErrorCode(from: data) {
-            return Self.displayMessage(forErrorCode: code)
+        let code = Self.normalizedErrorCode(from: data)
+        // A 401 whose body is a plain message, not one of the known auth codes, still needs a re-login.
+        if let status = data["http_status"] as? Int, status == 401,
+           code.map({ !Self.knownAuthErrorCodes.contains($0) }) ?? true {
+            return "Expired or revoked"
         }
 
-        if let status = data["http_status"] as? Int, status == 401 {
-            return "Expired or revoked"
+        if let code {
+            return Self.displayMessage(forErrorCode: code)
         }
 
         if let error = data["error"] as? String, !error.isEmpty {
@@ -622,6 +743,16 @@ final class UsageService: @unchecked Sendable {
     private static func normalizedAuthMessage(_ message: String?) -> String? {
         message?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
+
+    private static let knownAuthErrorCodes: Set<String> = [
+        "deactivated_workspace",
+        "token_expired",
+        "token_invalidated",
+        "token_revoked",
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+    ]
 
     private static func displayMessage(forErrorCode code: String) -> String {
         switch code {

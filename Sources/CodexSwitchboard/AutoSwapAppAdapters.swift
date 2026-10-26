@@ -33,7 +33,7 @@ extension CodexSurfaceStatus {
 }
 
 extension Account {
-    func autoSwapAccount(needsRelogin: Bool) -> AutoSwapAccount? {
+    func autoSwapAccount(needsRelogin: Bool, isLeased: Bool = false) -> AutoSwapAccount? {
         guard let profileKey else { return nil }
         let leadingFree = leadingQuotaWindow?.freePercent
         let longTermFree = weeklyQuotaWindow?.freePercent
@@ -45,7 +45,8 @@ extension Account {
             usableForCodex: isUsableForCodex && !needsRelogin,
             needsRelogin: needsRelogin,
             isFreePlan: isFreePlan,
-            score: quotaScore
+            score: quotaScore,
+            isLeased: isLeased
         )
     }
 }

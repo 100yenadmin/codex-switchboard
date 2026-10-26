@@ -158,6 +158,8 @@ public struct AutoSwapAccount: Equatable {
     public let needsRelogin: Bool
     public let isFreePlan: Bool
     public let score: Double
+    /// Lent to a lease home, which must stay the account's only live holder.
+    public let isLeased: Bool
 
     public init(
         profileKey: String,
@@ -166,7 +168,8 @@ public struct AutoSwapAccount: Equatable {
         usableForCodex: Bool,
         needsRelogin: Bool,
         isFreePlan: Bool,
-        score: Double
+        score: Double,
+        isLeased: Bool = false
     ) {
         self.profileKey = profileKey
         self.sessionFreePercent = sessionFreePercent
@@ -175,6 +178,7 @@ public struct AutoSwapAccount: Equatable {
         self.needsRelogin = needsRelogin
         self.isFreePlan = isFreePlan
         self.score = score
+        self.isLeased = isLeased
     }
 }
 
@@ -379,6 +383,7 @@ public enum AutoSwapDecisionEngine {
     ) -> AutoSwapAccount? {
         accounts
             .filter { $0.profileKey != activeProfileKey }
+            .filter { !$0.isLeased }
             .filter { !policy.paidOnly || !$0.isFreePlan }
             .filter { !policy.requireUsableForCodex || $0.usableForCodex }
             .filter { !$0.needsRelogin }
