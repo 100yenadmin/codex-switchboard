@@ -846,6 +846,7 @@ enum CodexAccountSwitchError: LocalizedError {
     case codexDidNotQuit
     case codexAuthConsumersStillRunning([String])
     case accountLeased(holder: String)
+    case destinationIsLeaseHome(holder: String)
     case leaseStoreUnreadable
     case capturedProfileIdentityMismatch(
         expectedEmail: String,
@@ -868,6 +869,8 @@ enum CodexAccountSwitchError: LocalizedError {
             return "Codex auth consumers are still running; switch canceled: \(processes.joined(separator: ", "))"
         case let .accountLeased(holder):
             return "This account is leased to \(holder); switch canceled. Return the lease first."
+        case let .destinationIsLeaseHome(holder):
+            return "The Codex auth store is the lease home of \(holder); switch canceled. Unset CODEX_HOME or return that lease first."
         case .leaseStoreUnreadable:
             return "The lease store cannot be read; switch canceled."
         case let .capturedProfileIdentityMismatch(expectedEmail, actualEmail, expectedAccountID, actualAccountID):
@@ -937,7 +940,7 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         try terminateCodex()
         didTerminateCodex = true
         try CodexAuthFileLock.withLock {
-            try ensureNotLeased(account)
+            try ensureNotLeased(account, destination: defaultAuthURL)
             try copyReplacing(source: profile.authURL, destination: defaultAuthURL)
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: defaultAuthURL.path)
         }
@@ -964,7 +967,7 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         }
 
         let profile = try CodexAuthFileLock.withLock {
-            try ensureNotLeased(account)
+            try ensureNotLeased(account, destination: cliAuthURL)
             authMirrorService.syncActiveAuth()
             let profile = try capturedProfile(for: account)
             try validateCapturedProfileIdentity(profile, for: account)
@@ -980,17 +983,24 @@ final class CodexAccountSwitchService: @unchecked Sendable {
         )
     }
 
-    /// A leased account's lease home is its only live holder; no surface may switch to it meanwhile.
-    private func ensureNotLeased(_ account: Account) throws {
-        guard let profileKey = account.profileKey else { return }
-        let lease: CodexLease?
+    /// A leased account's lease home is its only live holder: no surface may switch to the account,
+    /// and no switch may write into a lease home.
+    private func ensureNotLeased(_ account: Account, destination: URL? = nil) throws {
+        let leases: [CodexLease]
         do {
-            lease = try CodexLeaseStore(appSupportURL: AppStorage.rootURL).lease(forProfileKey: profileKey)
+            leases = try CodexLeaseStore(appSupportURL: AppStorage.rootURL).load()
         } catch {
             throw CodexAccountSwitchError.leaseStoreUnreadable
         }
-        if let lease {
+        if let profileKey = account.profileKey,
+           let lease = leases.first(where: { $0.profileKey == profileKey }) {
             throw CodexAccountSwitchError.accountLeased(holder: lease.holder)
+        }
+        if let destination,
+           let lease = leases.first(where: {
+               CodexLease.sameHome($0.home, destination.deletingLastPathComponent().path)
+           }) {
+            throw CodexAccountSwitchError.destinationIsLeaseHome(holder: lease.holder)
         }
     }
 

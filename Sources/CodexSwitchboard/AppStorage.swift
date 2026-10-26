@@ -113,6 +113,30 @@ enum AccountProfileStore {
         refreshToken: String,
         expiresAt: Int
     ) throws {
+        // Under the shared lock, so this read-modify-write cannot restore a token the CLI's
+        // lease return just replaced.
+        try CodexAuthFileLock.withLock {
+            try upsertWithoutLock(
+                profileKey: profileKey,
+                oldProfileKey: oldProfileKey,
+                email: email,
+                accountID: accountID,
+                accessToken: accessToken,
+                refreshToken: refreshToken,
+                expiresAt: expiresAt
+            )
+        }
+    }
+
+    private static func upsertWithoutLock(
+        profileKey: String,
+        oldProfileKey: String?,
+        email: String,
+        accountID: String,
+        accessToken: String,
+        refreshToken: String,
+        expiresAt: Int
+    ) throws {
         var root = accountsRoot()
         var profiles = root["profiles"] as? [String: Any] ?? [:]
         var entry = profiles[profileKey] as? [String: Any] ?? [:]

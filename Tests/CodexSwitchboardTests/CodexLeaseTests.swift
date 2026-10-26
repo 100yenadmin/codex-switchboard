@@ -181,6 +181,9 @@ final class CodexLeaseTests: XCTestCase {
         let busy = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
         XCTAssertEqual(busy.exitCode, 2)
         XCTAssertEqual(busy.json["error"] as? String, "home_in_use")
+        let details = try XCTUnwrap(busy.json["details"] as? [String])
+        XCTAssertTrue(details.contains("\(consumer.processIdentifier) sh"), "\(details)")
+        XCTAssertFalse(busy.text.contains("consumer/codex"), "full command lines must not leak")
         XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-k-1")
         XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().count, 1)
 
@@ -270,6 +273,62 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(switched.json["error"] as? String, "lease_store_unreadable")
         XCTAssertEqual(leased.json["error"] as? String, "lease_store_unreadable")
         XCTAssertEqual(try Data(contentsOf: liveAuth), before)
+    }
+
+    func testLeaseWaitsForAnInFlightAppRefresh() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let reservations = CodexRefreshReservations(appSupportURL: fixture.appSupport)
+        try reservations.reserve(profileKey: "profile-k")
+
+        let busy = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(busy.json["error"] as? String, "refresh_in_progress")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent("auth.json").path))
+
+        // A reservation left behind by an app that died mid-grant expires.
+        try reservations.reserve(
+            profileKey: "profile-k",
+            now: Date().addingTimeInterval(-CodexRefreshReservations.maxAge - 1)
+        )
+        let leased = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(leased.exitCode, 0, leased.text)
+    }
+
+    func testLeaseRefusesSymlinkIntoAppStorage() throws {
+        let link = fixture.root.appendingPathComponent("storage-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: fixture.appSupport)
+
+        let lease = fixture.run([
+            "lease", "--profile-key", "profile-k", "--home", link.appendingPathComponent("new-home").path,
+            "--holder", "bench", "--json",
+        ])
+
+        XCTAssertEqual(lease.json["error"] as? String, "home_not_allowed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.appSupport.appendingPathComponent("new-home").path))
+    }
+
+    func testReturnKeepsHomeAuthWhenAStoredCopyCannotBeRead() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let homeAuth = home.appendingPathComponent("auth.json")
+        try fixture.writeAuth(account: "k", generation: 2, to: homeAuth)
+        try Data("{broken".utf8).write(to: fixture.appSupport.appendingPathComponent("accounts.json"))
+
+        let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+
+        XCTAssertNotEqual(returned.exitCode, 0)
+        XCTAssertEqual(fixture.refreshToken(in: homeAuth), "refresh-k-2")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().count, 1)
+    }
+
+    func testSwitchboardAppDetectionCoversBareBuildsButNotTheCLI() {
+        XCTAssertTrue(isSwitchboardAppCommand("/Users/x/Applications/CodexSwitchboard.app/Contents/MacOS/CodexSwitchboard"))
+        XCTAssertTrue(isSwitchboardAppCommand("/Users/x/src/codex-switchboard/.build/release/CodexSwitchboard"))
+        XCTAssertTrue(isSwitchboardAppCommand("/Users/x/.build/debug/CodexSwitchboard --fixture-snapshot-only"))
+        XCTAssertFalse(isSwitchboardAppCommand("/Users/x/.build/release/codex-switchboard leases --json"))
+        XCTAssertFalse(isSwitchboardAppCommand("/usr/bin/xctest /x/CodexSwitchboardPackageTests.xctest"))
     }
 
     func testLeaseMirrorMarkerMustMatchEveryRunningApp() {

@@ -42,13 +42,25 @@ public struct CodexLease: Codable, Equatable {
         homeURL.appendingPathComponent("auth.json")
     }
 
-    /// The canonical spelling of a home directory: absolute, symlinks resolved, no trailing slash.
+    /// The canonical spelling of a home directory: absolute, no trailing slash, and symlinks resolved
+    /// through its deepest existing ancestor, so a home that does not exist yet still resolves.
     public static func normalizedHome(_ path: String) -> String {
         let expanded = (path as NSString).expandingTildeInPath
-        let standardized = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
-        guard let resolved = Darwin.realpath(standardized, nil) else { return standardized }
-        defer { free(resolved) }
-        return String(cString: resolved)
+        var existing = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
+        var missing: [String] = []
+        while existing.path != "/" {
+            if let resolved = Darwin.realpath(existing.path, nil) {
+                defer { free(resolved) }
+                var url = URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+                for component in missing.reversed() {
+                    url.appendPathComponent(component, isDirectory: true)
+                }
+                return url.path
+            }
+            missing.append(existing.lastPathComponent)
+            existing.deleteLastPathComponent()
+        }
+        return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
     }
 
     /// Every spelling a process might use for this home, such as `/var/...` and `/private/var/...`.
@@ -196,6 +208,17 @@ public enum CodexAuthStoreLock {
     }
 }
 
+public enum CodexLeaseSyncError: LocalizedError {
+    case storedCopyUnreadable(path: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .storedCopyUnreadable(path):
+            return "A stored copy of the leased account at \(path) cannot be read, so its token cannot be brought up to date."
+        }
+    }
+}
+
 public enum CodexLeaseSyncOutcome: String, Equatable {
     /// The home held rotated tokens; every stored copy of the account now holds them.
     case rotated
@@ -220,7 +243,8 @@ public enum CodexLeaseSync {
             return .homeAuthUnreadable
         }
 
-        let stored = storedProfiles(
+        // Every stored copy must be readable, or one of them could keep a spent token after return.
+        let stored = try storedProfiles(
             profileKey: lease.profileKey,
             profilesURL: appSupportURL.appendingPathComponent("profiles", isDirectory: true)
         )
@@ -269,13 +293,13 @@ public enum CodexLeaseSync {
 
     /// True when the home and the profile copied at lease time hold the same token chain head.
     public static func homeMatchesStoredProfile(_ lease: CodexLease, appSupportURL: URL) -> Bool {
-        guard let homeAuth = StoredAuth.load(from: lease.authURL) else { return false }
-        let stored = storedProfiles(
+        guard let homeAuth = StoredAuth.load(from: lease.authURL),
+              let stored = try? storedProfiles(
             profileKey: lease.profileKey,
-            profilesURL: appSupportURL.appendingPathComponent("profiles", isDirectory: true)
-        )
-        guard let pinned = stored.first(where: { $0.directoryName == lease.profileDirectory })
-            ?? stored.max(by: { $0.modified < $1.modified }) else {
+              profilesURL: appSupportURL.appendingPathComponent("profiles", isDirectory: true)
+              ),
+              let pinned = stored.first(where: { $0.directoryName == lease.profileDirectory })
+                ?? stored.max(by: { $0.modified < $1.modified }) else {
             return false
         }
         return pinned.auth.hasSameTokens(as: homeAuth)
@@ -289,7 +313,7 @@ public enum CodexLeaseSync {
         let modified: Date
     }
 
-    private static func storedProfiles(profileKey: String, profilesURL: URL) -> [StoredProfile] {
+    private static func storedProfiles(profileKey: String, profilesURL: URL) throws -> [StoredProfile] {
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: profilesURL,
             includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
@@ -297,7 +321,7 @@ public enum CodexLeaseSync {
         ) else {
             return []
         }
-        return entries.compactMap { entry in
+        return try entries.compactMap { entry in
             guard entry.lastPathComponent != "backups",
                   (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
                 return nil
@@ -305,7 +329,10 @@ public enum CodexLeaseSync {
             let metaURL = entry.appendingPathComponent("meta.json")
             guard (readJSON(metaURL)?["source_profile_key"] as? String) == profileKey else { return nil }
             let authURL = entry.appendingPathComponent("auth.json")
-            guard let auth = StoredAuth.load(from: authURL) else { return nil }
+            guard FileManager.default.fileExists(atPath: authURL.path) else { return nil }
+            guard let auth = StoredAuth.load(from: authURL) else {
+                throw CodexLeaseSyncError.storedCopyUnreadable(path: authURL.path)
+            }
             return StoredProfile(
                 directoryName: entry.lastPathComponent,
                 authURL: authURL,
@@ -318,8 +345,11 @@ public enum CodexLeaseSync {
     }
 
     private static func updateAccountList(profileKey: String, auth: StoredAuth, accountsURL: URL) throws -> Bool {
-        guard var root = readJSON(accountsURL),
-              var profiles = root["profiles"] as? [String: Any],
+        guard FileManager.default.fileExists(atPath: accountsURL.path) else { return false }
+        guard var root = readJSON(accountsURL) else {
+            throw CodexLeaseSyncError.storedCopyUnreadable(path: accountsURL.path)
+        }
+        guard var profiles = root["profiles"] as? [String: Any],
               var entry = profiles[profileKey] as? [String: Any] else {
             return false
         }
@@ -336,6 +366,48 @@ public enum CodexLeaseSync {
         root["profiles"] = profiles
         try CodexAtomicFile.writeJSON(root, to: accountsURL)
         return true
+    }
+}
+
+/// The app's in-flight refresh grants. A grant spends the account's current refresh token, so a
+/// lease must not copy that token until the grant's rotation is stored. A reservation older than
+/// `maxAge` is stale (the app died mid-grant). Callers hold `CodexAuthStoreLock`.
+public final class CodexRefreshReservations {
+    public static let fileName = "refresh-reservations.json"
+    public static let maxAge: TimeInterval = 60
+
+    private let url: URL
+
+    public init(appSupportURL: URL) {
+        url = appSupportURL.appendingPathComponent(Self.fileName)
+    }
+
+    public func reserve(profileKey: String, now: Date = Date()) throws {
+        var reservations = load()
+        reservations[profileKey] = now.timeIntervalSince1970
+        try save(reservations)
+    }
+
+    public func release(profileKey: String) throws {
+        var reservations = load()
+        guard reservations.removeValue(forKey: profileKey) != nil else { return }
+        try save(reservations)
+    }
+
+    public func isReserved(profileKey: String, now: Date = Date()) -> Bool {
+        guard let since = load()[profileKey] else { return false }
+        return now.timeIntervalSince1970 - since < Self.maxAge
+    }
+
+    private func load() -> [String: TimeInterval] {
+        guard let data = try? Data(contentsOf: url) else { return [:] }
+        return (try? JSONDecoder().decode([String: TimeInterval].self, from: data)) ?? [:]
+    }
+
+    private func save(_ reservations: [String: TimeInterval]) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try CodexAtomicFile.write(encoder.encode(reservations), to: url)
     }
 }
 

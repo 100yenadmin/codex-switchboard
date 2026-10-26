@@ -6,7 +6,7 @@ All notable changes to Codex Switchboard will be documented here.
 
 - Added agent leases: `codex-switchboard lease`, `return` and `leases` lend one paid, inactive account's captured auth to a separate `CODEX_HOME` and take it back. A refresh token is single-use, so a leased account has exactly one live holder: `switch`, `autoswap run-once`, auto-swap candidate ranking and in-app switches all skip it, the app stops refreshing its token during usage polling, and the auth mirror writes every rotation in a lease home back to the stored profile and account list.
 - `return` writes the home's latest token back, removes the home's `auth.json` and clears the lease. It refuses while any process holds files open in the home, and never deletes a home that now holds a different account.
-- `lease` refuses the active CLI or Desktop account, an account already leased, free or unknown plans, accounts that need a new sign-in, and any home that already holds another sign-in. It also refuses while a running Switchboard app predates leases, since that app would refresh the leased token itself.
+- `lease` refuses the active CLI or Desktop account, an account already leased, free or unknown plans, accounts that need a new sign-in, and any home that already holds another sign-in. It also refuses while a running Switchboard app predates leases, since that app would refresh the leased token itself, and while the app has a refresh grant for that account in flight.
 - App and CLI auth writes now share a cross-process lock (`.auth.lock` in app storage); the previous lock only covered the app's own threads.
 - `status` reports `leased` and `lease_holder` per account, and `--usable-only` leaves leased accounts out.
 

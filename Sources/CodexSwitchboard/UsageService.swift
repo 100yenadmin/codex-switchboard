@@ -22,8 +22,7 @@ final class UsageService: @unchecked Sendable {
     private let session: URLSession
     private let profileLoader: () -> AccountProfileCollection
     private let tokenUpdater: TokenUpdater
-    /// nil when the lease store cannot be read; refresh then pauses for every account.
-    private let leasedProfileKeys: () -> Set<String>?
+    private let refreshGate: RefreshGate
     private static let refreshFailedError = "Refresh failed - re-login required"
     private static let refreshTemporarilyUnavailableError = "Refresh temporarily unavailable"
     static let leasedRefreshDeferredError = "Leased - the lease holder refreshes this token"
@@ -41,8 +40,8 @@ final class UsageService: @unchecked Sendable {
                 ) else {
                     throw AccountProfileTokenUpdateError.profileChanged
                 }
-                // A lease taken after the grant was sent holds the token just spent;
-                // hand its home the rotation too, so the chain keeps one head.
+                // A lease can only appear mid-grant if the reservation went stale; that
+                // home then holds the token just spent, so hand it the rotation too.
                 let leaseHome = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
                     .lease(forProfileKey: profileKey)?.authURL
                 try ActiveCodexAuthStore.updateMatching(
@@ -65,14 +64,52 @@ final class UsageService: @unchecked Sendable {
                 )
             }
         },
-        leasedProfileKeys: @escaping () -> Set<String>? = {
-            try? CodexLeaseStore(appSupportURL: AppStorage.rootURL).leasedProfileKeys()
-        }
+        refreshGate: RefreshGate = .live
     ) {
         self.session = session
         self.profileLoader = profileLoader
         self.tokenUpdater = tokenUpdater
-        self.leasedProfileKeys = leasedProfileKeys
+        self.refreshGate = refreshGate
+    }
+
+    /// Decides whether this app may spend an account's refresh token now. A granted reservation
+    /// lasts until the rotation is stored, so the CLI cannot lease the account mid-grant.
+    struct RefreshGate {
+        enum Decision {
+            case granted
+            case leased
+            case leaseStoreUnreadable
+        }
+
+        let reserve: (_ profileKey: String) -> Decision
+        let release: (_ profileKey: String) -> Void
+
+        static let live = RefreshGate(
+            reserve: { profileKey in
+                CodexAuthFileLock.withLock {
+                    guard let leased = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
+                        .leasedProfileKeys() else {
+                        return .leaseStoreUnreadable
+                    }
+                    if leased.contains(profileKey) {
+                        return .leased
+                    }
+                    do {
+                        try CodexRefreshReservations(appSupportURL: AppStorage.rootURL)
+                            .reserve(profileKey: profileKey)
+                    } catch {
+                        return .leaseStoreUnreadable
+                    }
+                    return .granted
+                }
+            },
+            release: { profileKey in
+                CodexAuthFileLock.withLock {
+                    try? CodexRefreshReservations(appSupportURL: AppStorage.rootURL)
+                        .release(profileKey: profileKey)
+                }
+            }
+        )
     }
 
     private enum RefreshResult {
@@ -136,18 +173,20 @@ final class UsageService: @unchecked Sendable {
             guard accessTokenMissing || Self.shouldAttemptTokenRefresh(usage) else { continue }
             // A leased account's refresh token belongs to its lease home. Spending it here
             // would log that home out, so the mirror brings its rotations back instead.
-            // Read right before the grant, so a lease taken during the usage fetch still counts.
-            let leasedKeys = leasedProfileKeys()
-            guard let leasedKeys, !leasedKeys.contains(key) else {
-                usages[key] = [
-                    "error": leasedKeys == nil
-                        ? Self.leaseStoreUnreadableError
-                        : Self.leasedRefreshDeferredError,
-                ]
+            switch refreshGate.reserve(key) {
+            case .granted:
+                break
+            case .leased:
+                usages[key] = ["error": Self.leasedRefreshDeferredError]
+                continue
+            case .leaseStoreUnreadable:
+                usages[key] = ["error": Self.leaseStoreUnreadableError]
                 continue
             }
+            let refreshResult = await refreshProfile(profileKey: key, profile: profile)
+            refreshGate.release(key)
 
-            switch await refreshProfile(profileKey: key, profile: profile) {
+            switch refreshResult {
             case .unavailable:
                 break
             case .removed:

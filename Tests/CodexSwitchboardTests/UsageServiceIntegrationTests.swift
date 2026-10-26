@@ -250,6 +250,39 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
+    func testRefreshReservationSpansTheGrantUntilTheRotationIsStored() async throws {
+        let events = EventRecorder()
+        MockURLProtocol.handler = { request in
+            if request.url?.path == "/oauth/token" {
+                events.record("grant")
+                return Self.response(request, json: [
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3_600,
+                ])
+            }
+            if request.value(forHTTPHeaderField: "Authorization") == "Bearer new-access" {
+                return Self.healthyUsageResponse(request)
+            }
+            return Self.response(request, status: 401, json: ["detail": ["code": "token_expired"]])
+        }
+
+        let service = makeService(
+            tokenUpdate: TokenUpdateRecorder(),
+            tokenUpdater: { _, _, _, _, _, _, _, _ in events.record("store") },
+            refreshGate: UsageService.RefreshGate(
+                reserve: { _ in
+                    events.record("reserve")
+                    return .granted
+                },
+                release: { _ in events.record("release") }
+            )
+        )
+        _ = await service.loadAll()
+
+        XCTAssertEqual(events.all, ["reserve", "grant", "store", "release"])
+    }
+
     func testUnreadableLeaseStorePausesEveryRefresh() async throws {
         let recorder = RequestRecorder()
         let tokenUpdate = TokenUpdateRecorder()
@@ -304,7 +337,8 @@ final class UsageServiceIntegrationTests: XCTestCase {
         tokenUpdate: TokenUpdateRecorder,
         accessToken: String? = "old-access",
         tokenUpdater: UsageService.TokenUpdater? = nil,
-        leasedProfileKeys: Set<String>? = []
+        leasedProfileKeys: Set<String>? = [],
+        refreshGate: UsageService.RefreshGate? = nil
     ) -> UsageService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -335,7 +369,13 @@ final class UsageServiceIntegrationTests: XCTestCase {
                     expiresAt: expiresAt
                 )
             },
-            leasedProfileKeys: { leasedProfileKeys }
+            refreshGate: refreshGate ?? UsageService.RefreshGate(
+                reserve: { profileKey in
+                    guard let leasedProfileKeys else { return .leaseStoreUnreadable }
+                    return leasedProfileKeys.contains(profileKey) ? .leased : .granted
+                },
+                release: { _ in }
+            )
         )
     }
 
@@ -424,6 +464,23 @@ private final class MockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private final class EventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func record(_ event: String) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    var all: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
 }
 
 private final class RequestRecorder: @unchecked Sendable {

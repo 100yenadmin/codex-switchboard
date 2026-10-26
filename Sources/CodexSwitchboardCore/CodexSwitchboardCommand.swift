@@ -1147,6 +1147,13 @@ private final class CLILeaseService {
                     details: nil
                 )
             }
+            if CodexRefreshReservations(appSupportURL: paths.appSupportURL).isReserved(profileKey: profileKey) {
+                throw CLIError.refused(
+                    code: "refresh_in_progress",
+                    message: "Switchboard is refreshing the token of profile_key \(profileKey) right now; lease again in a few seconds.",
+                    details: nil
+                )
+            }
             if surfaceService.statuses(scope: .all).contains(where: { $0.activeProfileKey == profileKey }) {
                 throw CLIError.refused(
                     code: "active_account",
@@ -1226,10 +1233,11 @@ private final class CLILeaseService {
             }
             let consumers = consumerProcesses(usingHome: lease.home)
             guard consumers.isEmpty else {
+                // Only pid and program name: a full command line can carry a prompt with secrets in it.
                 throw CLIError.refused(
                     code: "home_in_use",
-                    message: "Codex processes are still using \(lease.home); stop them, then return the lease.",
-                    details: consumers.map(\.description)
+                    message: "Processes are still using \(lease.home); stop them, then return the lease.",
+                    details: consumers.map { "\($0.pid) \(programName(of: $0.command))" }
                 )
             }
 
@@ -2321,8 +2329,22 @@ private func openFileHolderPIDs(in directory: String) -> [Int32] {
 
 private func runningSwitchboardAppPIDs() -> [Int32] {
     processLinesWithPID().compactMap { pid, command in
-        command.lowercased().contains(".app/contents/macos/codexswitchboard") ? pid : nil
+        isSwitchboardAppCommand(command) ? pid : nil
     }
+}
+
+/// A Switchboard app process, bundled or a bare build product, but not this CLI (`codex-switchboard`).
+func isSwitchboardAppCommand(_ command: String) -> Bool {
+    let lowercased = command.lowercased()
+    return lowercased.hasSuffix("/codexswitchboard")
+        || lowercased.contains("/codexswitchboard ")
+        || lowercased == "codexswitchboard"
+        || lowercased.hasPrefix("codexswitchboard ")
+}
+
+private func programName(of command: String) -> String {
+    let program = command.split(separator: " ", maxSplits: 1).first.map(String.init) ?? command
+    return URL(fileURLWithPath: program).lastPathComponent
 }
 
 private func isCodexConsumerCommand(_ lowercasedCommand: String) -> Bool {

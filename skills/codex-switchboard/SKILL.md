@@ -143,7 +143,8 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `home_holds_other_account`, `home_holds_other_login` | The home already holds a sign-in (for example its own device-code login). Use an empty home. |
 | `home_not_allowed` | The home is `~`, a Switchboard surface home such as `~/.codex`, or inside Switchboard's storage. |
 | `app_not_lease_aware` | A running Switchboard app predates leases and would refresh the leased token itself. Update or quit it. |
-| `home_in_use` | `return` found processes holding files open in the home (listed in `details`). Stop them first. |
+| `refresh_in_progress` | The app is refreshing this account's token right now. Lease again in a few seconds. |
+| `home_in_use` | `return` found processes holding files open in the home (pid and program name in `details`). Stop them first. |
 | `account_leased`, `surface_is_lease_home` | `switch` refused a leased account, or a surface whose auth store is a lease home. |
 | `lease_store_unreadable` | Switchboard could not read `leases.json`; every writer fails closed. |
 
