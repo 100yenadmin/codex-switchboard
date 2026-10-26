@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Fake codex-switchboard for the codex-logins tests. Each command's output comes from $FAKE_CS_FIXTURE:
-{"status": <obj> | "!exit" | "!garbage" | "!list", "leases": ..., "switch": "!ok" | "!exit" | "!noop"}.
+{"status": <obj> | "!exit" | "!garbage" | "!list", "leases": ..., "switch": "!ok" | "!exit" | "!noop" | "!hang"}.
 A successful switch records its --profile-key in the fixture's "switched" list and makes that account the CLI's
 active one. Exits 99 if CODEX_HOME reaches it."""
 import hashlib
@@ -19,6 +19,9 @@ if "--json" not in sys.argv:
 out = fx.get(cmd, "!exit")
 if cmd == "switch":
     given = sys.argv[sys.argv.index("--profile-key") + 1]
+    if out == "!hang":
+        import time
+        time.sleep(10)
     fx.setdefault("switched", []).append(given)
     if out == "!ok":
         keys = [a["profile_key"] for a in fx["status"]["accounts"]]

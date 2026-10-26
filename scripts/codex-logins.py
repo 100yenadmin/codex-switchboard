@@ -48,6 +48,7 @@ ERROR_CODE = re.compile(r"[a-z_]{1,64}")
 # A purpose is printed, so it must be a short label that cannot hold an email, a path or a token.
 PURPOSE = re.compile(r"[a-z][a-z0-9-]{0,47}")
 AUTH_LOCK_TIMEOUT = 60
+CS_TIMEOUT = 120
 
 
 def find_cli():
@@ -161,7 +162,7 @@ def auth_store_lock():
 def cs_run(*args):
     # Switchboard must judge the main CLI home, never a lease or reserved home in CODEX_HOME.
     env = {k: v for k, v in os.environ.items() if k != "CODEX_HOME"}
-    return subprocess.run([CS, *args], capture_output=True, text=True, timeout=120, env=env)
+    return subprocess.run([CS, *args], capture_output=True, text=True, timeout=CS_TIMEOUT, env=env)
 
 
 def cs_json(*args):
@@ -419,7 +420,11 @@ def cmd_swap(a):
         print("would switch the main CLI from %s to %s" % (describe(current), describe(chosen)))
         return 0
     # Switchboard re-checks leases and the registry by seat under its own lock before it writes.
-    r = cs_run("switch", "--profile-key", chosen["handle"], "--surface", "cli", "--json")
+    try:
+        r = cs_run("switch", "--profile-key", chosen["handle"], "--surface", "cli", "--json")
+    except (OSError, subprocess.SubprocessError) as e:
+        # A switch killed on timeout may or may not have written, so its outcome cannot be confirmed.
+        return refuse(7, "the switch to %s did not finish (%s), so it cannot be confirmed" % (chosen["handle"], type(e).__name__))
     if r.returncode != 0:
         try:
             error = json.loads(r.stdout or r.stderr).get("error")

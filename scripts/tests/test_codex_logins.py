@@ -163,6 +163,7 @@ swap_cases = [
      {"fixture": mut(lambda d: d["status"]["accounts"][1].update(usable_for_codex=False))}, 5, None),
     ("swap refused by Switchboard", ["swap"], {"fixture": mut(lambda d: d.update(switch="!exit"))}, 6, h(FREE)),
     ("swap that does not take", ["swap"], {"fixture": mut(lambda d: d.update(switch="!noop"))}, 7, h(FREE)),
+    ("swap whose switch times out: cannot be confirmed", ["swap"], {"fixture": mut(lambda d: d.update(switch="!hang"))}, 7, None),
     ("swap with a stale reservation: refused before any switch", ["swap"],
      {"registry": {"version": 1, "logins": [{"purpose": "p", "profile_key": "cli:gone@example.invalid"}]}}, 2, None),
     ("swap with an unreadable lease store: refused", ["swap"], {"fixture": mut(lambda d: d.update(leases="!exit"))}, 4, None),
@@ -223,7 +224,9 @@ for name, key, kw, want in check_cases:
     print("%s %-72s want %d got %d%s  %s" % ("PASS" if ok else "FAIL", name, want, got, "  LEAK" if leak else "", text))
 
 for name, argv, kw, want, switched_to in swap_cases:
+    cl.CS_TIMEOUT = 1 if kw.get("fixture", {}).get("switch") == "!hang" else 120
     got, text, after = run(argv, **kw)
+    cl.CS_TIMEOUT = 120
     calls = after.get("switched", [])
     leak = any(s in text for s in SECRETS) or any(not cl.HANDLE.fullmatch(c) for c in calls)
     right_call = calls == ([switched_to] if switched_to else [])
