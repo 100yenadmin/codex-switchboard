@@ -278,6 +278,12 @@ fails += not ok
 total += 1
 print("%s %-72s want 1 got %d  %s" % ("PASS" if ok else "FAIL", "register while a switch holds .auth.lock: refused", got, text))
 
+for bad in ("{not json", {"version": 1, "logins": [{"purpose": "p", "profile_key": ["x"]}]}):
+    got, text, _ = run(["status"], registry=bad)
+    ok = got == 2 and "registry" in text
+    fails += not ok
+    total += 1
+    print("%s %-72s want 2 got %d  %s" % ("PASS" if ok else "FAIL", "status with a malformed registry: refused", got, text))
 got, text, _ = run(["status"], registry="{not json")
 ok = got == 2 and "cannot be read" in text
 fails += not ok

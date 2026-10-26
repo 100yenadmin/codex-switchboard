@@ -83,8 +83,9 @@ def load_registry():
     except (OSError, ValueError):
         raise Refusal(2, "the registry cannot be read as JSON")
     if not isinstance(reg, dict) or not isinstance(reg.get("logins"), list) or not all(
-            isinstance(e, dict) for e in reg["logins"]):
-        raise Refusal(2, "the registry does not hold a list of logins")
+            isinstance(e, dict) and all(isinstance(e.get(k, ""), str) for k in ("profile_key", "purpose", "codex_home"))
+            for e in reg["logins"]):
+        raise Refusal(2, "the registry does not hold a list of logins with text fields")
     return reg
 
 
