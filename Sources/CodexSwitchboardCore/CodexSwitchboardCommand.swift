@@ -348,7 +348,7 @@ private final class CommandRunner {
     codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
     codex-switchboard return --profile-key <key> --home <dir> --json
     codex-switchboard leases --json
-    codex-switchboard swap-lease --home <dir> [--profile-key <key>] [--exclude-profile-key <key>]... [--holder <name>] --json
+    codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... --json
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
     codex-switchboard autoswap enable --surface cli|desktop|both --json [--trigger-session-free <percent>] [--target-min-session-free <percent>]
     codex-switchboard autoswap disable --surface cli|desktop|both --json
@@ -431,7 +431,7 @@ private struct SwapLeaseOptions {
     let home: String
     let profileKey: String?
     let excludedProfileKeys: Set<String>
-    let holder: String?
+    let holder: String
 
     static func parse(_ args: [String]) throws -> SwapLeaseOptions {
         var parser = ArgumentParser(args)
@@ -439,12 +439,12 @@ private struct SwapLeaseOptions {
         let home = try parser.takeRequiredValue("--home")
         let profileKey = parser.takeOptionalValue("--profile-key")
         let excluded = try parser.takeAllValues("--exclude-profile-key")
-        let holder = parser.takeOptionalValue("--holder")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let holder = try parser.takeRequiredValue("--holder").trimmingCharacters(in: .whitespacesAndNewlines)
         try parser.finish()
         if let profileKey, profileKey.isEmpty || profileKey.hasPrefix("--") {
             throw CLIError.usage("Missing value for --profile-key.", jsonPreferred: false)
         }
-        if let holder, holder.isEmpty || holder.count > 200 || holder.hasPrefix("--") {
+        if holder.isEmpty || holder.count > 200 || holder.hasPrefix("--") {
             throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
         }
         if let profileKey, excluded.contains(profileKey) {
@@ -716,6 +716,16 @@ private struct SwitchboardPaths {
         leaseStore = CodexLeaseStore(appSupportURL: appSupportURL)
     }
 
+    /// The codex-logins registry of reserved logins.
+    var reservedLoginsURL: URL {
+        homeURL.appendingPathComponent(".config/codex-logins/registry.json")
+    }
+
+    /// How long lease, return and swap-lease wait for a lease home's holder to release its auth lock.
+    var homeLockTimeout: TimeInterval {
+        environment["CODEX_SWITCHBOARD_HOME_LOCK_TIMEOUT_SECONDS"].flatMap(Double.init) ?? 30
+    }
+
     /// Whether this storage is one a Switchboard app could be using, as opposed to a test or scratch copy.
     var isAppStorage: Bool {
         let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -880,6 +890,7 @@ private final class CLIAccountStore {
             if let lease = leases.first(where: { $0.profileKey == account.profileKey }) {
                 account.leased = true
                 account.leaseHolder = lease.holder
+                account.leaseQuarantined = CodexLeaseHome.isQuarantined(home: lease.home)
             }
             return account
         }
@@ -1179,6 +1190,41 @@ private final class CLISwitchService {
     }
 }
 
+/// Logins the codex-logins registry sets aside for one consumer each, such as a benchmark director with
+/// its own device-code home. Lending one would share its rate limit with another consumer, so none is
+/// ever leased, and no lease goes into a registered home.
+private struct ReservedLogins {
+    let profileKeys: Set<String>
+    let homes: [String]
+
+    struct Unreadable: Error {}
+
+    /// A missing registry reserves nothing. One that does not parse, or lists a login without a
+    /// profile key, throws, so that callers fail closed as `codex-logins.py check-switch` does.
+    static func load(from url: URL, homeURL: URL) throws -> ReservedLogins {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return ReservedLogins(profileKeys: [], homes: [])
+        }
+        guard let root = readJSON(url), let logins = root["logins"] as? [[String: Any]] else {
+            throw Unreadable()
+        }
+        var profileKeys = Set<String>()
+        var homes: [String] = []
+        for login in logins {
+            guard let profileKey = login["profile_key"] as? String, !profileKey.isEmpty else {
+                throw Unreadable()
+            }
+            profileKeys.insert(profileKey)
+            if let home = login["codex_home"] as? String, !home.isEmpty {
+                homes.append(home == "~" || home.hasPrefix("~/")
+                    ? homeURL.path + home.dropFirst()
+                    : home)
+            }
+        }
+        return ReservedLogins(profileKeys: profileKeys, homes: homes)
+    }
+}
+
 /// Lends one account's captured auth to a separate CODEX_HOME and takes it back. A refresh token is
 /// single-use, so two live copies of one chain log each other out: a lease home must be the account's
 /// only live holder, and the stored profile must end up with the home's latest rotated token.
@@ -1215,6 +1261,7 @@ private final class CLILeaseService {
                     details: nil
                 )
             }
+            try ensureNotReserved(profileKey: profileKey, home: requestedHome)
             if CodexRefreshReservations(appSupportURL: paths.appSupportURL)
                 .isReserved(profileKey: profileKey, runningAppPIDs: Set(runningSwitchboardAppPIDs())) {
                 throw CLIError.refused(
@@ -1247,36 +1294,44 @@ private final class CLILeaseService {
                 throw CLIError.failure(message: "Captured profile is missing valid redacted identity fields.", jsonPreferred: true)
             }
 
+            if CodexLeaseHome.isQuarantined(home: requestedHome) {
+                throw quarantined(requestedHome)
+            }
             try paths.ensureDirectory(URL(fileURLWithPath: requestedHome, isDirectory: true), permissions: 0o700)
             let home = CodexLease.normalizedHome(requestedHome)
             let authURL = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("auth.json")
-            let alreadyHeld = try homeAlreadyHolds(profileAuth, at: authURL)
 
-            let lease = CodexLease(
-                profileKey: profileKey,
-                home: home,
-                holder: holder,
-                profileDirectory: profile.profileURL.lastPathComponent
-            )
-            // Record the lease before the copy exists, so switch, auto-swap and the app see it first.
-            try paths.leaseStore.save(leases + [lease])
-            if !alreadyHeld {
-                do {
-                    try paths.writeData(try Data(contentsOf: profile.authURL), to: authURL, permissions: 0o600)
-                } catch {
-                    try? paths.leaseStore.save(leases)
-                    throw error
+            return try withHomeLock(home) {
+                if CodexLeaseHome.isQuarantined(home: home) {
+                    throw quarantined(home)
                 }
+                let alreadyHeld = try homeAlreadyHolds(profileAuth, at: authURL)
+                let lease = CodexLease(
+                    profileKey: profileKey,
+                    home: home,
+                    holder: holder,
+                    profileDirectory: profile.profileURL.lastPathComponent
+                )
+                // Record the lease before the copy exists, so switch, auto-swap and the app see it first.
+                try paths.leaseStore.save(leases + [lease])
+                if !alreadyHeld {
+                    do {
+                        try paths.writeData(try Data(contentsOf: profile.authURL), to: authURL, permissions: 0o600)
+                    } catch {
+                        try? paths.leaseStore.save(leases)
+                        throw error
+                    }
+                }
+                return LeasePayload(
+                    generatedAt: Date(),
+                    profileKey: profileKey,
+                    home: home,
+                    holder: holder,
+                    leasedAt: lease.leasedAt,
+                    authStorePath: authURL.path,
+                    authWritten: !alreadyHeld
+                )
             }
-            return LeasePayload(
-                generatedAt: Date(),
-                profileKey: profileKey,
-                home: home,
-                holder: holder,
-                leasedAt: lease.leasedAt,
-                authStorePath: authURL.path,
-                authWritten: !alreadyHeld
-            )
         }
     }
 
@@ -1285,7 +1340,7 @@ private final class CLILeaseService {
             .standardizedFileURL.path
 
         return try CodexAuthStoreLock.withRequiredLock(appSupportURL: paths.appSupportURL) {
-            var leases = try paths.leaseStore.load()
+            let leases = try paths.leaseStore.load()
             guard let lease = leases.first(where: { $0.profileKey == profileKey }) else {
                 throw CLIError.refused(
                     code: "not_leased",
@@ -1310,46 +1365,57 @@ private final class CLILeaseService {
                 )
             }
 
-            let outcome = try CodexLeaseSync.syncHome(lease, appSupportURL: paths.appSupportURL)
-            switch outcome {
-            case .identityMismatch:
-                throw CLIError.refused(
-                    code: "home_holds_other_account",
-                    message: "\(lease.authURL.path) now holds a different account. Nothing was synced or removed; move that file away, then return again.",
-                    details: nil
-                )
-            case .homeAuthUnreadable:
-                throw CLIError.refused(
-                    code: "home_auth_unreadable",
-                    message: "\(lease.authURL.path) cannot be read as Codex auth. Nothing was removed.",
-                    details: nil
-                )
-            case .storedProfileMissing:
-                throw CLIError.refused(
-                    code: "stored_profile_missing",
-                    message: "The captured profile for profile_key \(profileKey) is gone, so the lease home holds the only copy. Nothing was removed.",
-                    details: nil
-                )
-            case .rotated, .unchanged, .homeAuthMissing:
-                break
+            return try withHomeLock(lease.home) {
+                try finishReturn(lease, leases: leases)
             }
-
-            let removeHomeAuth = outcome != .homeAuthMissing
-            if removeHomeAuth {
-                try fileManager.removeItem(at: lease.authURL)
-            }
-            leases.removeAll { $0.profileKey == profileKey }
-            try paths.leaseStore.save(leases)
-            return LeaseReturnPayload(
-                generatedAt: Date(),
-                profileKey: profileKey,
-                home: lease.home,
-                holder: lease.holder,
-                leasedAt: lease.leasedAt,
-                sync: outcome.rawValue,
-                homeAuthRemoved: removeHomeAuth
-            )
         }
+    }
+
+    /// Syncs the home's tokens back, removes its auth and clears the lease. Callers hold both locks.
+    private func finishReturn(_ lease: CodexLease, leases: [CodexLease]) throws -> LeaseReturnPayload {
+        var leases = leases
+        let profileKey = lease.profileKey
+        let outcome = try CodexLeaseSync.syncHome(lease, appSupportURL: paths.appSupportURL)
+        switch outcome {
+        case .homeQuarantined:
+            throw quarantined(lease.home)
+        case .identityMismatch:
+            throw CLIError.refused(
+                code: "home_holds_other_account",
+                message: "\(lease.authURL.path) now holds a different account. Nothing was synced or removed; move that file away, then return again.",
+                details: nil
+            )
+        case .homeAuthUnreadable:
+            throw CLIError.refused(
+                code: "home_auth_unreadable",
+                message: "\(lease.authURL.path) cannot be read as Codex auth. Nothing was removed.",
+                details: nil
+            )
+        case .storedProfileMissing:
+            throw CLIError.refused(
+                code: "stored_profile_missing",
+                message: "The captured profile for profile_key \(profileKey) is gone, so the lease home holds the only copy. Nothing was removed.",
+                details: nil
+            )
+        case .rotated, .unchanged, .homeAuthMissing:
+            break
+        }
+
+        let removeHomeAuth = outcome != .homeAuthMissing
+        if removeHomeAuth {
+            try fileManager.removeItem(at: lease.authURL)
+        }
+        leases.removeAll { $0.profileKey == profileKey }
+        try paths.leaseStore.save(leases)
+        return LeaseReturnPayload(
+            generatedAt: Date(),
+            profileKey: profileKey,
+            home: lease.home,
+            holder: lease.holder,
+            leasedAt: lease.leasedAt,
+            sync: outcome.rawValue,
+            homeAuthRemoved: removeHomeAuth
+        )
     }
 
     func list() throws -> LeasesPayload {
@@ -1376,21 +1442,27 @@ private final class CLILeaseService {
                         lease,
                         appSupportURL: paths.appSupportURL
                     ),
-                    activeOnSurface: activeKeys.contains(lease.profileKey)
+                    activeOnSurface: activeKeys.contains(lease.profileKey),
+                    quarantined: CodexLeaseHome.isQuarantined(home: lease.home),
+                    quarantinedSince: CodexLeaseHome.quarantinedSince(home: lease.home)
                 )
             }
         )
     }
 
-    /// Marks the accounts an agent could lease now: unleased, a known paid plan, usable quota, no
-    /// re-login needed, and not the active account of any surface.
-    /// Nothing is leasable while the lease store cannot be read.
+    /// Marks the accounts an agent could lease now: unleased, not reserved, a known paid plan, usable
+    /// quota, no re-login needed, and not the active account of any surface.
+    /// Nothing is leasable while the lease store or the reserved-login registry cannot be read.
     func annotateLeasable(_ accounts: [AccountPayload]) -> [AccountPayload] {
         let storeReadable = (try? paths.leaseStore.load()) != nil
+        let reserved = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
         let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
         return accounts.map { account in
             var account = account
+            account.reserved = reserved?.profileKeys.contains(account.profileKey) ?? false
             account.leasable = storeReadable
+                && reserved != nil
+                && !account.reserved
                 && !account.leased
                 && account.isKnownPaidPlan
                 && account.usableForCodex
@@ -1402,12 +1474,13 @@ private final class CLILeaseService {
 
     /// Returns the account leased at `home` and leases another into the same home, for a lane whose
     /// account runs low. Every process in the home must have stopped: a live Codex holds the old
-    /// token in memory.
+    /// token in memory. Only the lease's holder may swap it, since its run records name the account
+    /// each run used; the new lease keeps that holder.
     func swapLease(
         home rawHome: String,
         to requestedKey: String?,
         excluding excludedKeys: Set<String>,
-        holder newHolder: String?
+        holder: String
     ) throws -> LeaseSwapPayload {
         let requestedHome = URL(fileURLWithPath: (rawHome as NSString).expandingTildeInPath, isDirectory: true)
             .standardizedFileURL.path
@@ -1420,6 +1493,16 @@ private final class CLILeaseService {
                     message: "\(requestedHome) holds no lease; use lease for its first account.",
                     details: nil
                 )
+            }
+            guard current.holder == holder else {
+                throw CLIError.refused(
+                    code: "holder_mismatch",
+                    message: "\(current.home) is leased to \(current.holder); only that holder swaps its account.",
+                    details: nil
+                )
+            }
+            if CodexLeaseHome.isQuarantined(home: current.home) {
+                throw quarantined(current.home)
             }
             let candidates = annotateLeasable(accountStore.accounts())
             let targetKey: String
@@ -1445,6 +1528,7 @@ private final class CLILeaseService {
                 )
             }
             // Check the target before giving anything back, so a refusal leaves the lane as it was.
+            try ensureNotReserved(profileKey: targetKey, home: nil)
             if let target = candidates.first(where: { $0.profileKey == targetKey }), !target.leasable {
                 try ensureLeasableAccount(profileKey: targetKey)
                 let (code, reason) = target.leased
@@ -1469,25 +1553,82 @@ private final class CLILeaseService {
             }
             try ensureAppMirrorsLeases()
 
-            let returned = try returnLease(profileKey: current.profileKey, home: current.home)
-            let leased: LeasePayload
-            do {
-                leased = try lease(profileKey: targetKey, home: current.home, holder: newHolder ?? current.holder)
-            } catch {
-                throw CLIError.refused(
-                    code: "swap_incomplete",
-                    message: "Returned profile_key \(current.profileKey) from \(current.home), but leasing \(targetKey) failed: \(error.localizedDescription) The home now holds no account.",
-                    details: nil
+            // One hold of the holder's lock across both steps, so it cannot rotate in between.
+            return try withHomeLock(current.home) {
+                let returned = try returnLease(profileKey: current.profileKey, home: current.home)
+                let leased: LeasePayload
+                do {
+                    leased = try lease(profileKey: targetKey, home: current.home, holder: current.holder)
+                } catch {
+                    throw CLIError.refused(
+                        code: "swap_incomplete",
+                        message: "Returned profile_key \(current.profileKey) from \(current.home), but leasing \(targetKey) failed: \(error.localizedDescription) The home now holds no account.",
+                        details: nil
+                    )
+                }
+                return LeaseSwapPayload(
+                    generatedAt: Date(),
+                    home: leased.home,
+                    holder: leased.holder,
+                    returnedProfileKey: returned.profileKey,
+                    returnSync: returned.sync,
+                    leasedProfileKey: leased.profileKey,
+                    leasedAt: leased.leasedAt
                 )
             }
-            return LeaseSwapPayload(
-                generatedAt: Date(),
-                home: leased.home,
-                holder: leased.holder,
-                returnedProfileKey: returned.profileKey,
-                returnSync: returned.sync,
-                leasedProfileKey: leased.profileKey,
-                leasedAt: leased.leasedAt
+        }
+    }
+
+    /// Takes the home holder's auth lock, waiting up to the configured timeout.
+    private func withHomeLock<T>(_ home: String, _ body: () throws -> T) throws -> T {
+        do {
+            return try CodexHomeAuthLock.withLock(home: home, timeout: paths.homeLockTimeout, body)
+        } catch CodexHomeAuthLockError.busy {
+            throw CLIError.refused(
+                code: "home_locked",
+                message: "The process holding \(home) kept \(CodexLeaseHome.lockFileName) locked for \(Int(paths.homeLockTimeout)) s, probably while refreshing its token. Nothing was changed; try again.",
+                details: nil
+            )
+        } catch let error as CodexHomeAuthLockError {
+            throw CLIError.refused(
+                code: "home_lock_unavailable",
+                message: "\(error.localizedDescription) Nothing was changed.",
+                details: nil
+            )
+        }
+    }
+
+    private func quarantined(_ home: String) -> CLIError {
+        CLIError.refused(
+            code: "home_quarantined",
+            message: "\(home) holds \(CodexLeaseHome.stoppedSentinelName): its holder stopped after a credential failure, so the token chain there may be spent. Nothing was synced, written or removed. Only the holder's owner removes that file, after diagnosis.",
+            details: nil
+        )
+    }
+
+    private func ensureNotReserved(profileKey: String, home: String?) throws {
+        let reserved: ReservedLogins
+        do {
+            reserved = try ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
+        } catch {
+            throw CLIError.refused(
+                code: "reserved_registry_unreadable",
+                message: "\(paths.reservedLoginsURL.path) cannot be read or lists a login without a profile_key; refusing to guess which accounts are reserved.",
+                details: nil
+            )
+        }
+        if reserved.profileKeys.contains(profileKey) {
+            throw CLIError.refused(
+                code: "reserved_account",
+                message: "profile_key \(profileKey) is reserved in the codex-logins registry for its own consumer.",
+                details: nil
+            )
+        }
+        if let home, reserved.homes.contains(where: { CodexLease.sameHome($0, home) }) {
+            throw CLIError.refused(
+                code: "home_reserved",
+                message: "\(home) is a reserved login's home in the codex-logins registry.",
+                details: nil
             )
         }
     }
@@ -1856,6 +1997,8 @@ private struct AccountPayload: Codable {
     let score: Double
     var leased = false
     var leaseHolder: String?
+    var leaseQuarantined = false
+    var reserved = false
     var leasable = false
 
     enum CodingKeys: String, CodingKey {
@@ -1873,6 +2016,8 @@ private struct AccountPayload: Codable {
         case score
         case leased
         case leaseHolder = "lease_holder"
+        case leaseQuarantined = "lease_quarantined"
+        case reserved
         case leasable
     }
 
@@ -2148,6 +2293,8 @@ private struct LeaseStatusPayload: Codable {
     let homeAuthPresent: Bool
     let homeMatchesStoredProfile: Bool
     let activeOnSurface: Bool
+    let quarantined: Bool
+    let quarantinedSince: Date?
 
     enum CodingKeys: String, CodingKey {
         case profileKey = "profile_key"
@@ -2163,6 +2310,8 @@ private struct LeaseStatusPayload: Codable {
         case homeAuthPresent = "home_auth_present"
         case homeMatchesStoredProfile = "home_matches_stored_profile"
         case activeOnSurface = "active_on_surface"
+        case quarantined
+        case quarantinedSince = "quarantined_since"
     }
 }
 

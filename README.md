@@ -106,6 +106,9 @@ Codex Switchboard is local-first and never syncs tokens or exposes a remote serv
 | `~/Library/Application Support/CodexSwitchboard/leases.json` | Accounts lent to agent `CODEX_HOME`s (no tokens) |
 | `~/Library/Application Support/CodexSwitchboard/lease-mirror.json` | Pid of the lease-aware app mirroring lease homes |
 | `~/Library/Application Support/CodexSwitchboard/.auth.lock` | Lock shared by the app and CLI for auth writes |
+| `<lease home>/auth.json.lock` | `flock` shared with a lease home's holder around each read, refresh and write of its `auth.json` |
+| `<lease home>/auth.json.stopped` | Written by a holder that stopped after a credential failure; Switchboard leaves a quarantined home alone and never deletes it |
+| `~/.config/codex-logins/registry.json` | Read only: logins reserved for one consumer each, never leased |
 | `~/Library/Application Support/CodexSwitchboard/backups/<timestamp>-remove-account/` | Backups before removal |
 
 All sensitive files are written with `0600` permissions. Removal actions create backups before deleting profile data.

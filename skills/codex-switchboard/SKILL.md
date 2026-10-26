@@ -97,14 +97,14 @@ Add `--stop-consumers` only when the caller explicitly authorized stopping runni
 
 A lease lends one account's captured auth to a separate `CODEX_HOME`, so an automated lane runs on its own account without touching the main CLI or Desktop sign-in. While a lease is active its home is the account's only live holder: `switch`, `autoswap`, and the app's own switching and token refresh all leave the account alone, and the Switchboard app writes every token rotation in the home back to the stored profile. `return` writes the latest token back and clears the lease.
 
-1. See which accounts you can lease. `leasable: true` means unleased, a known paid plan, usable quota, no re-login needed, and not the active account of any surface:
+1. See which accounts you can lease. `leasable: true` means unleased, not reserved, a known paid plan, usable quota, no re-login needed, and not the active account of any surface:
 
 ```bash
 codex-switchboard status --json --leasable-only \
   | jq '[.accounts[] | {profile_key, plan, session_free_percent, weekly_free_percent, score}]'
 ```
 
-Drop `--leasable-only` to see every account with its `plan`, free percentages, `leased`, `lease_holder` and `leasable`.
+Drop `--leasable-only` to see every account with its `plan`, free percentages, `leased`, `lease_holder`, `lease_quarantined`, `reserved` and `leasable`. `reserved: true` means the codex-logins registry (`~/.config/codex-logins/registry.json`) sets the account aside for one consumer with its own sign-in; it is never leased, and no lease goes into a registered home. If that registry cannot be read, or lists a login without a `profile_key`, nothing is leasable.
 
 Choose the highest `score`.
 
@@ -117,23 +117,25 @@ codex-switchboard lease --profile-key "$PROFILE_KEY" --home "$LANE_HOME" --holde
 
 3. Run the lane with `CODEX_HOME="$LANE_HOME"`. Do not run `codex-switchboard` itself with `CODEX_HOME` pointing at the lease home.
 
+   A holder that refreshes the token itself, instead of Codex, must take `flock(LOCK_EX)` on `$LANE_HOME/auth.json.lock` around each read, refresh and write-back of `auth.json`, and replace the file atomically. `lease`, `return`, `swap-lease` and the app's mirror take the same lock, so they never act on a token mid-rotation. If the holder stops after a credential refusal or a failed refresh, it writes `$LANE_HOME/auth.json.stopped` (a reason and a time, never a token). Switchboard then treats the home as quarantined: it never returns, swaps, mirrors or leases into it, and never deletes that file. Only the holder's owner removes it, after diagnosis.
+
 4. Check active leases at any time:
 
 ```bash
 codex-switchboard leases --json \
-  | jq '[.leases[] | {profile_key, holder, home, home_auth_present, home_matches_stored_profile, active_on_surface}]'
+  | jq '[.leases[] | {profile_key, holder, home, home_auth_present, home_matches_stored_profile, active_on_surface, quarantined, quarantined_since}]'
 ```
 
 `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
 
-5. When the lane's account runs low, swap it between runs, after every Codex process in the home has exited:
+5. When the lane's account runs low, swap it between runs, after every Codex process in the home has exited. Only the lease's holder swaps it, because the lane's run records name the account each run used: pass your own holder name, never one copied from `leases`:
 
 ```bash
-codex-switchboard swap-lease --home "$LANE_HOME" --json \
+codex-switchboard swap-lease --home "$LANE_HOME" --holder "$LANE_NAME" --json \
   | jq '{returned_profile_key, return_sync, leased_profile_key, holder}'
 ```
 
-This returns the current account (writing its latest token back) and leases the best leasable account into the same home. Pass `--profile-key K` to choose the account, or `--exclude-profile-key K` (repeatable) to skip accounts reserved for something else. A refusal before the return leaves the lane as it was; `swap_incomplete` means the return happened but the new lease failed, so the home holds no account.
+This returns the current account (writing its latest token back) and leases the best leasable account into the same home under the same holder. Pass `--profile-key K` to choose the account, or `--exclude-profile-key K` (repeatable) to skip more accounts. A refusal before the return leaves the lane as it was; `swap_incomplete` means the return happened but the new lease failed, so the home holds no account.
 
 6. When every process in the lane has exited for good, return the lease:
 
@@ -149,6 +151,12 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `error` | Meaning |
 |---------|---------|
 | `active_account` | The account is the active CLI or Desktop account. Pick another. |
+| `reserved_account`, `home_reserved` | The codex-logins registry reserves the account, or the home is a reserved login's home. |
+| `reserved_registry_unreadable` | The codex-logins registry cannot be read or lists a login without a `profile_key`; nothing is leased until it is fixed. |
+| `home_quarantined` | The home holds `auth.json.stopped`. Nothing was synced, written or removed; its owner diagnoses the home. |
+| `home_locked` | The home's holder kept `auth.json.lock` for 30 s, probably while refreshing. Nothing changed; try again. |
+| `home_lock_unavailable` | `auth.json.lock` in the home cannot be opened or locked. Nothing changed. |
+| `holder_mismatch` | `swap-lease`: the lease belongs to another holder. |
 | `already_leased`, `home_already_leased` | The account, or the home, already has a lease. |
 | `free_plan`, `plan_unknown`, `needs_relogin`, `unknown_profile` | The account cannot be leased. |
 | `home_holds_other_account`, `home_holds_other_login` | The home already holds a sign-in (for example its own device-code login). Use an empty home. |

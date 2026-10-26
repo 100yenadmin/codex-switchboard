@@ -40,18 +40,30 @@ final class UsageService: @unchecked Sendable {
                 ) else {
                     throw AccountProfileTokenUpdateError.profileChanged
                 }
-                // A lease can only appear mid-grant if the reservation went stale; that
-                // home then holds the token just spent, so hand it the rotation too.
-                let leaseHome = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
-                    .lease(forProfileKey: profileKey)?.authURL
                 try ActiveCodexAuthStore.updateMatching(
-                    authURLs: ActiveCodexAuthStore.defaultAuthURLs() + (leaseHome.map { [$0] } ?? []),
                     email: email,
                     accountID: accountID,
                     accessToken: accessToken,
                     refreshToken: refreshToken,
                     idToken: idToken
                 )
+                // A lease can only appear mid-grant if the reservation went stale; that
+                // home then holds the token just spent, so hand it the rotation too, under
+                // its holder's lock. A quarantined home is left for its owner.
+                if let lease = try? CodexLeaseStore(appSupportURL: AppStorage.rootURL)
+                    .lease(forProfileKey: profileKey) {
+                    try? CodexHomeAuthLock.withLock(home: lease.home, timeout: 30) {
+                        guard !CodexLeaseHome.isQuarantined(home: lease.home) else { return }
+                        try ActiveCodexAuthStore.updateMatching(
+                            authURLs: [lease.authURL],
+                            email: email,
+                            accountID: accountID,
+                            accessToken: accessToken,
+                            refreshToken: refreshToken,
+                            idToken: idToken
+                        )
+                    }
+                }
                 try AccountProfileStore.updateTokens(
                     profileKey: profileKey,
                     email: email,

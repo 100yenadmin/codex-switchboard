@@ -15,6 +15,9 @@ struct CodexAuthMirrorResult: Equatable {
 /// Mirrors rotated Codex tokens back into the stored profiles: the live `~/.codex` auth, and the
 /// auth in every lease home, each written only into the profile of the account it holds.
 final class CodexAuthMirrorService: @unchecked Sendable {
+    /// The skip reason when a lease home's holder has its auth file locked.
+    static let homeLockedReason = "home_locked"
+
     private let fileManager: FileManager
     private let authURL: URL
     private let profileStoreURL: URL
@@ -49,7 +52,9 @@ final class CodexAuthMirrorService: @unchecked Sendable {
             self.lastSignature = self.fileSignature()
             _ = self.syncActiveAuth()
             self.leaseSignatures = self.leaseHomeSignatures()
-            _ = self.syncLeasedHomes()
+            if self.syncLeasedHomes().contains(where: { $0.reason == Self.homeLockedReason }) {
+                self.leaseSignatures = [:]
+            }
 
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + self.interval, repeating: self.interval)
@@ -89,11 +94,20 @@ final class CodexAuthMirrorService: @unchecked Sendable {
             }
             return leases.map { lease in
                 do {
-                    let outcome = try CodexLeaseSync.syncHome(lease, appSupportURL: storageRootURL)
+                    // Never wait on the holder here: a busy home is synced on a later tick.
+                    let outcome = try CodexHomeAuthLock.withLock(home: lease.home, timeout: 0) {
+                        try CodexLeaseSync.syncHome(lease, appSupportURL: storageRootURL)
+                    }
                     return CodexAuthMirrorResult(
                         status: outcome == .rotated ? .synced : .skipped,
                         profileKey: lease.profileKey,
                         reason: outcome == .rotated ? nil : outcome.rawValue
+                    )
+                } catch CodexHomeAuthLockError.busy {
+                    return CodexAuthMirrorResult(
+                        status: .skipped,
+                        profileKey: lease.profileKey,
+                        reason: Self.homeLockedReason
                     )
                 } catch {
                     return CodexAuthMirrorResult(
@@ -158,7 +172,9 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         let signatures = leaseHomeSignatures()
         guard signatures != leaseSignatures else { return }
         leaseSignatures = signatures
-        _ = syncLeasedHomes()
+        if syncLeasedHomes().contains(where: { $0.reason == Self.homeLockedReason }) {
+            leaseSignatures = [:]
+        }
     }
 
     private func leaseHomeSignatures() -> [String: FileSignature?] {
@@ -179,7 +195,9 @@ final class CodexAuthMirrorService: @unchecked Sendable {
               let size = attrs[.size] as? NSNumber else {
             return nil
         }
-        return FileSignature(modified: modified, size: size.int64Value)
+        // A holder that replaces the file gives it a new inode even when size and time match.
+        let inode = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        return FileSignature(modified: modified, size: size.int64Value, inode: inode)
     }
 
     private func capturedProfiles() -> [MirrorableCapturedProfile] {
@@ -304,6 +322,7 @@ enum ActiveCodexAuthStore {
 private struct FileSignature: Equatable {
     let modified: Date
     let size: Int64
+    let inode: UInt64
 }
 
 private struct MirrorableCapturedProfile {

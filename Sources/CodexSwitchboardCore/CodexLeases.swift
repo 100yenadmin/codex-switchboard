@@ -208,6 +208,109 @@ public enum CodexAuthStoreLock {
     }
 }
 
+/// Files a lease home's holder keeps beside its `auth.json`.
+public enum CodexLeaseHome {
+    /// A holder that refreshes its own token takes `flock(LOCK_EX)` on this file around each read,
+    /// refresh and write-back of `auth.json`.
+    public static let lockFileName = "auth.json.lock"
+    /// Written by a holder that stopped after a credential refusal or a failed refresh: the home's
+    /// token chain may be spent. Only the holder's owner removes it.
+    public static let stoppedSentinelName = "auth.json.stopped"
+
+    public static func stoppedSentinelURL(home: String) -> URL {
+        URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(stoppedSentinelName)
+    }
+
+    public static func isQuarantined(home: String) -> Bool {
+        FileManager.default.fileExists(atPath: stoppedSentinelURL(home: home).path)
+    }
+
+    public static func quarantinedSince(home: String) -> Date? {
+        let path = stoppedSentinelURL(home: home).path
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        return (try? FileManager.default.attributesOfItem(atPath: path)[.modificationDate] as? Date) ?? .distantPast
+    }
+}
+
+public enum CodexHomeAuthLockError: LocalizedError {
+    case busy(home: String)
+    case unavailable(home: String, code: Int32)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .busy(home):
+            return "The process holding \(home) still has \(CodexLeaseHome.lockFileName) locked."
+        case let .unavailable(home, code):
+            return "Cannot lock \(home)/\(CodexLeaseHome.lockFileName): \(String(cString: strerror(code)))."
+        }
+    }
+}
+
+/// Shares a lease home's `auth.json` with the process holding it. Switchboard takes the holder's
+/// `flock` before it reads the file to keep its tokens, replaces it or removes it, so it never acts
+/// on a token the holder is in the middle of rotating. Reentrant within one process.
+public enum CodexHomeAuthLock {
+    private final class State: @unchecked Sendable {
+        let lock = NSRecursiveLock()
+        var held: [String: (descriptor: Int32, depth: Int)] = [:]
+    }
+
+    private static let state = State()
+
+    /// Waits up to `timeout` seconds for the lock; zero tries once. A home directory that does not
+    /// exist has no holder, so the body runs without the lock.
+    public static func withLock<T>(home: String, timeout: TimeInterval, _ body: () throws -> T) throws -> T {
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        let key = CodexLease.normalizedHome(home)
+        if let entry = state.held[key] {
+            state.held[key] = (entry.descriptor, entry.depth + 1)
+            defer { release(key) }
+            return try body()
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: key, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return try body()
+        }
+        state.held[key] = (try acquire(home: key, timeout: timeout), 1)
+        defer { release(key) }
+        return try body()
+    }
+
+    private static func release(_ key: String) {
+        guard let entry = state.held[key] else { return }
+        guard entry.depth <= 1 else {
+            state.held[key] = (entry.descriptor, entry.depth - 1)
+            return
+        }
+        _ = flock(entry.descriptor, LOCK_UN)
+        Darwin.close(entry.descriptor)
+        state.held[key] = nil
+    }
+
+    private static func acquire(home: String, timeout: TimeInterval) throws -> Int32 {
+        let path = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(CodexLeaseHome.lockFileName).path
+        let descriptor = Darwin.open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw CodexHomeAuthLockError.unavailable(home: home, code: errno)
+        }
+        let deadline = Date().addingTimeInterval(max(0, timeout))
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            let code = errno
+            guard code == EWOULDBLOCK || code == EINTR else {
+                Darwin.close(descriptor)
+                throw CodexHomeAuthLockError.unavailable(home: home, code: code)
+            }
+            guard Date() < deadline else {
+                Darwin.close(descriptor)
+                throw CodexHomeAuthLockError.busy(home: home)
+            }
+            usleep(50_000)
+        }
+        return descriptor
+    }
+}
+
 public enum CodexLeaseSyncError: LocalizedError {
     case storedCopyUnreadable(path: String)
 
@@ -229,13 +332,19 @@ public enum CodexLeaseSyncOutcome: String, Equatable {
     case storedProfileMissing = "stored_profile_missing"
     /// The home holds a different account. Nothing was written.
     case identityMismatch = "identity_mismatch"
+    /// The holder left `auth.json.stopped`: the home's chain may be spent. Nothing was written.
+    case homeQuarantined = "home_quarantined"
 }
 
 /// Writes a lease home's current tokens back into Switchboard's stored copies of the leased account:
 /// the captured profile copied at lease time, any other captured profile with the same key, and the
-/// account list the app refreshes usage from. Callers hold `CodexAuthStoreLock`.
+/// account list the app refreshes usage from. Callers hold `CodexAuthStoreLock` and the home's
+/// `CodexHomeAuthLock`.
 public enum CodexLeaseSync {
     public static func syncHome(_ lease: CodexLease, appSupportURL: URL) throws -> CodexLeaseSyncOutcome {
+        guard !CodexLeaseHome.isQuarantined(home: lease.home) else {
+            return .homeQuarantined
+        }
         guard FileManager.default.fileExists(atPath: lease.authURL.path) else {
             return .homeAuthMissing
         }

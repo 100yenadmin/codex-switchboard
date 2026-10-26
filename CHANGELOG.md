@@ -9,7 +9,9 @@ All notable changes to Codex Switchboard will be documented here.
 - `lease` refuses the active CLI or Desktop account, an account already leased, free or unknown plans, accounts that need a new sign-in, and any home that already holds another sign-in. It also refuses while a running Switchboard app predates leases, since that app would refresh the leased token itself, and while the app has a refresh grant for that account in flight.
 - App and CLI auth writes now share a cross-process lock (`.auth.lock` in app storage); the previous lock only covered the app's own threads.
 - `status` reports `leased`, `lease_holder` and `leasable` per account; `--usable-only` leaves leased accounts out and `--leasable-only` lists only accounts an agent can lease now. `leases` shows each leased account's plan and free percentages.
-- Added `swap-lease`, which returns a lane's account and leases the best leasable one (or `--profile-key K`) into the same home, for lanes whose account runs low.
+- Added `swap-lease`, which returns a lane's account and leases the best leasable one (or `--profile-key K`) into the same home, for lanes whose account runs low. Only the lease's holder may swap it (`--holder` must match).
+- Lease homes whose holder refreshes the token itself: `lease`, `return`, `swap-lease` and the app's mirror take `flock` on `<home>/auth.json.lock` before reading, replacing or removing `auth.json`, and the mirror notices an atomic replace by inode. A home with `auth.json.stopped` is quarantined: Switchboard never returns, swaps, mirrors or leases into it, never deletes that file, and reports it as `lease_quarantined` / `quarantined`.
+- Logins reserved in the codex-logins registry (`~/.config/codex-logins/registry.json`) are never leasable (`reserved: true` in `status`), and no lease goes into a registered home. An unreadable registry makes nothing leasable.
 
 ## 1.0.12
 
