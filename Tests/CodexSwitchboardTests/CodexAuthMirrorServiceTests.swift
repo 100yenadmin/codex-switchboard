@@ -1,4 +1,5 @@
 import XCTest
+import CodexSwitchboardCore
 @testable import CodexSwitchboard
 
 final class CodexAuthMirrorServiceTests: XCTestCase {
@@ -155,6 +156,30 @@ final class CodexAuthMirrorServiceTests: XCTestCase {
         XCTAssertEqual(urls.map(\.standardizedFileURL.path), [
             "/tmp/switchboard-home/.codex/auth.json",
         ])
+    }
+
+    func testARefreshRecordsAnotherCodexHomeBeforeWritingIt() throws {
+        // A refresh passed into the app's CODEX_HOME puts Switchboard's chain there, so lease checks must see it.
+        let root = try temporaryDirectory()
+        let appSupport = root.appendingPathComponent("app-support", isDirectory: true)
+        let defaultHome = root.appendingPathComponent(".codex", isDirectory: true).path
+        let defaultAuth = URL(fileURLWithPath: defaultHome).appendingPathComponent("auth.json")
+        let otherAuth = root.appendingPathComponent("other-home/auth.json")
+
+        let kept = ActiveCodexAuthStore.recordingSwitchHomes(
+            [defaultAuth, otherAuth], appSupportURL: appSupport, defaultHome: defaultHome
+        )
+        XCTAssertEqual(kept, [defaultAuth, otherAuth])
+        XCTAssertEqual(CodexSwitchHomes.load(appSupportURL: appSupport)?.count, 1)
+
+        // A record that cannot be read is left as it is, and the other home is not written.
+        let record = appSupport.appendingPathComponent(CodexSwitchHomes.fileName)
+        try Data("{not json".utf8).write(to: record)
+        let skipped = ActiveCodexAuthStore.recordingSwitchHomes(
+            [defaultAuth, otherAuth], appSupportURL: appSupport, defaultHome: defaultHome
+        )
+        XCTAssertEqual(skipped, [defaultAuth])
+        XCTAssertEqual(try Data(contentsOf: record), Data("{not json".utf8))
     }
 
     private func temporaryDirectory() throws -> URL {

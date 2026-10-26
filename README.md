@@ -112,7 +112,7 @@ Codex Switchboard is local-first and never syncs tokens or exposes a remote serv
 | `<lease home>/holder.lock` | `flock` a holder process keeps for its lifetime; `lease`, `return`, `swap-lease` and `switch` refuse while it is held |
 | `<lease home>/auth.json.lock` | `flock` shared with a lease home's holder around each read, refresh and write of its `auth.json` |
 | `<lease home>/auth.json.stopped` | Written by a holder that stopped after a credential failure, or while a refresh it started is in flight (`refresh_in_flight`); Switchboard leaves a quarantined home alone and never deletes it |
-| `cli-homes.json` | Codex homes other than `~/.codex` that a switch wrote an account into, so lease checks see those chains; paths only |
+| `cli-homes.json` | Codex homes other than `~/.codex` that a switch or the app's token refresh wrote an account into, so lease checks see those chains; paths only |
 | `~/.config/codex-logins/registry.json` | Read only: registry-reserved logins, one consumer each, never leased or switched to |
 | `~/Library/Application Support/CodexSwitchboard/backups/<timestamp>-remove-account/` | Backups before removal |
 

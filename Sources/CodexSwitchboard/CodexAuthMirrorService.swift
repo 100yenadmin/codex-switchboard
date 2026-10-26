@@ -331,6 +331,17 @@ enum ActiveCodexAuthStore {
         }
     }
 
+    /// The auth files a refresh may write. A home other than ~/.codex is kept only once it is in the switch
+    /// record, so a lease taken after the app quits still sees the chain written there; one that cannot be
+    /// recorded is skipped.
+    static func recordingSwitchHomes(_ authURLs: [URL], appSupportURL: URL, defaultHome: String) -> [URL] {
+        authURLs.filter { authURL in
+            let home = authURL.deletingLastPathComponent().path
+            guard !CodexLease.sameHome(home, defaultHome) else { return true }
+            return (try? CodexSwitchHomes.record(home, appSupportURL: appSupportURL, defaultHome: defaultHome)) != nil
+        }
+    }
+
     static func updateMatching(
         authURLs: [URL] = defaultAuthURLs(),
         email: String,

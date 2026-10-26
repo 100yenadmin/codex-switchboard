@@ -877,16 +877,21 @@ private final class CLISurfaceService {
         for home in homes where seen.insert(CodexLease.normalizedHome(home)).inserted {
             let authURL = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("auth.json")
             if CodexFileProbe.isMissing(authURL) { continue }
-            var auth = StoredAuth.load(from: authURL)
-            if auth == nil {
+            // Each look classifies one parsed snapshot, so a file completed between two reads is never
+            // mistaken for one without tokens.
+            var root = readJSON(authURL)
+            if root == nil {
                 usleep(75_000)
-                auth = StoredAuth.load(from: authURL)
+                root = readJSON(authURL)
             }
-            if let auth {
-                if let key = store.profileMatching(auth: auth)?.sourceProfileKey { keys.insert(key) }
-            } else if readJSON(authURL) == nil {
-                // Valid JSON without tokens (an API key, a tombstone) holds no chain; anything else is unknown.
+            guard let root else {
                 unknown = true
+                continue
+            }
+            // Valid JSON without tokens (an API key, a tombstone) holds no chain.
+            if let auth = StoredAuth.load(root: root),
+               let key = store.profileMatching(auth: auth)?.sourceProfileKey {
+                keys.insert(key)
             }
         }
         return (keys, unknown)
@@ -2312,8 +2317,12 @@ struct StoredAuth {
     }
 
     static func load(from url: URL) -> StoredAuth? {
-        guard let root = readJSON(url),
-              let tokens = root["tokens"] as? [String: Any] else {
+        readJSON(url).flatMap(load(root:))
+    }
+
+    /// The auth in an already parsed `auth.json`; nil when it holds no `tokens` object.
+    static func load(root: [String: Any]) -> StoredAuth? {
+        guard let tokens = root["tokens"] as? [String: Any] else {
             return nil
         }
         let idToken = tokens["id_token"] as? String ?? ""

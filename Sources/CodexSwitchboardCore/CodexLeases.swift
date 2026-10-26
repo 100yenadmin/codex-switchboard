@@ -835,9 +835,9 @@ public enum CodexFileProbe {
     }
 }
 
-/// Codex homes other than ~/.codex that a switch, the CLI's or the app's, wrote an account into, so a lease can
-/// still see a chain there after the shell that set CODEX_HOME is gone. Paths only, no account. Callers hold
-/// `CodexAuthStoreLock`.
+/// Codex homes other than ~/.codex that a switch (the CLI's or the app's) or the app's token refresh wrote an
+/// account into, so a lease can still see a chain there after the process that set CODEX_HOME is gone. Paths only,
+/// no account. Callers hold `CodexAuthStoreLock`.
 public enum CodexSwitchHomes {
     public static let fileName = "cli-homes.json"
 
