@@ -1197,6 +1197,65 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: liveAuth), before)
     }
 
+    func testATornLiveAuthMakesNothingLeasable() throws {
+        // Codex rewrites ~/.codex/auth.json in place; mid-write it names no account, and that could be any one.
+        let liveAuth = fixture.home.appendingPathComponent(".codex/auth.json")
+        let before = try Data(contentsOf: liveAuth)
+        try Data("{\"tokens\": {\"id_tok".utf8).write(to: liveAuth)
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+
+        let lease = fixture.run(["lease", "--profile-key", "profile-a", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.json["error"] as? String, "surface_identity_unknown", lease.text)
+        let status = fixture.run(["status", "--json", "--leasable-only"])
+        XCTAssertEqual((status.json["accounts"] as? [[String: Any]])?.count, 0, status.text)
+
+        try before.write(to: liveAuth)
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-a", "--home", home.path, "--holder", "bench", "--json"])
+            .json["error"] as? String, "active_account")
+    }
+
+    func testAKeychainSurfaceMakesNothingLeasable() throws {
+        // A CLI that keeps its sign-in in a keychain could be on any account, so status lists none as leasable.
+        try "cli_auth_credentials_store = \"keychain\"\n"
+            .write(to: fixture.home.appendingPathComponent(".codex/config.toml"), atomically: true, encoding: .utf8)
+        let status = fixture.run(["status", "--json", "--leasable-only"])
+        XCTAssertEqual((status.json["accounts"] as? [[String: Any]])?.count, 0, status.text)
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let lease = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.json["error"] as? String, "surface_identity_unknown", lease.text)
+    }
+
+    func testLeaseSeesAChainASwitchWroteIntoAnotherCodexHome() throws {
+        // A switch run with CODEX_HOME=other records that home, then writes profile-b's chain there. A real switch
+        // refuses consumers_running while any Codex app runs on the test machine, so the test does both steps.
+        let other = fixture.root.appendingPathComponent("other-codex-home", isDirectory: true)
+        let defaultHome = fixture.home.appendingPathComponent(".codex").path
+        try CodexSwitchHomes.record(other.path, appSupportURL: fixture.appSupport, defaultHome: defaultHome)
+        try CodexSwitchHomes.record(other.path, appSupportURL: fixture.appSupport, defaultHome: defaultHome)
+        try CodexSwitchHomes.record(defaultHome, appSupportURL: fixture.appSupport, defaultHome: defaultHome)
+        XCTAssertEqual(CodexSwitchHomes.load(appSupportURL: fixture.appSupport)?.count, 1)
+        try fixture.writeAuth(account: "b", generation: 1, to: other.appendingPathComponent("auth.json"))
+
+        // Later, from a shell without CODEX_HOME, profile-b looks idle unless the switch was recorded.
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let lease = fixture.run(["lease", "--profile-key", "profile-b", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(lease.json["error"] as? String, "active_account", lease.text)
+        let status = fixture.run(["status", "--json"])
+        XCTAssertEqual(fixture.account("profile-b", in: status.json)?["leasable"] as? Bool, false)
+
+        // A record that cannot be read is never overwritten, and leases wait until it is fixed.
+        let record = fixture.appSupport.appendingPathComponent(CodexSwitchHomes.fileName)
+        try Data("{not json".utf8).write(to: record)
+        XCTAssertThrowsError(try CodexSwitchHomes.record(
+            fixture.root.appendingPathComponent("third-home").path, appSupportURL: fixture.appSupport, defaultHome: defaultHome
+        ))
+        XCTAssertEqual(try Data(contentsOf: record), Data("{not json".utf8))
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
+            .json["error"] as? String, "surface_identity_unknown")
+        let blocked = fixture.run(["status", "--json"])
+        XCTAssertEqual(fixture.account("profile-k", in: blocked.json)?["leasable"] as? Bool, false)
+    }
+
     func testSwitchIntoAnotherHomeNeedsAReadableRegistry() throws {
         let other = fixture.root.appendingPathComponent("other-codex-home", isDirectory: true)
         try fixture.writeAuth(account: "a", generation: 1, to: other.appendingPathComponent("auth.json"))

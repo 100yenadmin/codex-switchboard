@@ -72,7 +72,11 @@ final class UsageService: @unchecked Sendable {
                     }
                 } ?? ActiveCodexAuthStore.defaultAuthURLs(environment: [:])
                 try? ActiveCodexAuthStore.updateMatching(
-                    authURLs: authURLs,
+                    authURLs: ActiveCodexAuthStore.recordingSwitchHomes(
+                        authURLs,
+                        appSupportURL: AppStorage.rootURL,
+                        defaultHome: defaultHome
+                    ),
                     email: email,
                     accountID: accountID,
                     accessToken: accessToken,

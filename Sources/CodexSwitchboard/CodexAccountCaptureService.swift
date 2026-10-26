@@ -905,6 +905,7 @@ enum CodexAccountSwitchError: LocalizedError {
     case reservedRegistryUnreadable
     case destinationIsLaneHome
     case leaseStoreUnreadable
+    case switchRecordUnreadable
     case capturedProfileIdentityMismatch(
         expectedEmail: String,
         actualEmail: String,
@@ -936,6 +937,8 @@ enum CodexAccountSwitchError: LocalizedError {
             return "The Codex auth store is in a lane home (it has \(CodexLeaseHome.holderLockFileName)), which only its holder or a lease writes; switch canceled. Unset CODEX_HOME first."
         case .leaseStoreUnreadable:
             return "The lease store cannot be read; switch canceled."
+        case .switchRecordUnreadable:
+            return "\(CodexSwitchHomes.fileName) cannot be read, so this switch into CODEX_HOME cannot be recorded for lease checks; switch canceled."
         case let .capturedProfileIdentityMismatch(expectedEmail, actualEmail, expectedAccountID, actualAccountID):
             return "Codex auth switch canceled: destination profile changed before copy. Expected \(expectedEmail) / \(expectedAccountID), got \(actualEmail) / \(actualAccountID). Live auth was not overwritten."
         }
@@ -1034,6 +1037,16 @@ final class CodexAccountSwitchService: @unchecked Sendable {
             authMirrorService.syncActiveAuth()
             let profile = try capturedProfile(for: account)
             try validateCapturedProfileIdentity(profile, for: account)
+            // Recorded before the write, as the CLI's switch does: a lease must see a chain in this home.
+            do {
+                try CodexSwitchHomes.record(
+                    codexHomeURL.path,
+                    appSupportURL: AppStorage.rootURL,
+                    defaultHome: homeURL.appendingPathComponent(".codex").path
+                )
+            } catch is CodexSwitchHomes.Unreadable {
+                throw CodexAccountSwitchError.switchRecordUnreadable
+            }
             try backupCLIAuthBeforeSwitch(at: cliAuthURL, to: profile)
             try copyReplacing(source: profile.authURL, destination: cliAuthURL)
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cliAuthURL.path)

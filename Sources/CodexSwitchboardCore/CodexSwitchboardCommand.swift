@@ -859,6 +859,44 @@ private final class CLISurfaceService {
         )
     }
 
+    /// The accounts whose token chains sit in a Codex home that a surface uses or a switch wrote: ~/.codex,
+    /// this process's CODEX_HOME, and every home in the switch record. `unknown` is true when one of those
+    /// homes holds an auth.json that cannot be read even on a second look (Codex rewrites it in place), or the
+    /// record cannot be read: a lease then cannot tell which account it would share.
+    func liveChains() -> (keys: Set<String>, unknown: Bool) {
+        var homes = [paths.homeURL.appendingPathComponent(".codex").path, paths.codexHome(for: .cli).path]
+        var unknown = false
+        if let recorded = CodexSwitchHomes.load(appSupportURL: paths.appSupportURL) {
+            homes += recorded
+        } else {
+            unknown = true
+        }
+        let store = CapturedProfileStore(paths: paths)
+        var keys = Set<String>()
+        var seen = Set<String>()
+        for home in homes where seen.insert(CodexLease.normalizedHome(home)).inserted {
+            let authURL = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("auth.json")
+            if CodexFileProbe.isMissing(authURL) { continue }
+            // Each look classifies one parsed snapshot, so a file completed between two reads is never
+            // mistaken for one without tokens.
+            var root = readJSON(authURL)
+            if root == nil {
+                usleep(75_000)
+                root = readJSON(authURL)
+            }
+            guard let root else {
+                unknown = true
+                continue
+            }
+            // Valid JSON without tokens (an API key, a tombstone) holds no chain.
+            if let auth = StoredAuth.load(root: root),
+               let key = store.profileMatching(auth: auth)?.sourceProfileKey {
+                keys.insert(key)
+            }
+        }
+        return (keys, unknown)
+    }
+
     private func annotateSharedStores(_ statuses: [SurfaceStatusPayload]) -> [SurfaceStatusPayload] {
         statuses.map { status in
             var status = status
@@ -1057,6 +1095,22 @@ private final class CLISwitchService {
         try CodexAuthStoreLock.withRequiredLock(appSupportURL: paths.appSupportURL) {
             // A lease taken while consumers were being checked must still win.
             try ensureSwitchable(profileKey: profileKey, surfaces: surfaces)
+            // Recorded before the write: a lease must see this home's chain even after CODEX_HOME is unset.
+            for (_, destination) in destinations {
+                do {
+                    try CodexSwitchHomes.record(
+                        destination.deletingLastPathComponent().path,
+                        appSupportURL: paths.appSupportURL,
+                        defaultHome: paths.homeURL.appendingPathComponent(".codex").path
+                    )
+                } catch is CodexSwitchHomes.Unreadable {
+                    throw CLIError.refused(
+                        code: "switch_record_unreadable",
+                        message: "\(CodexSwitchHomes.fileName) in Switchboard's storage cannot be read, so Switchboard cannot record this switch for its lease checks. Nothing was switched.",
+                        details: nil
+                    )
+                }
+            }
             let sourceData = try Data(contentsOf: profile.authURL)
             let previousAuth = destinations.reduce(into: [String: Data?]()) { result, destination in
                 result[destination.url.path] = try? Data(contentsOf: destination.url)
@@ -1327,7 +1381,7 @@ private struct ReservedLogins {
         return ReservedLogins(profileKeys: profileKeys, homes: homes)
     }
 
-    /// Reservations whose key no Switchboard account has any more, for example after a new sign-in
+    /// Registry entries whose key no Switchboard account has any more, for example after a new sign-in
     /// re-keyed the account. While one exists, nothing can tell which account it means.
     func staleKeys(among accountKeys: Set<String>) -> Set<String> {
         profileKeys.subtracting(accountKeys)
@@ -1606,21 +1660,27 @@ private final class CLILeaseService {
         )
     }
 
-    /// Marks the accounts an agent could lease now: unleased (a returning lease counts), not reserved,
-    /// a known paid plan, usable quota, no re-login needed, and not the active account of any surface.
-    /// Nothing is leasable while the lease store or the reserved-login registry cannot be read, or while
-    /// the registry reserves a key no account has.
+    /// Marks the accounts an agent could lease now: unleased (a returning lease counts), not registry-reserved,
+    /// a known paid plan, usable quota, no re-login needed, not being refreshed by the app (no live refresh
+    /// reservation), and with no chain in a Codex home a surface uses or a switch wrote. Nothing is leasable
+    /// while the lease store, the registry, one of those homes' auth.json or the switch record cannot be read,
+    /// while the registry reserves a key no account has, or while a surface keeps its sign-in in a keychain.
     func annotateLeasable(_ accounts: [AccountPayload]) -> [AccountPayload] {
         let storeReadable = (try? paths.leaseStore.load()) != nil
         let reserved = try? ReservedLogins.load(from: paths.reservedLoginsURL, homeURL: paths.homeURL)
         let registryUsable = reserved.map { $0.staleKeys(among: Set(accounts.map(\.profileKey))).isEmpty } ?? false
-        let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
+        let live = surfaceService.liveChains()
+        let surfaces = surfaceService.statuses(scope: .all)
+        let surfacesKnown = !surfaces.contains { $0.detected && !$0.supportsFileSwitching }
+        let activeKeys = Set(surfaces.compactMap(\.activeProfileKey)).union(live.keys)
         let reservations = CodexRefreshReservations(appSupportURL: paths.appSupportURL)
         let appPIDs = Set(runningSwitchboardAppPIDs())
         return accounts.map { account in
             var account = account
             account.reserved = reserved?.profileKeys.contains(account.profileKey) ?? false
             account.leasable = storeReadable
+                && !live.unknown
+                && surfacesKnown
                 && registryUsable
                 && !account.reserved
                 && !account.leased
@@ -1907,6 +1967,19 @@ private final class CLILeaseService {
             throw refused(
                 "active_account",
                 "\(handle) is the active CLI or Desktop account; lease an account no surface is using."
+            )
+        }
+        let live = surfaceService.liveChains()
+        if live.keys.contains(profileKey) {
+            throw refused(
+                "active_account",
+                "\(handle) is signed in to ~/.codex or a Codex home a switch wrote; lease an account no Codex home holds."
+            )
+        }
+        if live.unknown {
+            throw refused(
+                "surface_identity_unknown",
+                "A Codex home that a surface uses or a switch wrote holds an auth.json Switchboard cannot read, so it cannot tell which account that home holds. Try again in a moment; if it persists, check that home."
             )
         }
         if let unknown = surfaces.first(where: { $0.detected && !$0.supportsFileSwitching }) {
@@ -2244,8 +2317,12 @@ struct StoredAuth {
     }
 
     static func load(from url: URL) -> StoredAuth? {
-        guard let root = readJSON(url),
-              let tokens = root["tokens"] as? [String: Any] else {
+        readJSON(url).flatMap(load(root:))
+    }
+
+    /// The auth in an already parsed `auth.json`; nil when it holds no `tokens` object.
+    static func load(root: [String: Any]) -> StoredAuth? {
+        guard let tokens = root["tokens"] as? [String: Any] else {
             return nil
         }
         let idToken = tokens["id_token"] as? String ?? ""

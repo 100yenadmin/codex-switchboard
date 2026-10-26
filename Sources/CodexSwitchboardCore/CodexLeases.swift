@@ -835,6 +835,35 @@ public enum CodexFileProbe {
     }
 }
 
+/// Codex homes other than ~/.codex that a switch (the CLI's or the app's) or the app's token refresh wrote an
+/// account into, so a lease can still see a chain there after the process that set CODEX_HOME is gone. Paths only,
+/// no account. Callers hold `CodexAuthStoreLock`.
+public enum CodexSwitchHomes {
+    public static let fileName = "cli-homes.json"
+
+    public struct Unreadable: Error {}
+
+    /// The recorded homes; nil when the record exists but cannot be read.
+    public static func load(appSupportURL: URL) -> [String]? {
+        let url = appSupportURL.appendingPathComponent(fileName)
+        if CodexFileProbe.isMissing(url) { return [] }
+        guard let data = try? Data(contentsOf: url),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let homes = root["homes"] as? [String] else { return nil }
+        return homes
+    }
+
+    /// Throws `Unreadable`, and never overwrites the record, when it cannot be read, since that would drop the
+    /// homes it lists. The default home is never recorded.
+    public static func record(_ home: String, appSupportURL: URL, defaultHome: String) throws {
+        guard !CodexLease.sameHome(home, defaultHome) else { return }
+        guard var homes = load(appSupportURL: appSupportURL) else { throw Unreadable() }
+        guard !homes.contains(where: { CodexLease.sameHome($0, home) }) else { return }
+        homes.append(CodexLease.normalizedHome(home))
+        try CodexAtomicFile.writeJSON(["version": 1, "homes": homes], to: appSupportURL.appendingPathComponent(fileName))
+    }
+}
+
 public enum CodexAtomicFile {
     public static func writeJSON(_ object: Any, to url: URL, permissions: Int = 0o600) throws {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
