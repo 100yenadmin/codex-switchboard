@@ -52,7 +52,7 @@ final class CodexAuthMirrorService: @unchecked Sendable {
             self.lastSignature = self.fileSignature()
             _ = self.syncActiveAuth()
             self.leaseSignatures = self.leaseHomeSignatures()
-            if self.syncLeasedHomes().contains(where: { $0.reason == Self.homeLockedReason }) {
+            if Self.needsRetry(self.syncLeasedHomes()) {
                 self.leaseSignatures = [:]
             }
 
@@ -172,8 +172,19 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         let signatures = leaseHomeSignatures()
         guard signatures != leaseSignatures else { return }
         leaseSignatures = signatures
-        if syncLeasedHomes().contains(where: { $0.reason == Self.homeLockedReason }) {
+        if Self.needsRetry(syncLeasedHomes()) {
             leaseSignatures = [:]
+        }
+    }
+
+    /// A busy home, a torn read (Codex writes `auth.json` in place) or a failed write leaves the
+    /// home's rotation uncopied, so the next tick tries again instead of waiting for a new rotation.
+    private static func needsRetry(_ results: [CodexAuthMirrorResult]) -> Bool {
+        results.contains { result in
+            guard result.status == .skipped, let reason = result.reason else { return false }
+            if reason == homeLockedReason { return true }
+            guard let outcome = CodexLeaseSyncOutcome(rawValue: reason) else { return true }
+            return outcome == .homeAuthUnreadable
         }
     }
 

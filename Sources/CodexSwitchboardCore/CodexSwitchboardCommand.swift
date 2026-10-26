@@ -1260,6 +1260,15 @@ private struct ReservedLogins {
     }
 }
 
+/// The homes the codex-logins registry reserves, for the app's own switch check. An unreadable
+/// registry reserves no home here; `holder.lock` still marks every home a holder has used.
+public enum CodexReservedLoginHomes {
+    public static func load(homeURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String] {
+        let registryURL = homeURL.appendingPathComponent(".config/codex-logins/registry.json")
+        return (try? ReservedLogins.load(from: registryURL, homeURL: homeURL))?.homes ?? []
+    }
+}
+
 /// Lends one account's captured auth to a separate CODEX_HOME and takes it back. A refresh token is
 /// single-use, so two live copies of one chain log each other out: a lease home must be the account's
 /// only live holder, and the stored profile must end up with the home's latest rotated token.
