@@ -1,23 +1,23 @@
 ---
 name: codex-switchboard
-description: Use when an agent orchestrator needs to inspect Codex Desktop or Codex CLI auth capacity, choose a usable paid Codex profile, perform an explicit local Codex Switchboard profile switch, or lease an account's token into a separate CODEX_HOME for an automated lane and return it.
+description: Use when an agent orchestrator needs to inspect Codex Desktop or Codex CLI auth capacity, move the main Codex CLI to a usable paid account without touching a leased or reserved one, or lease an account's token into a separate CODEX_HOME for an automated lane and return it.
 ---
 
 # Codex Switchboard
 
 ## Overview
 
-Use the local `codex-switchboard` CLI to inspect Codex Desktop/CLI auth surfaces and switch profiles only when the caller explicitly asks for a switch. Use `autoswap run-once` when the caller has enabled policy-driven failover. Treat all auth files as sensitive; never print tokens or raw `auth.json` contents.
+Use the local `codex-switchboard` CLI to inspect Codex Desktop/CLI auth surfaces and to lease accounts to automated lanes. Move the main CLI to another account only through `scripts/codex-logins.py` in this repository, which checks leases and reservations first and names accounts by handle. Treat all auth files as sensitive; never print tokens or raw `auth.json` contents.
 
 ## Required Rules
 
 - Use only local CLI commands; do not read or print raw `~/.codex/auth.json` or captured profile auth files.
-- Prefer paid usable accounts: `is_free_plan == false`, `usable_for_codex == true`, and `needs_relogin == false`.
-- Do not switch to free-plan accounts unless the user explicitly requests that exact profile.
+- Name accounts by their handle (`acct_` plus 12 hex digits). Never print a profile key, email, account id, or another lane's holder name: pipe every `--json` command through a `jq` that keeps only the fields shown here.
+- Swap the main CLI with `codex-logins.py swap`, never with a raw `switch` or a live `autoswap run-once`. Before any switch you were asked to make to one named account, run `codex-logins.py check-switch` on it and stop on any nonzero exit.
+- Never switch to a leased account or a registry-reserved account. A leased account's token chain belongs to its lease home, and a second live copy logs both out; a reserved account's quota belongs to its own consumer.
+- Do not switch to free-plan accounts unless the user explicitly requests that exact account.
 - Do not use `--stop-consumers` unless the user explicitly authorized stopping running Codex Desktop/CLI consumers.
-- Prefer `autoswap run-once --dry-run` before a policy-driven switch so the decision and candidate are visible without mutating auth.
-- After any switch, verify the selected surface reports the requested `active_profile_key`.
-- Report counts, chosen rationale, and safe commands. Avoid pasting full account JSON into chat or logs.
+- Run `codex-switchboard` and `codex-logins.py` with `CODEX_HOME` unset (the tool unsets it for Switchboard itself).
 - Never copy an auth file into another `CODEX_HOME` yourself. Use `lease` and `return`: a refresh token is single-use, so two live copies of one token chain log each other out.
 
 ## Workflow
@@ -35,63 +35,52 @@ codex-switchboard doctor --json \
   | jq '{consumers_running, consumer_count, unsupported_surfaces, surfaces: [.surfaces[] | {kind, detected, running, auth_store_mode, supports_file_switching, shared_auth_store}]}'
 ```
 
-3. Find paid usable profiles:
+3. See every account by handle, with its quota, and which are the main CLI's, leased or reserved:
 
 ```bash
-codex-switchboard status --json --surface all --paid-only --usable-only \
-  | jq '{generated_at, surfaces: [.surfaces[] | {kind, detected, running, active_profile_key, auth_store_mode, shared_auth_store}], accounts: [.accounts[] | {profile_key, plan, usable_for_codex, needs_relogin, session_free_percent, weekly_free_percent, score}]}'
+python3 scripts/codex-logins.py status
 ```
 
-4. Choose the highest `score` account that is not free, is usable, and does not need relogin. If no such account exists, stop and report that no paid usable profile is available.
-
-5. Switch only with an explicit local command:
+4. When the main CLI's account runs low, dry-run the swap. It picks the highest-`score` paid, usable account that needs no re-login and that `check-switch` allows, and prints the current and chosen handles:
 
 ```bash
-codex-switchboard switch --profile-key "$PROFILE_KEY" --surface cli --json
+python3 scripts/codex-logins.py swap --dry-run
 ```
 
-Use `--surface desktop` or `--surface both` only when that target was requested. Add `--stop-consumers` only after explicit authorization.
-
-6. Verify:
+5. Swap. Switchboard re-checks leases and reservations by seat under its own store lock before it writes, and the tool then checks that the CLI is on the chosen account:
 
 ```bash
-codex-switchboard status --json --surface cli \
-  | jq --arg key "$PROFILE_KEY" '.surfaces[] | select(.kind == "cli") | {kind, active_profile_key, matched: (.active_profile_key == $key)}'
+python3 scripts/codex-logins.py swap
 ```
 
-If `matched` is not `true`, treat the switch as failed and report the blocker.
+Exit codes, for `check-switch` and `swap`; any nonzero means the main CLI was not moved onto a forbidden account:
 
-## Auto-swap Workflow
+| Exit | `check-switch` | `swap` |
+|------|----------------|--------|
+| 0 | The account may become the main CLI account. | Switched and confirmed (with `--dry-run`: an account passes). |
+| 1 | The account is registry-reserved, or shares its email with a reserved one. | |
+| 2 | The registry is missing, cannot be read, or reserves a key Switchboard no longer lists. | Same; nothing was switched. |
+| 3 | The account is leased (`leasing`, `active` or `returning`), or shares its email with a leased one. | |
+| 4 | Switchboard's account or lease state cannot be read. | Same; nothing was switched. |
+| 5 | | No paid, usable account other than the current one passes. |
+| 6 | | Switchboard refused or failed the switch; the message gives its `error` code. |
+| 7 | | The switch did not take, or cannot be confirmed. |
 
-Use auto-swap when the user has asked for low-quota failover rather than one specific profile.
-
-1. Inspect the current policy and decisions:
+For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys:
 
 ```bash
-codex-switchboard autoswap status --json \
-  | jq '{policy, decisions: [.decisions[] | {surface, decision, reason, active_profile_key, candidate_profile_key}]}'
+set -o pipefail
+python3 scripts/codex-logins.py check-switch --profile-key "$HANDLE" \
+  && codex-switchboard switch --profile-key "$HANDLE" --surface cli --json | jq '{error}' \
+  && codex-switchboard status --json --surface cli \
+  | jq -e --arg h "$HANDLE" '(.surfaces[] | select(.kind == "cli") | .active_profile_key) as $k | [.accounts[] | select(.profile_key == $k) | .handle] == [$h]'
 ```
 
-2. Enable policy only when explicitly requested:
+If the chain exits nonzero or prints `false`, treat the switch as failed and report the blocker. Use `--surface desktop` or `--surface both` only when that target was requested. Add `--stop-consumers` only after explicit authorization.
 
-```bash
-codex-switchboard autoswap enable --surface cli --json
-```
+## Auto-swap
 
-3. Dry-run the policy decision:
-
-```bash
-codex-switchboard autoswap run-once --surface cli --json --dry-run \
-  | jq '{consumer_count, decisions: [.decisions[] | {surface, decision, reason, active_profile_key, candidate_profile_key}]}'
-```
-
-4. Execute only through the policy engine:
-
-```bash
-codex-switchboard autoswap run-once --surface cli --json
-```
-
-Add `--stop-consumers` only when the caller explicitly authorized stopping running Codex consumers. If the result is `blocked`, report the `reason` and do not manually edit auth files.
+The app's auto-swap policy (`autoswap enable|disable|status|run-once`) is the user's own failover setting; enable or disable it only when the user asks. An agent never runs `autoswap run-once` without `--dry-run`: it picks its candidate again when it runs, so it can land on an account nobody checked. Use `codex-logins.py swap` instead.
 
 ## Lease Workflow
 
@@ -131,7 +120,7 @@ codex-switchboard lease --profile-key "$HANDLE" --home "$LANE_HOME" --holder "$L
 
 ```bash
 codex-switchboard leases --json \
-  | jq '[.leases[] | {handle, lease_id, state, holder, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
+  | jq '[.leases[] | {handle, lease_id, state, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
 ```
 
 `state` is `leasing` until the home's `auth.json` is written, then `active`, and `returning` once a return starts, until it finishes; every state counts as leased. `holder_running: true` means a process holds `holder.lock`. `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
@@ -197,16 +186,17 @@ An orchestrator says: "A Codex CLI agent exhausted its current account. Put it b
 
 Correct behavior:
 
-- Run `doctor --json` and redacted `status --json --paid-only --usable-only`.
-- Select a paid usable profile by `score`.
-- If consumers are running, either run `switch` without `--stop-consumers` and report the refusal, or ask/confirm before stopping consumers.
-- Verify `active_profile_key` after a successful switch.
-- Do not print token fields, raw auth files, or full unredacted account dumps.
+- Run `doctor --json` and `codex-logins.py status`.
+- Run `codex-logins.py swap --dry-run`, then `codex-logins.py swap`.
+- If Switchboard refuses because consumers are running (exit 6, `consumers_running`), report it, or ask before stopping consumers.
+- Report the exit code and the handles the tool printed.
 
 Incorrect behavior:
 
-- Reading `auth.json` into chat.
+- Reading `auth.json` into chat, or printing profile keys, emails or account JSON.
+- Switching with a raw `switch` or a live `autoswap run-once` instead of `codex-logins.py swap`.
+- Switching to a leased or reserved account, or retrying around a nonzero `check-switch`.
 - Choosing a free plan because it has reset sooner.
 - Copying an `auth.json` into a lane's `CODEX_HOME` instead of leasing it.
 - Using `--stop-consumers` without explicit authorization.
-- Claiming success without verifying the active profile.
+- Claiming success without the tool's confirmation.
