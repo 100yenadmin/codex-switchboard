@@ -1117,7 +1117,7 @@ private final class CLISwitchService {
         if let lease = leases.first(where: { seat.contains($0.profileKey) }) {
             throw CLIError.refused(
                 code: "account_leased",
-                message: "\(handle) is leased to \(lease.holder)\(lease.profileKey == profileKey ? "" : " under another key of its seat"); return the lease before switching to it.",
+                message: "\(handle) is leased to an agent lane\(lease.profileKey == profileKey ? "" : " under another key of its seat"); return the lease before switching to it.",
                 details: nil
             )
         }
@@ -1150,10 +1150,10 @@ private final class CLISwitchService {
         }
         for surface in surfaces {
             let surfaceHome = URL(fileURLWithPath: surface.authStorePath).deletingLastPathComponent().path
-            if let lease = leases.first(where: { CodexLease.sameHome($0.home, surfaceHome) }) {
+            if leases.contains(where: { CodexLease.sameHome($0.home, surfaceHome) }) {
                 throw CLIError.refused(
                     code: "surface_is_lease_home",
-                    message: "The \(surface.kind.rawValue) auth store is the lease home of \(lease.holder); unset CODEX_HOME or return that lease first.",
+                    message: "The \(surface.kind.rawValue) auth store is a lease home; unset CODEX_HOME or return that lease first.",
                     details: nil
                 )
             }

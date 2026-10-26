@@ -9,7 +9,9 @@ import importlib.util
 import io
 import json
 import os
+import base64
 import shutil
+import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,7 +28,10 @@ cl.REG_DIR = work
 cl.REG = os.path.join(work, "registry.json")
 FIX = os.path.join(work, "fixture.json")
 os.environ["FAKE_CS_FIXTURE"] = FIX
-assert cl.REG.startswith(work)
+# register takes Switchboard's .auth.lock; keep it in the temporary folder, never the real one.
+os.environ["CODEX_SWITCHBOARD_APP_SUPPORT"] = work
+os.environ.pop("CODEX_SWITCHBOARD_STORAGE_NAMESPACE", None)
+assert cl.REG.startswith(work) and cl.app_support_dir() == work
 
 
 def h(k):
@@ -86,7 +91,10 @@ def run(argv, fixture=BASE, registry=REGISTRY, codex_home=None):
             cl.main()
         code = 0
     except SystemExit as e:
-        code = e.code if isinstance(e.code, int) else 1
+        # sys.exit("message") prints the message only when the interpreter exits, so keep it here.
+        code = e.code if isinstance(e.code, int) else 0 if e.code is None else 1
+        if isinstance(e.code, str):
+            err.write(e.code)
     with open(FIX) as f:
         after = json.load(f)
     return code, (out.getvalue() + err.getvalue()).strip(), after
@@ -161,7 +169,49 @@ swap_cases = [
     ("swap with no registry: refused", ["swap"], {"registry": MISSING}, 2, None),
 ]
 
-SECRETS = ("@example.invalid", "@Example.invalid", "cli:")
+
+
+def login_home(name, email):
+    """A fake sign-in: an auth.json whose id_token carries only an email claim."""
+    home = os.path.join(work, "homes", name)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    claim = base64.urlsafe_b64encode(json.dumps({"email": email}).encode()).decode().rstrip("=")
+    with open(os.path.join(home, "auth.json"), "w") as f:
+        json.dump({"tokens": {"id_token": "e30.%s.sig" % claim}}, f)
+    return home
+
+
+def register(home, purpose="spare-bench", **kw):
+    return run(["register", "--purpose", purpose, "--home", home, "--consumer", "SECRET-CONSUMER x@example.invalid"], **kw)
+
+
+def reserved_after():
+    with open(cl.REG) as f:
+        return [e["profile_key"] for e in json.load(f)["logins"]]
+
+
+register_cases = [
+    # name, home, purpose, kwargs, exit, profile keys the registry must hold afterwards
+    ("register a spare account", login_home("free", "free@example.invalid"), "spare-bench", {}, 0, [RES, FREE]),
+    ("register the main CLI account: refused", login_home("main", "main@example.invalid"), "spare-bench", {}, 1, [RES]),
+    ("register the account Desktop is on: refused", login_home("free", "free@example.invalid"), "spare-bench",
+     {"fixture": mut(lambda d: d["status"]["surfaces"].append({"kind": "desktop", "active_profile_key": FREE}))}, 1, [RES]),
+    ("register a leased account: refused", login_home("leased", "leased@example.invalid"), "spare-bench",
+     {"fixture": mut(lambda d: d["status"].update(accounts=[a for a in d["status"]["accounts"] if a["profile_key"] != DUP]))},
+     1, [RES]),
+    ("register a seat Switchboard lists twice: refused", login_home("leased", "leased@example.invalid"), "spare-bench", {}, 1, [RES]),
+    ("register a free-plan account: refused", login_home("freeplan", "freeplan@example.invalid"), "spare-bench", {}, 1, [RES]),
+    ("register an account reserved under another purpose: refused", login_home("reserved", "reserved@example.invalid"),
+     "spare-bench", {"fixture": mut(lambda d: d["status"].update(accounts=[a for a in d["status"]["accounts"] if a["profile_key"] != RES2]))},
+     1, [RES]),
+    ("register with a purpose that is not a plain label: refused", login_home("free", "free@example.invalid"),
+     "me@example.invalid", {}, 1, [RES]),
+    ("register with an unreadable lease store: refused", login_home("free", "free@example.invalid"), "spare-bench",
+     {"fixture": mut(lambda d: d.update(leases="!exit"))}, 1, [RES]),
+    ("register a home with no sign-in: refused", os.path.join(work, "homes", "empty"), "spare-bench", {}, 1, [RES]),
+]
+
+SECRETS = ("@example.invalid", "@Example.invalid", "cli:", "SECRET-")
 fails = 0
 total = 0
 for name, key, kw, want in check_cases:
@@ -182,6 +232,45 @@ for name, argv, kw, want, switched_to in swap_cases:
     total += 1
     print("%s %-72s want %d got %d%s%s  %s" % ("PASS" if ok else "FAIL", name, want, got, "  LEAK" if leak else "",
                                               "" if right_call else "  switch calls %r" % calls, text))
+
+for name, home, purpose, kw, want, keys in register_cases:
+    got, text, _ = register(home, purpose, **kw)
+    after = reserved_after()
+    leak = any(sec in text for sec in SECRETS)
+    ok = got == want and not leak and after == keys
+    fails += not ok
+    total += 1
+    print("%s %-72s want %d got %d%s%s  %s" % ("PASS" if ok else "FAIL", name, want, got, "  LEAK" if leak else "",
+                                              "" if after == keys else "  registry %d logins" % len(after), text))
+
+# A switch holds .auth.lock from its registry check to its auth write; register waits for it, then gives up.
+holder = subprocess.Popen(
+    [sys.executable, "-I", "-c", "import fcntl, os, sys, time\n"
+     "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\nfcntl.lockf(fd, fcntl.LOCK_EX)\n"
+     "print('locked', flush=True)\ntime.sleep(60)", os.path.join(work, ".auth.lock")],
+    stdout=subprocess.PIPE, text=True)
+assert holder.stdout.readline().strip() == "locked"
+cl.AUTH_LOCK_TIMEOUT = 0.3
+got, text, _ = register(login_home("free", "free@example.invalid"))
+holder.kill()
+holder.wait()
+cl.AUTH_LOCK_TIMEOUT = 60
+ok = got == 1 and reserved_after() == [RES] and "store lock" in text
+fails += not ok
+total += 1
+print("%s %-72s want 1 got %d  %s" % ("PASS" if ok else "FAIL", "register while a switch holds .auth.lock: refused", got, text))
+
+noisy = {"version": 1, "logins": [
+    {"purpose": "bench", "profile_key": RES, "codex_home": os.path.join(work, "SECRET-home"), "consumer": "SECRET-c",
+     "owner": "x@example.invalid", "notes": "SECRET-notes"},
+    {"purpose": "x@example.invalid", "profile_key": RES2, "codex_home": "~/SECRET-path"}]}
+got, text, _ = run(["status"], registry=noisy)
+leak = any(sec in text for sec in SECRETS)
+ok = not leak and "bench -> Switchboard #5" in text and "hidden" in text and h(LEASED) in text
+fails += not ok
+total += 1
+print("%s %-72s got %d%s\n%s" % ("PASS" if ok else "FAIL", "status shows labels and handles, never free text", got,
+                                 "  LEAK" if leak else "", text))
 
 _, dry, _ = run(["swap", "--dry-run"])
 ok = h(FREE) in dry and h(MAIN) in dry

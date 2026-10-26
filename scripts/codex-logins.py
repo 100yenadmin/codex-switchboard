@@ -7,7 +7,7 @@ benchmark) so that its quota is never shared with the main CLI. The registry is 
 land on one.
 
   codex-logins.py status                          every account (redacted), the main CLI account, leases, and each reserved login's health
-  codex-logins.py register --purpose P --home DIR --consumer TEXT [--owner TEXT] [--notes TEXT]
+  codex-logins.py register --purpose LABEL --home DIR --consumer TEXT [--owner TEXT] [--notes TEXT]
   codex-logins.py check-switch --profile-key K    exit 0 only if K may become the main CLI account
   codex-logins.py swap [--dry-run]                move the main CLI to the best account check-switch allows
 
@@ -19,7 +19,9 @@ reserved or leased one is refused too, since Switchboard can list one seat under
 swap exits: 0 switched (with --dry-run: an account passes); 2 or 4 as for check-switch; 5 no account passes;
 6 Switchboard refused or failed the switch; 7 the switch did not take.
 
-Nothing here prints an email, account id, profile key, holder name or token: accounts appear by handle.
+Nothing here prints an email, account id, profile key, holder name, token, or the registry's free text (consumer,
+owner, notes, home path): accounts appear by handle and reserved logins by their purpose label. register takes
+Switchboard's own .auth.lock, so a reservation cannot land between a switch's registry check and its write.
 Switchboard is found at $CODEX_SWITCHBOARD_CLI, else in this repository's release build, else on PATH.
 """
 import argparse
@@ -37,11 +39,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 REG_DIR = os.path.expanduser("~/.config/codex-logins")
 REG = os.path.join(REG_DIR, "registry.json")
 HANDLE = re.compile(r"acct_[0-9a-f]{12}")
 ERROR_CODE = re.compile(r"[a-z_]{1,64}")
+# A purpose is printed, so it must be a short label that cannot hold an email, a path or a token.
+PURPOSE = re.compile(r"[a-z][a-z0-9-]{0,47}")
+AUTH_LOCK_TIMEOUT = 60
 
 
 def find_cli():
@@ -116,6 +122,41 @@ def registry_lock():
         yield
 
 
+def app_support_dir():
+    """Switchboard's storage folder, found the way its CLI finds it."""
+    override = os.environ.get("CODEX_SWITCHBOARD_APP_SUPPORT", "").strip()
+    if override:
+        return override
+    namespace = os.environ.get("CODEX_SWITCHBOARD_STORAGE_NAMESPACE")
+    if namespace is not None:
+        namespace = namespace.strip()
+        if not namespace or namespace in (".", "..") or "/" in namespace or ":" in namespace:
+            sys.exit("refused: CODEX_SWITCHBOARD_STORAGE_NAMESPACE is not a single folder name")
+    return os.path.expanduser(os.path.join("~/Library/Application Support", namespace or "CodexSwitchboard"))
+
+
+@contextlib.contextmanager
+def auth_store_lock():
+    """Switchboard's own .auth.lock, which its switch holds from its registry check to its auth write. A registry
+    change made under it cannot slip in between that check and that write."""
+    folder = app_support_dir()
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(folder, ".auth.lock"), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        deadline = time.monotonic() + AUTH_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    sys.exit("refused: another Switchboard process kept its store lock for %gs; try again" % AUTH_LOCK_TIMEOUT)
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
+
+
 def cs_run(*args):
     # Switchboard must judge the main CLI home, never a lease or reserved home in CODEX_HOME.
     env = {k: v for k, v in os.environ.items() if k != "CODEX_HOME"}
@@ -148,7 +189,8 @@ def email_of(account):
 
 
 def switchboard_state():
-    """(accounts, leased handles, active CLI profile key or None). Refusal(4) on anything unexpected.
+    """(accounts, leased handles, active CLI profile key or None, every surface's active key). Refusal(4) on anything
+    unexpected.
 
     `leases --json` fails when the lease store cannot be read, while `status --json` would show no leases, so leases
     come from the first and are cross-checked with the second's per-account flag."""
@@ -169,7 +211,8 @@ def switchboard_state():
     surfaces = status.get("surfaces") if isinstance(status.get("surfaces"), list) else []
     active = next((s.get("active_profile_key") for s in surfaces
                    if isinstance(s, dict) and s.get("kind") == "cli" and s.get("active_profile_key")), None)
-    return accounts, leased, active
+    actives = {s.get("active_profile_key") for s in surfaces if isinstance(s, dict)} - {None, ""}
+    return accounts, leased, active, actives
 
 
 def verdict(given, reserved, accounts, leased):
@@ -235,6 +278,8 @@ def mode(path):
 
 
 def health(entry):
+    if not isinstance(entry.get("codex_home"), str):
+        return "home not recorded"
     home = os.path.expanduser(entry["codex_home"])
     auth = os.path.join(home, "auth.json")
     out = []
@@ -256,6 +301,11 @@ def health(entry):
     return ", ".join(out)
 
 
+def label(entry):
+    purpose = entry.get("purpose")
+    return purpose if isinstance(purpose, str) and PURPOSE.fullmatch(purpose) else "(purpose not a plain label; hidden)"
+
+
 def cmd_status(_):
     reg = load_registry()
     by_key = {e["profile_key"]: e for e in reg["logins"] if e.get("profile_key")}
@@ -267,60 +317,66 @@ def cmd_status(_):
         if k in active:
             tag.append("MAIN CLI (active)")
         if k in by_key:
-            tag.append("RESERVED: " + by_key[k]["purpose"])
+            tag.append("RESERVED: " + label(by_key[k]))
         if a.get("leased"):
             tag.append("LEASED to an agent lane")
         print("  #%d %s %-8s %-4s weekly_free %-4s session_free %-4s relogin %-5s %s" % (
             i, a.get("handle", "?"), a.get("plan"), "free" if a.get("is_free_plan") else "paid",
             a.get("weekly_free_percent"), a.get("session_free_percent"), a.get("needs_relogin"), " | ".join(tag)))
-    print("\nReserved logins (%s):" % REG)
+    # Consumer, owner, notes and the home path are free text, so only the label and the home's health are shown.
+    print("\nReserved logins (~/.config/codex-logins/registry.json):")
     if not reg["logins"]:
         print("  none")
     for e in reg["logins"]:
         num = next((i for i, a in enumerate(accounts, 1) if a.get("profile_key") == e.get("profile_key")), None)
         clash = " !! IS THE MAIN CLI ACCOUNT" if e.get("profile_key") in active else ""
-        print("  %s -> Switchboard #%s%s" % (e["purpose"], num if num else "? (not matched)", clash))
-        print("     home: %s  [%s]" % (e["codex_home"], health(e)))
-        print("     consumer: %s" % e.get("consumer", ""))
-        if e.get("owner"):
-            print("     owner: %s" % e["owner"])
-        if e.get("notes"):
-            print("     notes: %s" % e["notes"])
+        print("  %s -> Switchboard #%s%s  [%s]" % (label(e), num if num else "? (not matched)", clash, health(e)))
     return 1 if any(e.get("profile_key") in active for e in reg["logins"]) else 0
 
 
 def cmd_register(a):
+    if not PURPOSE.fullmatch(a.purpose):
+        sys.exit("refused: --purpose must be a lowercase label (a letter, then letters, digits or dashes; at most 48)")
     home = os.path.abspath(os.path.expanduser(a.home))
-    email = home_email(home)
+    try:
+        email = (home_email(home) or "").strip().lower()
+    except (OSError, ValueError, AttributeError):
+        email = ""
     if not email:
-        sys.exit("no id_token email claim in %s/auth.json; sign in first" % home)
-    accounts, active = switchboard()
-    hits = [(i, x) for i, x in enumerate(accounts, 1) if x.get("email") == email]
-    if len(hits) != 1:
-        sys.exit("refused: %d Switchboard accounts match this login (need exactly 1)" % len(hits))
-    num, acct = hits[0]
-    key = acct.get("profile_key")
-    if not key:
-        sys.exit("refused: Switchboard #%d reports no profile key" % num)
-    if key in active:
-        sys.exit("refused: this login is Switchboard #%d, the MAIN CLI account; sign in with a spare account" % num)
-    if acct.get("is_free_plan"):
-        sys.exit("refused: Switchboard #%d is a free-plan account" % num)
-    if acct.get("leased"):
-        sys.exit("refused: Switchboard #%d is leased to an agent lane; return the lease first" % num)
+        sys.exit("no id_token email claim in the home's auth.json; sign in first")
     user_home = os.path.expanduser("~")
     home_out = "~" + home[len(user_home):] if home == user_home or home.startswith(user_home + os.sep) else home
-    with registry_lock():
+    # Switchboard's switch reads the registry and writes auth under .auth.lock, so this check and write go under it
+    # too: a switch to this account either finishes first, and is seen here, or sees the reservation.
+    with auth_store_lock(), registry_lock():
+        try:
+            accounts, leased, _, actives = switchboard_state()
+            hits = [(i, x) for i, x in enumerate(accounts, 1) if email_of(x) == email]
+            leased_seat = len(hits) == 1 and verdict(hits[0][1]["profile_key"], set(), accounts, leased)[0] == 3
+        except Refusal as r:
+            sys.exit("refused: Switchboard's state cannot be checked: %s" % r.message)
+        if len(hits) != 1:
+            sys.exit("refused: %d Switchboard accounts match this login (need exactly 1)" % len(hits))
+        num, acct = hits[0]
+        key = acct["profile_key"]
+        if key in actives or email in {email_of(x) for x in accounts if x["profile_key"] in actives}:
+            sys.exit("refused: this login is Switchboard #%d, the account a CLI or Desktop surface is on; "
+                     "move that surface off it first (codex-logins.py swap)" % num)
+        if acct.get("is_free_plan"):
+            sys.exit("refused: Switchboard #%d is a free-plan account" % num)
+        if leased_seat:
+            sys.exit("refused: Switchboard #%d is leased to an agent lane; return the lease first" % num)
         reg = load_registry()
         for e in reg["logins"]:
-            if e.get("profile_key") == key and e["purpose"] != a.purpose:
-                sys.exit("refused: Switchboard #%d is already reserved for %s" % (num, e["purpose"]))
-        reg["logins"] = [e for e in reg["logins"] if e["purpose"] != a.purpose]
+            if e.get("profile_key") == key and e.get("purpose") != a.purpose:
+                sys.exit("refused: Switchboard #%d is already reserved under another purpose" % num)
+        reg["logins"] = [e for e in reg["logins"] if e.get("purpose") != a.purpose]
         reg["logins"].append({"purpose": a.purpose, "codex_home": home_out, "consumer": a.consumer, "owner": a.owner or "",
                               "notes": a.notes or "", "profile_key": key,
                               "registered": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
         save_registry(reg)
-    print("registered %s -> Switchboard #%d (%s, weekly_free %s)" % (a.purpose, num, acct.get("plan"), acct.get("weekly_free_percent")))
+    print("registered %s -> Switchboard #%d %s (%s, weekly_free %s)" % (
+        a.purpose, num, acct["handle"], acct.get("plan"), acct.get("weekly_free_percent")))
 
 
 def cmd_check_switch(a):
@@ -328,7 +384,7 @@ def cmd_check_switch(a):
         reserved = reserved_keys()
         if a.profile_key in reserved:
             return refuse(1, "this key is reserved in the registry")
-        accounts, leased, _ = switchboard_state()
+        accounts, leased, _, _ = switchboard_state()
         code, why = verdict(a.profile_key, reserved, accounts, leased)
     except Refusal as r:
         return refuse(r.code, "Switchboard's state cannot be checked: %s" % r.message if r.code == 4 else r.message)
@@ -338,7 +394,7 @@ def cmd_check_switch(a):
 def cmd_swap(a):
     try:
         reserved = reserved_keys()
-        accounts, leased, active = switchboard_state()
+        accounts, leased, active, _ = switchboard_state()
         if not active:
             raise Refusal(4, "Switchboard reports no active CLI account")
         current = next((x for x in accounts if x["profile_key"] == active), None)
@@ -371,7 +427,7 @@ def cmd_swap(a):
         return refuse(6, "Switchboard did not switch to %s (%s)" % (
             chosen["handle"], error if isinstance(error, str) and ERROR_CODE.fullmatch(error) else "exit %d" % r.returncode))
     try:
-        _, _, now_active = switchboard_state()
+        _, _, now_active, _ = switchboard_state()
     except Refusal as r:
         return refuse(7, "the switch to %s cannot be confirmed: %s" % (chosen["handle"], r.message))
     if now_active != chosen["profile_key"]:
