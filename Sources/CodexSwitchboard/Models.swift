@@ -178,11 +178,12 @@ struct Account: Identifiable, Equatable, Codable {
             && freePlanResetSeconds > 0
     }
 
+    /// When the account is usable again: every exhausted window must have reset, so the latest one counts.
     var freePlanResetSeconds: Double {
         effectiveQuotaWindows
             .filter { $0.freePercent <= 0.001 && $0.resetSeconds > 0 }
             .map(\.resetSeconds)
-            .min() ?? 0
+            .max() ?? 0
     }
 
     var nextWaitingResetSeconds: Double {
@@ -418,6 +419,14 @@ struct ResetFormatter {
     static func timeOnly(seconds: Double) -> String {
         guard seconds > 0 else { return "now" }
         return hhmm(Date().addingTimeInterval(seconds))
+    }
+
+    /// A window's reset in its row slot: the time alone for windows shorter than a day, and the day
+    /// too for longer ones, whose reset can be days away.
+    static func windowReset(_ window: QuotaWindow) -> String {
+        (window.durationSeconds ?? 0) >= 86_400
+            ? format(seconds: window.resetSeconds)
+            : timeOnly(seconds: window.resetSeconds)
     }
 
     private static func startOfWeekSunday(containing date: Date) -> Date {

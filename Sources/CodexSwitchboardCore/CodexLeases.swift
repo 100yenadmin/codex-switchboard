@@ -337,7 +337,8 @@ enum CodexHomeFileLock {
     private static let state = State()
 
     /// Waits up to `timeout` seconds; zero tries once. A home directory that does not exist has no
-    /// holder, so the body runs without the lock.
+    /// holder, so the body runs without the lock. One that cannot be checked, such as a home behind
+    /// a directory this process cannot search, fails to lock instead.
     static func withLock<T>(
         home: String,
         fileName: String,
@@ -353,8 +354,7 @@ enum CodexHomeFileLock {
             defer { release(key) }
             return try body()
         }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: homePath, isDirectory: &isDirectory), isDirectory.boolValue else {
+        if CodexFileProbe.isMissing(URL(fileURLWithPath: homePath, isDirectory: true)) {
             return try body()
         }
         state.held[key] = (try acquire(home: homePath, path: key, timeout: timeout), 1)
@@ -729,8 +729,7 @@ public final class CodexRefreshReservations {
     public func reserve(profileKey: String, pid: Int32 = Darwin.getpid(), now: Date = Date()) throws {
         var reservations = load()
         if let existing = reservations[profileKey], existing.pid != pid,
-           now.timeIntervalSince1970 - existing.since < Self.maxAge
-            || (Self.isRunning(existing.pid) && now.timeIntervalSince1970 - existing.since < Self.maxHoldWhileRunning) {
+           Self.holds(existing, running: Self.isRunning(existing.pid), now: now) {
             throw HeldElsewhere()
         }
         reservations[profileKey] = Reservation(since: now.timeIntervalSince1970, pid: pid)
@@ -739,6 +738,13 @@ public final class CodexRefreshReservations {
 
     private static func isRunning(_ pid: Int32) -> Bool {
         kill(pid, 0) == 0
+    }
+
+    /// A grant may still be in flight: the reservation is new, or its app still runs and no grant
+    /// could take this long.
+    private static func holds(_ reservation: Reservation, running: Bool, now: Date) -> Bool {
+        let age = now.timeIntervalSince1970 - reservation.since
+        return age < maxAge || (running && age < maxHoldWhileRunning)
     }
 
     public func release(profileKey: String, pid: Int32 = Darwin.getpid()) throws {
@@ -751,8 +757,7 @@ public final class CodexRefreshReservations {
     /// `runningAppPIDs` are the Switchboard app processes alive now.
     public func isReserved(profileKey: String, runningAppPIDs: Set<Int32>, now: Date = Date()) -> Bool {
         guard let reservation = load()[profileKey] else { return false }
-        return runningAppPIDs.contains(reservation.pid)
-            || now.timeIntervalSince1970 - reservation.since < Self.maxAge
+        return Self.holds(reservation, running: runningAppPIDs.contains(reservation.pid), now: now)
     }
 
     private func load() -> [String: Reservation] {
@@ -798,6 +803,26 @@ public enum CodexLeaseMirrorMarker {
 
     public static func isReady(runningAppPIDs: [Int32], recordedPID: Int32?) -> Bool {
         runningAppPIDs.allSatisfy { $0 == recordedPID }
+    }
+}
+
+/// The Application Support folder Switchboard keeps its data in. A side-by-side build names its own,
+/// so it never reads or writes the default build's accounts.
+public enum CodexStorageNamespace {
+    public static let defaultName = "CodexSwitchboard"
+    public static let environmentKey = "CODEX_SWITCHBOARD_STORAGE_NAMESPACE"
+
+    /// The trimmed name, or nil when it is empty or is not a single folder name.
+    public static func validated(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              trimmed != ".",
+              trimmed != "..",
+              !trimmed.contains("/"),
+              !trimmed.contains(":") else {
+            return nil
+        }
+        return trimmed
     }
 }
 

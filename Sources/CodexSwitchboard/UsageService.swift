@@ -488,6 +488,10 @@ final class UsageService: @unchecked Sendable {
             ])
             let (data, urlResponse) = try await session.data(for: request)
             let statusCode = (urlResponse as? HTTPURLResponse)?.statusCode ?? 0
+            // A timeout, rate limit or server error says nothing about the token, so no re-login yet.
+            if statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode) {
+                return .transientFailure
+            }
             guard (200...299).contains(statusCode) else { return .failed }
 
             let response = try JSONDecoder().decode(RefreshedTokenResponse.self, from: data)
@@ -688,12 +692,15 @@ final class UsageService: @unchecked Sendable {
             return error
         }
 
-        if let code = Self.normalizedErrorCode(from: data) {
-            return Self.displayMessage(forErrorCode: code)
+        let code = Self.normalizedErrorCode(from: data)
+        // A 401 whose body is a plain message, not one of the known auth codes, still needs a re-login.
+        if let status = data["http_status"] as? Int, status == 401,
+           code.map({ !Self.knownAuthErrorCodes.contains($0) }) ?? true {
+            return "Expired or revoked"
         }
 
-        if let status = data["http_status"] as? Int, status == 401 {
-            return "Expired or revoked"
+        if let code {
+            return Self.displayMessage(forErrorCode: code)
         }
 
         if let error = data["error"] as? String, !error.isEmpty {
@@ -736,6 +743,16 @@ final class UsageService: @unchecked Sendable {
     private static func normalizedAuthMessage(_ message: String?) -> String? {
         message?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
+
+    private static let knownAuthErrorCodes: Set<String> = [
+        "deactivated_workspace",
+        "token_expired",
+        "token_invalidated",
+        "token_revoked",
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+    ]
 
     private static func displayMessage(forErrorCode code: String) -> String {
         switch code {

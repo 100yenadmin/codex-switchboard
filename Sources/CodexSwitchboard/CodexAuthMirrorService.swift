@@ -26,7 +26,7 @@ final class CodexAuthMirrorService: @unchecked Sendable {
     private let interval: TimeInterval
     private var timer: DispatchSourceTimer?
     private var lastSignature: FileSignature?
-    private var leaseSignatures: [String: FileSignature?] = [:]
+    private var leaseSignatures: [String: [FileSignature?]] = [:]
 
     init(
         fileManager: FileManager = .default,
@@ -143,18 +143,26 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         // Live auth that differs from a stored copy is taken only when it is a later link: a refresh, or a
         // new sign-in, always moves the access token's expiry forward. The account list is checked too,
         // since the app stores a rotation there first; after it stored one and could not pass it on,
-        // live auth and the captured copy can both still hold the spent predecessor.
+        // live auth and the captured copy can both still hold the spent predecessor. Expiries come from
+        // the tokens themselves where they can, so both sides are measured the same way, and a copy
+        // whose expiry is unknown cannot be ordered, so live auth is not taken over it.
         var storedCopies = [(refreshToken: match.auth.refreshToken, expiresAt: match.auth.accessExpiresAt)]
         if let profileKey = match.sourceProfileKey,
            let entry = (AppStorage.readJSON(storageRootURL.appendingPathComponent("accounts.json"))?["profiles"]
                as? [String: Any])?[profileKey] as? [String: Any],
            let listed = entry["refresh"] as? String {
-            storedCopies.append((listed, (entry["expires"] as? NSNumber)?.intValue ?? 0))
+            let expiresAt = (entry["access"] as? String).flatMap(StoredCodexAuth.tokenExpiry)
+                ?? (entry["expires"] as? NSNumber)?.intValue ?? 0
+            storedCopies.append((listed, expiresAt))
         }
         let differing = storedCopies.filter { $0.refreshToken != liveAuth.refreshToken }
-        if !differing.isEmpty,
-           liveAuth.accessExpiresAt <= 0 || differing.contains(where: { liveAuth.accessExpiresAt <= $0.expiresAt }) {
-            return CodexAuthMirrorResult(status: .skipped, profileKey: match.sourceProfileKey, reason: "live auth is older than the stored copy")
+        if !differing.isEmpty {
+            if liveAuth.accessExpiresAt <= 0 || differing.contains(where: { $0.expiresAt <= 0 }) {
+                return CodexAuthMirrorResult(status: .skipped, profileKey: match.sourceProfileKey, reason: "live auth cannot be ordered against the stored copy")
+            }
+            if differing.contains(where: { liveAuth.accessExpiresAt <= $0.expiresAt }) {
+                return CodexAuthMirrorResult(status: .skipped, profileKey: match.sourceProfileKey, reason: "live auth is older than the stored copy")
+            }
         }
 
         do {
@@ -168,7 +176,8 @@ final class CodexAuthMirrorService: @unchecked Sendable {
                     accessToken: liveAuth.accessToken,
                     refreshToken: liveAuth.refreshToken,
                     idToken: liveAuth.idToken,
-                    expiresAt: liveAuth.accessExpiresAt
+                    expiresAt: liveAuth.accessExpiresAt,
+                    storageRootURL: storageRootURL
                 )
             }
             return CodexAuthMirrorResult(status: .synced, profileKey: match.sourceProfileKey, reason: nil)
@@ -184,7 +193,7 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         _ = syncActiveAuth()
     }
 
-    private func syncLeasedHomesIfChanged() {
+    func syncLeasedHomesIfChanged() {
         let signatures = leaseHomeSignatures()
         guard signatures != leaseSignatures else { return }
         leaseSignatures = signatures
@@ -204,10 +213,17 @@ final class CodexAuthMirrorService: @unchecked Sendable {
         }
     }
 
-    private func leaseHomeSignatures() -> [String: FileSignature?] {
+    /// A home's quarantine sentinel counts too: a rotation written while it existed was skipped, and its
+    /// removal must bring the sync back.
+    private func leaseHomeSignatures() -> [String: [FileSignature?]] {
         let leases = (try? CodexLeaseStore(appSupportURL: storageRootURL).load()) ?? []
         return Dictionary(
-            leases.map { ($0.profileKey + "\u{0}" + $0.home, fileSignature(at: $0.authURL)) },
+            leases.map { lease in
+                (
+                    lease.profileKey + "\u{0}" + lease.home,
+                    [fileSignature(at: lease.authURL), fileSignature(at: CodexLeaseHome.stoppedSentinelURL(home: lease.home))]
+                )
+            },
             uniquingKeysWith: { first, _ in first }
         )
     }
@@ -423,6 +439,12 @@ struct StoredCodexAuth {
             accessExpiresAt: accessExp.map { Int($0 * 1000) } ?? 0,
             idExpiresAt: idExp.map { Int($0 * 1000) } ?? 0
         )
+    }
+
+    /// A JWT's `exp` in milliseconds, or nil when the token carries none.
+    static func tokenExpiry(_ token: String) -> Int? {
+        guard let exp = decodePayload(token)?["exp"] as? Double, exp > 0 else { return nil }
+        return Int(exp * 1000)
     }
 
     private static func decodePayload(_ token: String) -> [String: Any]? {

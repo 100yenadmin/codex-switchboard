@@ -53,12 +53,13 @@ cp "$ICNS" "${OUT}/Contents/Resources/AppIcon.icns"
 cp "${ROOT}/Support/codex.png" "${OUT}/Contents/Resources/codex.png"
 
 PLIST="${OUT}/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${DISPLAY_NAME}" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleName ${DISPLAY_NAME}" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${BUNDLE_ID}" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VERSION}" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VERSION}" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CodexSwitchboardStorageNamespace ${STORAGE_NAMESPACE}" "$PLIST"
+# plutil stores each value exactly; PlistBuddy would parse quotes and backslashes in it.
+plutil -replace CFBundleDisplayName -string "$DISPLAY_NAME" "$PLIST"
+plutil -replace CFBundleName -string "$DISPLAY_NAME" "$PLIST"
+plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$PLIST"
+plutil -replace CFBundleShortVersionString -string "$VERSION" "$PLIST"
+plutil -replace CFBundleVersion -string "$VERSION" "$PLIST"
+plutil -replace CodexSwitchboardStorageNamespace -string "$STORAGE_NAMESPACE" "$PLIST"
 
 if command -v codesign &>/dev/null; then
 	codesign --force --deep --sign - "$OUT" 2>/dev/null || true

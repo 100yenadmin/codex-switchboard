@@ -72,6 +72,13 @@ private final class CommandRunner {
     }
 
     func run() throws -> CommandResult {
+        if paths.storageNamespaceInvalid {
+            throw CLIError.refused(
+                code: "storage_namespace_invalid",
+                message: "\(CodexStorageNamespace.environmentKey) must be a folder name without / or :. Nothing was read or changed.",
+                details: nil
+            )
+        }
         guard let command = arguments.first else {
             throw CLIError.usage("Missing command. Use status, switch, lease, return, leases, or doctor.", jsonPreferred: false)
         }
@@ -709,6 +716,9 @@ private struct SwitchboardPaths {
     let autoSwapPolicyURL: URL
     let autoSwapAuditURL: URL
     let leaseStore: CodexLeaseStore
+    /// The namespace variable is set but names no usable folder. Falling back to the default storage
+    /// would defeat the isolation it asks for, so every command refuses.
+    let storageNamespaceInvalid: Bool
 
     init(
         homeURL: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -716,12 +726,19 @@ private struct SwitchboardPaths {
     ) {
         self.homeURL = homeURL
         self.environment = environment
+        let namespace = environment[CodexStorageNamespace.environmentKey]
+        let namespaceSet = !(namespace?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
         if let override = environment["CODEX_SWITCHBOARD_APP_SUPPORT"],
            !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             appSupportURL = URL(fileURLWithPath: override, isDirectory: true)
+            storageNamespaceInvalid = false
         } else {
             appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("CodexSwitchboard", isDirectory: true)
+                .appendingPathComponent(
+                    CodexStorageNamespace.validated(namespace) ?? CodexStorageNamespace.defaultName,
+                    isDirectory: true
+                )
+            storageNamespaceInvalid = namespaceSet && CodexStorageNamespace.validated(namespace) == nil
         }
         profilesURL = appSupportURL.appendingPathComponent("profiles", isDirectory: true)
         backupsURL = appSupportURL.appendingPathComponent("backups", isDirectory: true)
@@ -1945,7 +1962,9 @@ private final class CLILeaseService {
             if let match = line.range(of: pattern, options: .regularExpression) {
                 let assignment = String(line[match])
                 if let open = assignment.firstIndex(of: "\""), let close = assignment.lastIndex(of: "\""), open < close {
-                    return String(assignment[assignment.index(after: open)..<close])
+                    let value = String(assignment[assignment.index(after: open)..<close])
+                    // A TOML escape would make Codex read a different path than the one checked here.
+                    return value.contains("\\") ? nil : value
                 }
             }
         }

@@ -320,6 +320,11 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertTrue(reservations.isReserved(profileKey: "profile-k", runningAppPIDs: [4242]), "only its own app releases it")
         try reservations.release(profileKey: "profile-k", pid: 4242)
         XCTAssertFalse(reservations.isReserved(profileKey: "profile-k", runningAppPIDs: [4242]))
+
+        // No grant takes this long, so a running pid this old is a reused one.
+        let longAgo = Date().addingTimeInterval(-CodexRefreshReservations.maxHoldWhileRunning - 1)
+        try reservations.reserve(profileKey: "profile-k", pid: 4242, now: longAgo)
+        XCTAssertFalse(reservations.isReserved(profileKey: "profile-k", runningAppPIDs: [4242]))
     }
 
     func testOnlyOneAppHoldsARefreshGrantAtATime() throws {
@@ -1218,6 +1223,76 @@ final class CodexLeaseTests: XCTestCase {
         try CodexAtomicFile.writeJSON(root, to: accountsURL)
         XCTAssertEqual(mirror.syncActiveAuth().reason, "live auth is older than the stored copy")
         XCTAssertEqual(fixture.accountListRefreshToken("profile-a"), "refresh-a-4")
+
+        // A list entry whose expiry is unknown cannot be ordered, so live auth is not taken over it.
+        entry.removeValue(forKey: "expires")
+        profiles["profile-a"] = entry
+        root["profiles"] = profiles
+        try CodexAtomicFile.writeJSON(root, to: accountsURL)
+        XCTAssertEqual(mirror.syncActiveAuth().reason, "live auth cannot be ordered against the stored copy")
+        XCTAssertEqual(fixture.accountListRefreshToken("profile-a"), "refresh-a-4")
+
+        // The entry's own access token gives its expiry, measured the same way as live auth's.
+        entry["access"] = LeaseFixture.jwt(["exp": 1_800_000_000 + 5])
+        profiles["profile-a"] = entry
+        root["profiles"] = profiles
+        try CodexAtomicFile.writeJSON(root, to: accountsURL)
+        XCTAssertEqual(mirror.syncActiveAuth().reason, "live auth is older than the stored copy")
+        try fixture.writeAuth(account: "a", generation: 6, to: liveAuth)
+        XCTAssertEqual(mirror.syncActiveAuth().status, .synced)
+        XCTAssertEqual(fixture.accountListRefreshToken("profile-a"), "refresh-a-6")
+    }
+
+    func testMirrorRetriesAHomeOnceItsQuarantineClears() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        let mirror = CodexAuthMirrorService(
+            authURL: fixture.home.appendingPathComponent(".codex/auth.json"),
+            profileStoreURL: fixture.appSupport.appendingPathComponent("profiles"),
+            storageRootURL: fixture.appSupport,
+            interval: 30
+        )
+        mirror.syncLeasedHomesIfChanged()
+
+        // The holder writes its rotation while its refresh sentinel still exists.
+        let sentinel = CodexLeaseHome.stoppedSentinelURL(home: home.path)
+        try "refresh_in_flight\n".write(to: sentinel, atomically: true, encoding: .utf8)
+        try fixture.writeAuth(account: "k", generation: 2, to: home.appendingPathComponent("auth.json"))
+        mirror.syncLeasedHomesIfChanged()
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-1")
+
+        try FileManager.default.removeItem(at: sentinel)
+        mirror.syncLeasedHomesIfChanged()
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
+    }
+
+    func testAHomeThatCannotBeSearchedIsNeverReturnedUnlocked() throws {
+        let parent = fixture.root.appendingPathComponent("closed", isDirectory: true)
+        let home = parent.appendingPathComponent("lane-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        XCTAssertEqual(
+            fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode,
+            0
+        )
+        try fixture.writeAuth(account: "k", generation: 2, to: home.appendingPathComponent("auth.json"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: parent.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+        }
+
+        let refused = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertNotEqual(refused.exitCode, 0, refused.text)
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-1")
+        let listed = fixture.run(["leases", "--json"])
+        XCTAssertEqual((listed.json["leases"] as? [[String: Any]])?.count, 1, "the lease is still held")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+        let returned = fixture.run(["return", "--profile-key", "profile-k", "--home", home.path, "--json"])
+        XCTAssertEqual(returned.exitCode, 0, returned.text)
+        XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-2")
     }
 
     func testLeaseChecksTheNestedCodexHomeValue() throws {
@@ -1228,6 +1303,8 @@ final class CodexLeaseTests: XCTestCase {
             "set = { CODEX_HOME_OTHER = \"/var/empty/x\" }",
             "set = { CODEX_HOME = \"\(home.path)\" }",
             "set = { CODEX_HOME = \"\(fixture.root.path)\" }",
+            // TOML decodes this to a different path than the one written.
+            "set = { CODEX_HOME = \"/var/empty/\\u006eested\" }",
         ] {
             try "cli_auth_credentials_store = \"file\"\n\n[shell_environment_policy]\n\(unsafe)\n"
                 .write(to: configURL, atomically: true, encoding: .utf8)
@@ -1238,6 +1315,19 @@ final class CodexLeaseTests: XCTestCase {
             .write(to: configURL, atomically: true, encoding: .utf8)
         let lease = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"])
         XCTAssertEqual(lease.exitCode, 0, lease.text)
+    }
+
+    func testCLIRefusesAnUnusableStorageNamespace() {
+        // Without an app-support override the namespace names the storage folder. An unusable one must
+        // not fall back to the default storage, so the command stops before reading anything.
+        let output = CodexSwitchboardCommand.execute(
+            arguments: ["status", "--json"],
+            environment: ["CODEX_SWITCHBOARD_STORAGE_NAMESPACE": "a/b", "PATH": "/usr/bin:/bin"],
+            homeURL: fixture.home
+        )
+        let text = output.stdout ?? output.stderr ?? ""
+        XCTAssertNotEqual(output.exitCode, 0)
+        XCTAssertTrue(text.contains("storage_namespace_invalid"), text)
     }
 
     func testHelpListsLeaseCommands() {
@@ -1290,6 +1380,7 @@ private struct LeaseFixture {
             accountList["profile-\(account)"] = [
                 "access": "access-\(account)-1",
                 "refresh": "refresh-\(account)-1",
+                "expires": (1_800_000_000 + 1) * 1000,
                 "email": "\(account)@example.invalid",
                 "accountId": "acct-\(account)",
             ]
@@ -1448,7 +1539,7 @@ private struct LeaseFixture {
         return process
     }
 
-    private static func jwt(_ claims: [String: Any]) -> String {
+    static func jwt(_ claims: [String: Any]) -> String {
         func encode(_ object: [String: Any]) -> String {
             let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             return data.base64EncodedString()

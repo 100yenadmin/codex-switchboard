@@ -225,6 +225,52 @@ final class UsageServiceIntegrationTests: XCTestCase {
         XCTAssertEqual(tokenUpdate.count, 0)
     }
 
+    func testTemporaryTokenEndpointFailureDoesNotDemandRelogin() async throws {
+        for status in [429, 503] {
+            let recorder = RequestRecorder()
+            let tokenUpdate = TokenUpdateRecorder()
+            MockURLProtocol.handler = { request in
+                let path = request.url?.path ?? ""
+                recorder.record(path: path)
+                if path == "/oauth/token" {
+                    return Self.response(request, status: status, json: ["error": "temporarily_unavailable"])
+                }
+                return Self.response(request, status: 401, json: ["detail": ["code": "token_expired"]])
+            }
+
+            let accounts = await makeService(tokenUpdate: tokenUpdate).loadAll()
+            let account = try XCTUnwrap(accounts.first)
+
+            XCTAssertEqual(account.errorMessage, "Refresh temporarily unavailable", "HTTP \(status)")
+            XCTAssertFalse(UsageService.requiresRelogin(account.errorMessage))
+            XCTAssertEqual(tokenUpdate.count, 0)
+        }
+    }
+
+    func testUnauthorizedPlainMessageStillAsksForRelogin() async throws {
+        for body in [["message": "Invalid token"], ["detail": "Unauthorized"]] {
+            MockURLProtocol.handler = { request in
+                if request.url?.path == "/oauth/token" {
+                    return Self.response(request, status: 400, json: ["error": "invalid_grant"])
+                }
+                if request.url?.path == "/backend-api/wham/usage" {
+                    return Self.response(request, status: 401, json: body)
+                }
+                return Self.response(request, json: ["accounts": [:]])
+            }
+
+            // The refresh is skipped, so the row shows the usage endpoint's own 401.
+            let service = makeService(tokenUpdate: TokenUpdateRecorder(), refreshGate: UsageService.RefreshGate(
+                reserve: { _, _ in .stale },
+                release: { _ in }
+            ))
+            let accounts = await service.loadAll()
+            let account = try XCTUnwrap(accounts.first)
+
+            XCTAssertTrue(UsageService.isExpiredOrRevokedAuthError(account.errorMessage), "\(body)")
+        }
+    }
+
     func testLeasedAccountIsNeverRefreshedByTheApp() async throws {
         let recorder = RequestRecorder()
         let tokenUpdate = TokenUpdateRecorder()

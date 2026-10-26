@@ -541,7 +541,7 @@ struct AccountCompactRow: View {
     @ViewBuilder
     private func quotaResetText(window: QuotaWindow?, width: CGFloat) -> some View {
         if let window {
-            Text(ResetFormatter.timeOnly(seconds: window.resetSeconds))
+            Text(ResetFormatter.windowReset(window))
                 .font(.system(size: resetFontSize))
                 .monospacedDigit()
                 .foregroundColor(.secondary)

@@ -3,29 +3,23 @@ import Foundation
 
 enum AppStorage {
     private static let fileManager = FileManager.default
-    private static let defaultNamespace = "CodexSwitchboard"
-
     static var storageNamespace: String {
-        let environmentValue = ProcessInfo.processInfo.environment[
-            "CODEX_SWITCHBOARD_STORAGE_NAMESPACE"
-        ]
-        let bundleValue = Bundle.main.object(
-            forInfoDictionaryKey: "CodexSwitchboardStorageNamespace"
-        ) as? String
-        return normalizedStorageNamespace(environmentValue ?? bundleValue)
+        resolvedStorageNamespace(
+            environmentValue: ProcessInfo.processInfo.environment[CodexStorageNamespace.environmentKey],
+            bundleValue: Bundle.main.object(forInfoDictionaryKey: "CodexSwitchboardStorageNamespace") as? String
+        )
+    }
+
+    /// The environment wins when it names a usable folder. An empty or unusable value falls back to
+    /// the bundle's own namespace, so a side-by-side build never lands in the default storage by accident.
+    static func resolvedStorageNamespace(environmentValue: String?, bundleValue: String?) -> String {
+        CodexStorageNamespace.validated(environmentValue)
+            ?? CodexStorageNamespace.validated(bundleValue)
+            ?? CodexStorageNamespace.defaultName
     }
 
     static func normalizedStorageNamespace(_ value: String?) -> String {
-        guard let value else { return defaultNamespace }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              trimmed != ".",
-              trimmed != "..",
-              !trimmed.contains("/"),
-              !trimmed.contains(":") else {
-            return defaultNamespace
-        }
-        return trimmed
+        CodexStorageNamespace.validated(value) ?? CodexStorageNamespace.defaultName
     }
 
     static var rootURL: URL {
@@ -170,9 +164,12 @@ enum AccountProfileStore {
         refreshToken: String,
         idToken: String?,
         expiresAt: Int,
-        expectedRefreshToken: String? = nil
+        expectedRefreshToken: String? = nil,
+        storageRootURL: URL? = nil
     ) throws {
-        var root = accountsRoot()
+        let storageRootURL = storageRootURL ?? AppStorage.rootURL
+        let accountsURL = storageRootURL.appendingPathComponent("accounts.json")
+        var root = accountsRoot(at: accountsURL)
         var profiles = root["profiles"] as? [String: Any] ?? [:]
         guard var entry = profiles[profileKey] as? [String: Any] else {
             if expectedRefreshToken != nil {
@@ -190,7 +187,7 @@ enum AccountProfileStore {
         entry["expires"] = expiresAt
         profiles[profileKey] = entry
         root["profiles"] = profiles
-        try AppStorage.writeJSON(root, to: AppStorage.accountsURL, permissions: 0o600)
+        try AppStorage.writeJSON(root, to: accountsURL, permissions: 0o600)
 
         try? updateCapturedProfiles(
             profileKey: profileKey,
@@ -199,7 +196,8 @@ enum AccountProfileStore {
             accessToken: accessToken,
             refreshToken: refreshToken,
             idToken: idToken,
-            expiresAt: expiresAt
+            expiresAt: expiresAt,
+            profilesURL: storageRootURL.appendingPathComponent("profiles", isDirectory: true)
         )
     }
 
@@ -235,8 +233,8 @@ enum AccountProfileStore {
         return AccountProfileCollection(profiles: profiles, orderedKeys: orderedKeys(root: root, profiles: profiles))
     }
 
-    private static func accountsRoot() -> [String: Any] {
-        AppStorage.readJSON(AppStorage.accountsURL) ?? ["version": 1, "profiles": [:], "order": ["default": []]]
+    private static func accountsRoot(at url: URL = AppStorage.accountsURL) -> [String: Any] {
+        AppStorage.readJSON(url) ?? ["version": 1, "profiles": [:], "order": ["default": []]]
     }
 
     private static func orderedKeys(root: [String: Any], profiles: [String: [String: Any]]) -> [String] {
@@ -321,10 +319,11 @@ enum AccountProfileStore {
         accessToken: String,
         refreshToken: String,
         idToken: String?,
-        expiresAt: Int
+        expiresAt: Int,
+        profilesURL: URL
     ) throws {
         guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: AppStorage.profilesURL,
+            at: profilesURL,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         ) else {

@@ -169,9 +169,9 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `home_in_use` | A process holds `holder.lock`, has a file open in the home, or runs with `CODEX_HOME` set to it (pid and program name in `details`). Stop it first. |
 | `home_scan_failed` | Switchboard could not check which processes use the home. Nothing changed. |
 | `home_locked` | The home's holder kept `auth.json.lock` for 30 s, probably while refreshing. Nothing changed; try again. |
-| `home_lock_unavailable` | A lock file in the home cannot be opened or locked. Nothing changed. |
+| `home_lock_unavailable` | A lock file in the home cannot be opened or locked, for example because a folder above the home cannot be searched. Nothing changed. |
 | `auth_store_locked` | `lease`, `return`, `swap-lease`: another Switchboard process kept Switchboard's own store lock for 60 s. Nothing changed; try again. |
-| `home_config_unsafe` | The home's `config.toml` cannot be read, or does not set both `cli_auth_credentials_store = "file"` and a `CODEX_HOME` for nested commands under `[shell_environment_policy]`. Add both, or move the file away so `lease` writes its own. |
+| `home_config_unsafe` | The home's `config.toml` cannot be read, or does not set both `cli_auth_credentials_store = "file"` and a `CODEX_HOME` for nested commands under `[shell_environment_policy]` (a path that does not exist and is not the home, written without TOML escapes). Add both, or move the file away so `lease` writes its own. |
 | `duplicate_account_keys` | Switchboard lists the account's seat under more than one key, so a lease check on one key would miss the other. Remove the account in the Switchboard app (that removes every key of the seat), sign in to it again, then lease. |
 | `holder_mismatch` | `swap-lease`: the lease belongs to another holder. |
 | `already_leased`, `home_already_leased` | The account, or the home, already has a lease (active or returning). |
@@ -189,6 +189,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 | `account_leased`, `surface_is_lease_home` | `switch` refused a leased account, or a surface whose auth store is a lease home. |
 | `surface_is_reserved_home`, `surface_is_lane_home` | `switch` refused a surface whose auth store is a registry-reserved login's home, or a lane home (it has `holder.lock`). Unset `CODEX_HOME`. A `switch` into a home other than `~/.codex` also refuses `reserved_registry_unreadable` while the registry cannot be read. |
 | `lease_store_unreadable` | Switchboard could not read `leases.json`; every writer fails closed. |
+| `storage_namespace_invalid` | Any command: `CODEX_SWITCHBOARD_STORAGE_NAMESPACE` is set but is not a single folder name, so the CLI stops instead of using the default storage. Unset it or fix it. |
 
 ## Pressure Scenario
 
