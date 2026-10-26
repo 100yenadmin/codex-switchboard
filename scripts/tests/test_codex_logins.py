@@ -191,7 +191,10 @@ def register(home, purpose="spare-bench", **kw):
 
 def reserved_after():
     with open(cl.REG) as f:
-        return [e["profile_key"] for e in json.load(f)["logins"]]
+        try:
+            return [e["profile_key"] for e in json.load(f)["logins"]]
+        except ValueError:
+            return None
 
 
 register_cases = [
@@ -220,6 +223,8 @@ register_cases = [
     ("register with an unreadable lease store: refused", login_home("free", "free@example.invalid"), "spare-bench",
      {"fixture": mut(lambda d: d.update(leases="!exit"))}, 1, [RES]),
     ("register a home with no sign-in: refused", os.path.join(work, "homes", "empty"), "spare-bench", {}, 1, [RES]),
+    ("register with an unreadable registry: refused", login_home("free", "free@example.invalid"), "spare-bench",
+     {"registry": "{not json"}, 1, None),
 ]
 
 SECRETS = ("@example.invalid", "@Example.invalid", "cli:", "SECRET-")
@@ -272,6 +277,12 @@ ok = got == 1 and reserved_after() == [RES] and "store lock" in text
 fails += not ok
 total += 1
 print("%s %-72s want 1 got %d  %s" % ("PASS" if ok else "FAIL", "register while a switch holds .auth.lock: refused", got, text))
+
+got, text, _ = run(["status"], registry="{not json")
+ok = got == 2 and "cannot be read" in text
+fails += not ok
+total += 1
+print("%s %-72s want 2 got %d  %s" % ("PASS" if ok else "FAIL", "status with an unreadable registry: refused", got, text))
 
 noisy = {"version": 1, "logins": [
     {"purpose": "bench", "profile_key": RES, "codex_home": os.path.join(work, "SECRET-home"), "consumer": "SECRET-c",

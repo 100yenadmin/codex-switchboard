@@ -6,7 +6,8 @@ benchmark) so that its quota is never shared with the main CLI. The registry is 
 (dir 700, file 600). Switchboard reads it too: it never leases a reserved account, and its switch and auto-swap never
 land on one.
 
-  codex-logins.py status                          every account (redacted), the main CLI account, leases, and each reserved login's health
+  codex-logins.py status                          every account (redacted), the main CLI account, leases, and each reserved login's
+                                                  health; exits 1 if a reserved account is the main CLI's, 2 if the registry is unreadable
   codex-logins.py register --purpose LABEL --home DIR --consumer TEXT [--owner TEXT] [--notes TEXT]
   codex-logins.py check-switch --profile-key K    exit 0 only if K may become the main CLI account
   codex-logins.py swap [--dry-run]                move the main CLI to the best account check-switch allows
@@ -73,11 +74,18 @@ class Refusal(Exception):
 
 
 def load_registry():
-    """The registry for status and register: a missing one is empty."""
+    """The registry for status and register: a missing one is empty. Refusal(2) if it cannot be read."""
     if not os.path.exists(REG):
         return {"version": 1, "logins": []}
-    with open(REG) as f:
-        return json.load(f)
+    try:
+        with open(REG) as f:
+            reg = json.load(f)
+    except (OSError, ValueError):
+        raise Refusal(2, "the registry cannot be read as JSON")
+    if not isinstance(reg, dict) or not isinstance(reg.get("logins"), list) or not all(
+            isinstance(e, dict) for e in reg["logins"]):
+        raise Refusal(2, "the registry does not hold a list of logins")
+    return reg
 
 
 def reserved_keys():
@@ -310,7 +318,10 @@ def label(entry):
 
 
 def cmd_status(_):
-    reg = load_registry()
+    try:
+        reg = load_registry()
+    except Refusal as r:
+        return refuse(r.code, r.message)
     by_key = {e["profile_key"]: e for e in reg["logins"] if e.get("profile_key")}
     accounts, active = switchboard()
     print("Switchboard accounts (CLI surface; numbers are Switchboard's list order):")
@@ -374,7 +385,10 @@ def cmd_register(a):
             sys.exit("refused: Switchboard #%d is a free-plan account" % num)
         if leased_seat:
             sys.exit("refused: Switchboard #%d is leased to an agent lane; return the lease first" % num)
-        reg = load_registry()
+        try:
+            reg = load_registry()
+        except Refusal as r:
+            sys.exit("refused: %s" % r.message)
         for e in reg["logins"]:
             if e.get("profile_key") == key and e.get("purpose") != a.purpose:
                 sys.exit("refused: Switchboard #%d is already reserved under another purpose" % num)
