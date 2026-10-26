@@ -292,7 +292,13 @@ def mode(path):
 def health(entry):
     if not isinstance(entry.get("codex_home"), str):
         return "home not recorded"
-    home = os.path.expanduser(entry["codex_home"])
+    try:
+        return home_health(os.path.expanduser(entry["codex_home"]))
+    except (OSError, ValueError):
+        return "home cannot be checked"
+
+
+def home_health(home):
     auth = os.path.join(home, "auth.json")
     out = []
     if not os.path.isdir(home):
