@@ -124,7 +124,8 @@ final class ResetCreditsTests: XCTestCase {
                 XCTAssertEqual(recorder.requests.count, 2)
             } else if code == "nothing_to_reset" {
                 XCTAssertEqual(model.notice, .nothingToReset)
-                XCTAssertEqual(recorder.requests.count, 1)
+                XCTAssertEqual(refreshes, 0)
+                XCTAssertEqual(recorder.requests.map(\.httpMethod), ["POST", "GET"], "nothing_to_reset also reloads the list")
             } else {
                 XCTAssertNotNil(model.consumeError)
                 XCTAssertNil(model.notice)

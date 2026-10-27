@@ -81,13 +81,9 @@ final class ResetCreditsViewModel: ObservableObject {
             spendUnresolved = false
             confirmation = nil
             notice = result
-            switch result {
-            case .reset:
-                refreshUsage()
-                await reload()
-            case .noCredit: await reload()
-            case .nothingToReset: break
-            }
+            if case .reset = result { refreshUsage() }
+            // Reload after every answer: after an unresolved attempt even nothing_to_reset can follow a spend.
+            await reload()
         } catch {
             spendUnresolved = true
             consumeError = error.localizedDescription
