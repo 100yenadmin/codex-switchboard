@@ -391,7 +391,7 @@ def with_unsafe_emails(d):
 
 got, text, _ = run(["status"], fixture=mut(with_unsafe_emails))
 rows = text.splitlines()
-expected_emails = ("-", "-", "-", "-", "?", "?", "?")
+expected_emails = ("-", "-", "-", "?", "?", "?", "?")
 safe_emails = all(any(line.split()[1:3] == [a["handle"], email] for line in rows)
                   for a, email in zip(BASE["status"]["accounts"], expected_emails))
 allowed_starts = ("Switchboard accounts (CLI surface; numbers are Switchboard's list order):",

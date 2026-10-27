@@ -217,7 +217,11 @@ def email_of(account):
 
 def shown_email(account):
     value = account.get("email")
-    if not isinstance(value, str) or not value.strip():
+    if value is None:
+        return "-"
+    if not isinstance(value, str):
+        return "?"
+    if not value.strip():
         return "-"
     if any(c.isspace() or c == "|" or not c.isprintable() for c in value):
         return "?"
