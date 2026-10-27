@@ -31,7 +31,7 @@ final class SwitchboardCLIClientTests: XCTestCase {
         XCTAssertEqual(calls, [
             ["leases", "--json"], ["status", "--json"],
             ["return", "--profile-key", lease.handle, "--home", lease.home, "--json"],
-            ["swap-lease", "--home", lease.home, "--holder", lease.holder, "--profile-key", target.handle, "--json"]
+            ["swap-lease", "--home", lease.home, "--holder", lease.holder, "--profile-key", target.handle, "--expect-lease-id", lease.leaseID, "--json"]
         ])
     }
 

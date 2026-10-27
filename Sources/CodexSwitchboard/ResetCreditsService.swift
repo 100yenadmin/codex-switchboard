@@ -18,7 +18,7 @@ struct ResetCredit: Decodable, Identifiable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
-        resetType = try c.decode(String.self, forKey: .resetType)
+        resetType = try c.decodeIfPresent(String.self, forKey: .resetType) ?? "unknown"
         status = try c.decode(String.self, forKey: .status)
         title = try c.decodeIfPresent(String.self, forKey: .title)
         description = try c.decodeIfPresent(String.self, forKey: .description)
@@ -38,7 +38,7 @@ struct ResetCredit: Decodable, Identifiable, Equatable {
 
 struct ResetCreditsList: Decodable, Equatable {
     let credits: [ResetCredit]
-    let availableCount: Int
+    let availableCount: Int?
     let totalEarnedCount: Int?
 
     enum CodingKeys: String, CodingKey {

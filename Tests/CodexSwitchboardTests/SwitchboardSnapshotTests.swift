@@ -33,6 +33,9 @@ final class SwitchboardSnapshotTests: XCTestCase {
         let account = ResetTestFixtures.account()
         let confirmation = ResetConfirmation(credit: list.available[0], requestID: UUID())
         let states: [(String, ResetCreditsContent)] = [
+            ("weekly-only", .init(account: ResetTestFixtures.account(quotaWindows: [
+                QuotaWindow(kind: .weekly, usedPercent: 73, resetSeconds: 86400, durationSeconds: 604800),
+            ]), state: .loaded(list))),
             ("loading", .init(account: account, state: .loading)),
             ("list", .init(account: account, state: .loaded(list))),
             ("confirm", .init(account: account, state: .loaded(list), confirmation: confirmation)),

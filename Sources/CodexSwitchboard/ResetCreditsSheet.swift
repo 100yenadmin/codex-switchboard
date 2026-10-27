@@ -6,7 +6,7 @@ struct ResetConfirmation: Equatable {
 
     func message(email: String) -> String {
         let expiry = credit.expiresAt.map { "expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "no expiry"
-        return "Use \u{201C}\(credit.displayTitle)\u{201D} (\(expiry)) on \(email)? It restores the 5-hour and weekly limits. The reset is used up."
+        return "Use \u{201C}\(credit.displayTitle)\u{201D} (\(expiry)) on \(email)? It restores the 5-hour limit, the weekly limit or both. The reset is used up."
     }
 }
 
@@ -126,6 +126,12 @@ struct ResetCreditsContent: View {
     var close: () -> Void = {}
     var scrolls = true
 
+    var quotaSummary: String {
+        account.effectiveQuotaWindows.map {
+            "\($0.displayLabel): \(String(format: "%.0f", $0.freePercent))% free"
+        }.joined(separator: " · ")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -134,8 +140,9 @@ struct ResetCreditsContent: View {
                 Button("Done", action: close).disabled(isConsuming)
             }
             Text(account.email).textSelection(.enabled)
-            Text(String(format: "5-hour: %.0f%% free · Weekly: %.0f%% free", account.sessionFree, account.weeklyFree))
-                .foregroundStyle(.secondary)
+            if !quotaSummary.isEmpty {
+                Text(quotaSummary).foregroundStyle(.secondary)
+            }
             if let notice {
                 switch notice {
                 case .reset:

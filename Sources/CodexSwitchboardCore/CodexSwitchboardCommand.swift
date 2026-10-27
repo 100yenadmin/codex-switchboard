@@ -174,7 +174,8 @@ private final class CommandRunner {
             home: options.home,
             to: options.profileKey,
             excluding: options.excludedProfileKeys,
-            holder: options.holder
+            holder: options.holder,
+            expectedLeaseID: options.expectedLeaseID
         )
         return CommandResult(payload: .leaseSwap(outcome), json: options.json, exitCode: 0)
     }
@@ -390,7 +391,8 @@ private final class CommandRunner {
     codex-switchboard leases --json
     codex-switchboard resolve --profile-key <key> --json
         (read-only: the handle and email of the account <key> names, as lease and switch resolve it)
-    codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... --json
+    codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... [--expect-lease-id <id>] --json
+        (--expect-lease-id refuses if the home no longer holds the lease confirmed by the owner)
         (accounts show email beside handle, acct_ plus 12 hex digits; <key> may be a profile key, a handle or an email)
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
     codex-switchboard autoswap enable --surface cli|desktop|both --json [--trigger-session-free <percent>] [--target-min-session-free <percent>]
@@ -475,17 +477,22 @@ private struct SwapLeaseOptions {
     let profileKey: String?
     let excludedProfileKeys: Set<String>
     let holder: String
+    let expectedLeaseID: String?
 
     static func parse(_ args: [String]) throws -> SwapLeaseOptions {
         var parser = ArgumentParser(args)
         let json = parser.takeFlag("--json")
         let home = try parser.takeRequiredValue("--home")
         let profileKey = parser.takeOptionalValue("--profile-key")
+        let expectedLeaseID = parser.takeOptionalValue("--expect-lease-id")
         let excluded = try parser.takeAllValues("--exclude-profile-key")
         let holder = try parser.takeRequiredValue("--holder").trimmingCharacters(in: .whitespacesAndNewlines)
         try parser.finish()
         if let profileKey, profileKey.isEmpty || profileKey.hasPrefix("--") {
             throw CLIError.usage("Missing value for --profile-key.", jsonPreferred: false)
+        }
+        if let expectedLeaseID, expectedLeaseID.isEmpty || expectedLeaseID.hasPrefix("--") {
+            throw CLIError.usage("Missing value for --expect-lease-id.", jsonPreferred: false)
         }
         if holder.isEmpty || holder.count > 200 || holder.hasPrefix("--") {
             throw CLIError.usage("--holder must be 1 to 200 characters.", jsonPreferred: false)
@@ -498,7 +505,8 @@ private struct SwapLeaseOptions {
             home: home,
             profileKey: profileKey,
             excludedProfileKeys: Set(excluded),
-            holder: holder
+            holder: holder,
+            expectedLeaseID: expectedLeaseID
         )
     }
 }
@@ -1786,7 +1794,8 @@ private final class CLILeaseService {
         home rawHome: String,
         to requestedKey: String?,
         excluding excludedGiven: Set<String>,
-        holder: String
+        holder: String,
+        expectedLeaseID: String? = nil
     ) throws -> LeaseSwapPayload {
         let requestedHome = Self.standardized(rawHome)
 
@@ -1794,6 +1803,9 @@ private final class CLILeaseService {
             let leases = try paths.leaseStore.load()
             guard let current = leases.first(where: { CodexLease.sameHome($0.home, requestedHome) }) else {
                 throw refused("no_lease_at_home", "\(requestedHome) holds no lease; use lease for its first account.")
+            }
+            if let expectedLeaseID, current.leaseID != expectedLeaseID {
+                throw refused("lease_changed", "\(requestedHome) now holds a different lease than the one confirmed; review it again.")
             }
             guard current.holder == holder else {
                 throw refused("holder_mismatch", "\(current.home) is leased to \(current.holder); only that holder swaps its account.")

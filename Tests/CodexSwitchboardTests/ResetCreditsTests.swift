@@ -54,6 +54,26 @@ final class ResetCreditsTests: XCTestCase {
         XCTAssertEqual(list.totalEarnedCount, 7)
     }
 
+    func testListLoadsWithoutResetTypeOrAvailableCount() async throws {
+        ResetMockURLProtocol.handler = { request in
+            Self.response(request, json: ["credits": [["id": "untyped", "status": "available"]]])
+        }
+        let list = try await service().list(profileKey: "fixture", isLeased: false)
+        XCTAssertNil(list.availableCount)
+        XCTAssertEqual(list.available.map(\.id), ["untyped"])
+        XCTAssertEqual(list.available.first?.resetType, "unknown")
+    }
+
+    @MainActor
+    func testQuotaSummaryShowsOnlyRealWindows() {
+        let weekly = ResetTestFixtures.account(quotaWindows: [
+            QuotaWindow(kind: .weekly, usedPercent: 73, resetSeconds: 86400, durationSeconds: 604800),
+        ])
+        XCTAssertEqual(ResetCreditsContent(account: weekly, state: .loading).quotaSummary, "Weekly: 27% free")
+        let empty = ResetTestFixtures.account(quotaWindows: [])
+        XCTAssertEqual(ResetCreditsContent(account: empty, state: .loading).quotaSummary, "")
+    }
+
     @MainActor
     func testConsumeHeadersBodyRetryAndNewConfirmation() async throws {
         let recorder = ResetRequestRecorder()
@@ -281,9 +301,9 @@ final class ResetCreditsTests: XCTestCase {
         let noExpiry = try XCTUnwrap(list.available.first { $0.id == "no-expiry" })
         let date = try XCTUnwrap(expiring.expiresAt).formatted(date: .abbreviated, time: .shortened)
         XCTAssertEqual(ResetConfirmation(credit: expiring, requestID: UUID()).message(email: "owner@example.invalid"),
-                       "Use “Earned reset” (expires \(date)) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
+                       "Use “Earned reset” (expires \(date)) on owner@example.invalid? It restores the 5-hour limit, the weekly limit or both. The reset is used up.")
         XCTAssertEqual(ResetConfirmation(credit: noExpiry, requestID: UUID()).message(email: "owner@example.invalid"),
-                       "Use “Usage limit reset” (no expiry) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
+                       "Use “Usage limit reset” (no expiry) on owner@example.invalid? It restores the 5-hour limit, the weekly limit or both. The reset is used up.")
     }
 
     func testUnauthorizedAndMissingTokenNeverRefresh() async throws {
@@ -407,8 +427,8 @@ private final class ResetRequestRecorder: @unchecked Sendable {
 }
 
 enum ResetTestFixtures {
-    static func account(resets: Int? = 2, email: String = "owner@example.invalid") -> Account {
-        Account(id: email + "|fixture-account", profileKey: "fixture", email: email, workspace: "Personal", plan: "pro", sessionFree: 0, weeklyFree: 15, sessionResetSeconds: 3600, weeklyResetSeconds: 86400, planRenewalDate: nil, hasError: false, errorMessage: nil, resetCreditsAvailable: resets)
+    static func account(resets: Int? = 2, email: String = "owner@example.invalid", quotaWindows: [QuotaWindow]? = nil) -> Account {
+        Account(id: email + "|fixture-account", profileKey: "fixture", email: email, workspace: "Personal", plan: "pro", sessionFree: 0, weeklyFree: 15, sessionResetSeconds: 3600, weeklyResetSeconds: 86400, quotaWindows: quotaWindows, planRenewalDate: nil, hasError: false, errorMessage: nil, resetCreditsAvailable: resets)
     }
     static let listJSON: [String: Any] = ["available_count": 4, "total_earned_count": 7, "credits": [
         ["id": "unknown", "reset_type": "both", "status": "mystery", "granted_at": "bad-date"],

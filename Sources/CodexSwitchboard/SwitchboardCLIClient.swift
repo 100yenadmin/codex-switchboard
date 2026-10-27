@@ -114,7 +114,7 @@ struct SwitchboardCLIClient: @unchecked Sendable {
         let _: ActionReceipt = try read(ActionReceipt.self, arguments: ["return", "--profile-key", lease.handle, "--home", lease.home, "--json"])
     }
     func swapLease(_ lease: AppLease, to account: AppLeaseAccount) throws {
-        let _: ActionReceipt = try read(ActionReceipt.self, arguments: ["swap-lease", "--home", lease.home, "--holder", lease.holder, "--profile-key", account.handle, "--json"])
+        let _: ActionReceipt = try read(ActionReceipt.self, arguments: ["swap-lease", "--home", lease.home, "--holder", lease.holder, "--profile-key", account.handle, "--expect-lease-id", lease.leaseID, "--json"])
     }
 
     private struct ActionReceipt: Decodable { let home: String }

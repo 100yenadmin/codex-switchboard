@@ -125,9 +125,13 @@ All sensitive files are written with `0600` permissions. Removal actions create 
 The app uses your local Codex/OpenAI auth tokens to query:
 
 - `https://chatgpt.com/backend-api/codex/usage`
+- `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`
+- `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`
 - `https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27`
 - `https://auth.openai.com/oauth/authorize`
 - `https://auth.openai.com/oauth/token`
+
+The app spends a usage-limit reset only after the owner confirms it.
 
 These are not official public APIs and may change without notice.
 
