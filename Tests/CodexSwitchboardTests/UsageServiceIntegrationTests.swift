@@ -8,6 +8,45 @@ final class UsageServiceIntegrationTests: XCTestCase {
         super.tearDown()
     }
 
+    @MainActor
+    func testUsagePublishesAndSavesBeforeBlockedLeaseRead() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("usage-publish-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        MockURLProtocol.handler = { request in
+            request.url?.path == "/backend-api/wham/usage"
+                ? Self.healthyUsageResponse(request) : Self.response(request, json: ["accounts": [:]])
+        }
+        let started = expectation(description: "CLI read started after snapshot save")
+        let finished = expectation(description: "CLI status read finished")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let client = SwitchboardCLIClient(executableURL: URL(fileURLWithPath: "/fixture/cli"), storageRoot: { root }) { _, args, environment, _ in
+            let snapshot = AccountSnapshotStore.load(storageRootURL: URL(fileURLWithPath: environment["CODEX_SWITCHBOARD_APP_SUPPORT"]!))
+            XCTAssertEqual(snapshot?.accounts.first?.profileKey, "profile-weekly")
+            XCTAssertEqual(snapshot?.accounts.first?.weeklyFree, 80)
+            if args.first == "leases" {
+                started.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 10), .success)
+                return .init(status: 0, stdout: LeaseTestFixtures.leasesJSON, stderr: "")
+            }
+            finished.fulfill()
+            return .init(status: 0, stdout: LeaseTestFixtures.statusJSON, stderr: "")
+        }
+        let leases = LeasesViewModel(client: client)
+        var published: [Account] = []
+        await UsageViewModel.refreshUsageThenLeases(service: makeService(tokenUpdate: TokenUpdateRecorder()), leases: leases) { result in
+            published = result
+            AccountSnapshotStore.save(accounts: result, lastRefresh: Date(), storageRootURL: root)
+        }
+        await fulfillment(of: [started], timeout: 5)
+        XCTAssertEqual(published.first?.profileKey, "profile-weekly")
+        XCTAssertEqual(published.first?.weeklyFree, 80)
+        XCTAssertTrue(leases.isRefreshing, "Usage must be published while the CLI runner is blocked")
+        release.signal()
+        await fulfillment(of: [finished], timeout: 5)
+    }
+
     func testExpiredAccessRefreshesOncePersistsRotationAndRetriesUsage() async throws {
         let recorder = RequestRecorder()
         let tokenUpdate = TokenUpdateRecorder()
@@ -446,7 +485,9 @@ final class UsageServiceIntegrationTests: XCTestCase {
                     return leasedProfileKeys.contains(profileKey) ? .leased : .granted
                 },
                 release: { _ in }
-            )
+            ),
+            cacheLoader: { [:] },
+            cacheSaver: { _ in }
         )
     }
 

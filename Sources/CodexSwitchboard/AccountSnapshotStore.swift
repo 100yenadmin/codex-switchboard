@@ -8,11 +8,8 @@ enum AccountSnapshotStore {
         var accounts: [Account]
     }
 
-    private static var url: URL {
-        AppStorage.rootURL.appendingPathComponent("accounts-snapshot.json")
-    }
-
-    static func load() -> (accounts: [Account], lastRefresh: Date?)? {
+    static func load(storageRootURL: URL = AppStorage.rootURL) -> (accounts: [Account], lastRefresh: Date?)? {
+        let url = storageRootURL.appendingPathComponent("accounts-snapshot.json")
         guard let data = try? Data(contentsOf: url) else { return nil }
         let dec = JSONDecoder()
         guard let p = try? dec.decode(Payload.self, from: data), !p.accounts.isEmpty else { return nil }
@@ -20,7 +17,8 @@ enum AccountSnapshotStore {
         return (p.accounts, date)
     }
 
-    static func save(accounts: [Account], lastRefresh: Date?) {
+    static func save(accounts: [Account], lastRefresh: Date?, storageRootURL: URL = AppStorage.rootURL) {
+        let url = storageRootURL.appendingPathComponent("accounts-snapshot.json")
         let p = Payload(
             lastRefreshEpoch: lastRefresh.map { $0.timeIntervalSince1970 },
             accounts: accounts

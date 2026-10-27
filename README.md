@@ -26,6 +26,8 @@
 
 **Codex Switchboard** helps you track OpenAI Codex usage, monitor quota reset windows, and manage multiple Codex accounts and workspaces directly from your Mac menu bar.
 
+The app shows leased and reserved accounts and a collapsible Leases panel with holder status, return and swap actions through the bundled CLI. Earned usage-limit resets appear beside each account; choose “Usage limit resets…” from its context menu to inspect them and explicitly confirm using one. Only the owner spends resets, and expired sign-ins must be refreshed through the existing usage flow.
+
 - View best-effort Codex quota and usage across all your accounts
 - Group accounts by workspace/team
 - Instantly see which account is active
@@ -123,9 +125,13 @@ All sensitive files are written with `0600` permissions. Removal actions create 
 The app uses your local Codex/OpenAI auth tokens to query:
 
 - `https://chatgpt.com/backend-api/codex/usage`
+- `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`
+- `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume`
 - `https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27`
 - `https://auth.openai.com/oauth/authorize`
 - `https://auth.openai.com/oauth/token`
+
+The app spends a usage-limit reset only after the owner confirms it.
 
 These are not official public APIs and may change without notice.
 

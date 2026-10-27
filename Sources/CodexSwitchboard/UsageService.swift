@@ -1,5 +1,6 @@
 import CodexSwitchboardCore
 import Foundation
+import CoreFoundation
 
 /// Fetches best-effort Codex usage data from chatgpt.com.
 final class UsageService: @unchecked Sendable {
@@ -15,13 +16,15 @@ final class UsageService: @unchecked Sendable {
         _ expiresAt: Int
     ) throws -> Void
 
-    private let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    static let requestUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     private let oauthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
     private let refreshedAccessTokenKey = "__codex_switchboard_access_token"
     private let session: URLSession
     private let profileLoader: () -> AccountProfileCollection
     private let tokenUpdater: TokenUpdater
+    private let cacheLoader: () -> [String: String]
+    private let cacheSaver: ([String: String]) -> Void
     private let refreshGate: RefreshGate
     private static let refreshFailedError = "Refresh failed - re-login required"
     private static let refreshTemporarilyUnavailableError = "Refresh temporarily unavailable"
@@ -101,8 +104,12 @@ final class UsageService: @unchecked Sendable {
                 }
             }
         },
-        refreshGate: RefreshGate = .live
+        refreshGate: RefreshGate = .live,
+        cacheLoader: @escaping () -> [String: String] = TeamNameCacheStore.load,
+        cacheSaver: @escaping ([String: String]) -> Void = TeamNameCacheStore.save
     ) {
+        self.cacheLoader = cacheLoader
+        self.cacheSaver = cacheSaver
         self.session = session
         self.profileLoader = profileLoader
         self.tokenUpdater = tokenUpdater
@@ -255,7 +262,7 @@ final class UsageService: @unchecked Sendable {
             }
         }
 
-        var teamNames = TeamNameCacheStore.load()
+        var teamNames = cacheLoader()
         let workspaceNamedAccountIDs = workspaceNamedAccountIDs(
             validKeys: validKeys,
             profiles: profiles,
@@ -284,7 +291,7 @@ final class UsageService: @unchecked Sendable {
                     resolvedNames[aid] = name
                 }
             }
-            TeamNameCacheStore.save(resolvedNames)
+            cacheSaver(resolvedNames)
         }
 
         // Build Account list
@@ -361,7 +368,8 @@ final class UsageService: @unchecked Sendable {
                 hasError: !hasUsage || quotaWindows.isEmpty,
                 errorMessage: usageError
                     ?? (rl == nil ? "Codex usage unavailable" : nil)
-                    ?? (quotaWindows.isEmpty ? "No quota windows reported" : nil)
+                    ?? (quotaWindows.isEmpty ? "No quota windows reported" : nil),
+                resetCreditsAvailable: hasUsage && !quotaWindows.isEmpty ? Self.resetCreditsAvailable(from: usage) : nil
             ))
         }
         applyWorkspacePlanDates(to: &accounts)
@@ -372,6 +380,14 @@ final class UsageService: @unchecked Sendable {
 
     static func dedupID(email: String, accountID: String, profileKey: String) -> String {
         "\(email.lowercased())|\(accountID.isEmpty ? profileKey : accountID)"
+    }
+
+    static func resetCreditsAvailable(from data: [String: Any]) -> Int? {
+        guard let credits = data["rate_limit_reset_credits"] as? [String: Any],
+              let value = credits["available_count"] as? NSNumber,
+              CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite else { return nil }
+        return Int(max(0, min(Double(Int.max - 1024), value.doubleValue)))
     }
 
     static func quotaWindows(from data: [String: Any]) -> [QuotaWindow] {
@@ -656,7 +672,7 @@ final class UsageService: @unchecked Sendable {
         }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.setValue("Bearer \(token)",   forHTTPHeaderField: "Authorization")
-        req.setValue(ua,                  forHTTPHeaderField: "User-Agent")
+        req.setValue(Self.requestUserAgent,                  forHTTPHeaderField: "User-Agent")
         req.setValue("application/json",  forHTTPHeaderField: "Accept")
         req.setValue("https://chatgpt.com",  forHTTPHeaderField: "Origin")
         req.setValue("https://chatgpt.com/", forHTTPHeaderField: "Referer")

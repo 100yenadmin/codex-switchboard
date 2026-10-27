@@ -11,6 +11,8 @@ Use the local `codex-switchboard` CLI to inspect Codex Desktop/CLI auth surfaces
 
 ## Required Rules
 
+Agents never use a usage-limit reset; only the owner does, from the app.
+
 - Use only local CLI commands; do not read or print raw `~/.codex/auth.json` or captured profile auth files.
 - Name accounts by their email and handle (`acct_` plus 12 hex digits). Agents may print emails and handles, never tokens, account ids, raw auth files, profile keys, or another lane's holder name: pipe every `--json` command through a `jq` that keeps only the fields shown here.
 - Swap the main CLI with `codex-logins.py swap`, never with a raw `switch` or a live `autoswap run-once`. Before any switch you were asked to make to one named account, run `codex-logins.py check-switch` on it and stop on any nonzero exit.

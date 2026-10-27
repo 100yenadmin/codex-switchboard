@@ -26,17 +26,37 @@ enum TimedProcessRunner {
         _ arguments: [String],
         timeout: TimeInterval? = nil
     ) throws -> String {
+        let result = try runResult(launchPath, arguments, timeout: timeout)
+        guard result.status == 0 else {
+            throw TimedProcessRunnerError.failed(command: ([launchPath] + arguments).joined(separator: " "), status: result.status, output: result.stdout + result.stderr)
+        }
+        return result.stdout + result.stderr
+    }
+
+    struct Result {
+        let status: Int32
+        let stdout: String
+        let stderr: String
+    }
+
+    static func runResult(
+        _ launchPath: String, _ arguments: [String],
+        environment: [String: String]? = nil, timeout: TimeInterval? = nil
+    ) throws -> Result {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = arguments
+        process.environment = environment
         process.standardInput = FileHandle.nullDevice
 
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = pipe
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
 
         let outputLock = NSLock()
         var collected = Data()
+        var collectedError = Data()
         let readGroup = DispatchGroup()
 
         // Start the drain only once the child exists: a failed launch would otherwise leave the
@@ -48,6 +68,15 @@ enum TimedProcessRunner {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             outputLock.lock()
             collected = data
+            outputLock.unlock()
+            readGroup.leave()
+        }
+
+        readGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            outputLock.lock()
+            collectedError = data
             outputLock.unlock()
             readGroup.leave()
         }
@@ -74,16 +103,9 @@ enum TimedProcessRunner {
         _ = readGroup.wait(timeout: .now() + 2)
         outputLock.lock()
         let output = String(data: collected, encoding: .utf8) ?? ""
+        let errorOutput = String(data: collectedError, encoding: .utf8) ?? ""
         outputLock.unlock()
-
-        if process.terminationStatus != 0 {
-            throw TimedProcessRunnerError.failed(
-                command: command,
-                status: process.terminationStatus,
-                output: output
-            )
-        }
-        return output
+        return Result(status: process.terminationStatus, stdout: output, stderr: errorOutput)
     }
 
     private static func waitForExit(_ process: Process, within timeout: TimeInterval) -> Bool {
