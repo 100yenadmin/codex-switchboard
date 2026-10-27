@@ -996,7 +996,8 @@ private final class CLIAccountStore {
 
     /// Status stays readable when the lease store is not; every writer re-reads it and fails closed.
     /// Emails come from accounts.json, the field `--profile-key` matches, so `status` and the tools that read it
-    /// name accounts the way Switchboard resolves them.
+    /// name accounts the way Switchboard resolves them. An account with no stored email shows none: the snapshot's
+    /// fallback can be another account's email or an account id.
     func accounts() -> [AccountPayload] {
         let leases = (try? paths.leaseStore.load()) ?? []
         let snapshot = snapshotAccounts() ?? []
@@ -1004,9 +1005,7 @@ private final class CLIAccountStore {
         return (snapshot.isEmpty ? profileFallbackAccounts() : snapshot).map { account in
             var account = account
             account.handle = CodexAccountHandle.handle(for: account.profileKey)
-            if let email = emails[account.profileKey] {
-                account.email = email
-            }
+            account.email = emails[account.profileKey] ?? ""
             if let lease = leases.first(where: { $0.profileKey == account.profileKey }) {
                 account.leased = true
                 account.leaseHolder = lease.holder

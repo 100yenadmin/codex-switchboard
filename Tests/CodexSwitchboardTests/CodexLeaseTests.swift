@@ -193,6 +193,20 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual((listed.json["leases"] as? [[String: Any]])?.first?["email"] as? String, "new@example.invalid")
     }
 
+    func testStatusShowsOnlyStoredEmails() throws {
+        // B has no stored email and F stores B's old email, so only F may show it: --profile-key resolves it to F.
+        try fixture.setEmail("", for: "profile-b")
+        try fixture.setEmail("b@example.invalid", for: "profile-f")
+        let status = fixture.run(["status", "--json"])
+        let accounts = status.json["accounts"] as? [[String: Any]] ?? []
+        let emailOf = { (key: String) in accounts.first { $0["profile_key"] as? String == key }?["email"] as? String }
+        XCTAssertEqual(emailOf("profile-b"), "")
+        XCTAssertEqual(emailOf("profile-f"), "b@example.invalid")
+        let resolved = fixture.run(["resolve", "--profile-key", "b@example.invalid", "--json"])
+        XCTAssertEqual(resolved.json["handle"] as? String, CodexAccountHandle.handle(for: "profile-f"))
+        XCTAssertFalse(status.text.contains("acct-b"))
+    }
+
     func testExclusionByEmailAlsoMatchesTheSnapshotEmail() throws {
         let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
         XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode, 0)
