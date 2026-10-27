@@ -1669,7 +1669,7 @@ final class CodexLeaseTests: XCTestCase {
 
 /// A fake machine: a home whose `.codex` is signed in to account A, Switchboard storage holding
 /// accounts A, K and B (paid) and F (free), and a fake `codex` on PATH so the CLI surface is detected.
-private struct LeaseFixture {
+struct LeaseFixture {
     let root: URL
     let home: URL
     let appSupport: URL

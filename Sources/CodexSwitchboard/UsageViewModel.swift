@@ -46,6 +46,7 @@ final class UsageViewModel: ObservableObject {
 
     // MARK: - Internals
 
+    let leases = LeasesViewModel()
     private let service = UsageService()
     private let captureService = CodexAccountCaptureService()
     private let switchService = CodexAccountSwitchService()
@@ -230,7 +231,9 @@ final class UsageViewModel: ObservableObject {
         refreshCodexAvailability()
 
         Task {
+            async let leaseRefresh: Void = leases.refresh()
             let result = await service.loadAll()
+            await leaseRefresh
             accounts = result
             let now = Date()
             lastRefresh = now

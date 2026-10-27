@@ -74,6 +74,7 @@ struct Account: Identifiable, Equatable, Codable {
     let weeklyResetSeconds: Double
     /// Nil means a pre-window-model snapshot. An empty array means the current response had no windows.
     let quotaWindows: [QuotaWindow]?
+    var resetCreditsAvailable: Int?
     var planRenewalDate: Date?
     let hasError: Bool
     let errorMessage: String?
@@ -91,8 +92,10 @@ struct Account: Identifiable, Equatable, Codable {
         quotaWindows: [QuotaWindow]? = nil,
         planRenewalDate: Date?,
         hasError: Bool,
-        errorMessage: String?
+        errorMessage: String?,
+        resetCreditsAvailable: Int? = nil
     ) {
+        self.resetCreditsAvailable = resetCreditsAvailable
         self.id = id
         self.profileKey = profileKey
         self.email = email

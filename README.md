@@ -26,6 +26,8 @@
 
 **Codex Switchboard** helps you track OpenAI Codex usage, monitor quota reset windows, and manage multiple Codex accounts and workspaces directly from your Mac menu bar.
 
+The app shows leased and reserved accounts and a collapsible Leases panel with holder status, return and swap actions through the bundled CLI. Earned usage-limit resets appear beside each account; choose “Usage limit resets…” from its context menu to inspect them and explicitly confirm using one. Only the owner spends resets, and expired sign-ins must be refreshed through the existing usage flow.
+
 - View best-effort Codex quota and usage across all your accounts
 - Group accounts by workspace/team
 - Instantly see which account is active

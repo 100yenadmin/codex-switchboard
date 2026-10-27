@@ -446,7 +446,9 @@ final class UsageServiceIntegrationTests: XCTestCase {
                     return leasedProfileKeys.contains(profileKey) ? .leased : .granted
                 },
                 release: { _ in }
-            )
+            ),
+            cacheLoader: { [:] },
+            cacheSaver: { _ in }
         )
     }
 

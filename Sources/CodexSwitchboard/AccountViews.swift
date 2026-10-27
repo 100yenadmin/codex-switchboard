@@ -3,14 +3,44 @@ import AppKit
 
 struct AccountListView: View {
     @ObservedObject var vm: UsageViewModel
+    @ObservedObject private var leases: LeasesViewModel
+    @State private var leasesCollapsed = false
+    @State private var resetAccount: Account?
+
+    init(vm: UsageViewModel) {
+        self.vm = vm
+        self.leases = vm.leases
+    }
 
     var body: some View {
         listBody
+            .sheet(item: $resetAccount) { account in
+                ResetCreditsSheet(model: ResetCreditsViewModel(
+                    account: account,
+                    isLeased: { leases.status(for: account)?.leased == true },
+                    refreshUsage: { vm.refresh() }
+                ), account: vm.accounts.first { $0.id == account.id } ?? account)
+            }
+            .alert(item: $leases.pendingAction) { action in
+                Alert(title: Text(action.target == nil ? "Return lease" : "Swap lease"),
+                      message: Text(action.confirmation),
+                      primaryButton: .default(Text(action.target == nil ? "Return lease" : "Swap lease")) {
+                          Task { await leases.perform(action) }
+                      }, secondaryButton: .cancel())
+            }
     }
 
     @ViewBuilder
     private var listBody: some View {
         VStack(spacing: 0) {
+            LeasesSection(leases: leases.leases, accounts: leases.accounts,
+                          isCollapsed: leasesCollapsed, isBusy: leases.isBusy || leases.isRefreshing,
+                          unavailableReason: leases.unavailableReason,
+                          toggle: { leasesCollapsed.toggle() }, requestAction: { leases.pendingAction = $0 })
+            if let message = leases.error {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 12).padding(.vertical, 4)
+            }
             if vm.groupByWorkspace {
                 if !vm.priorityAccounts.isEmpty {
                     PrioritySeparatorHeader(count: vm.priorityAccounts.count)
@@ -94,24 +124,30 @@ struct AccountListView: View {
 
     @ViewBuilder
     private func accountRow(for acc: Account) -> some View {
-        AccountCompactRow(
-            account: acc,
-            needsRelogin: vm.needsRelogin(acc),
-            isRelogging: vm.isRelogging(acc),
-            isReloginBlocked: vm.hasPendingAccountAction && !vm.isRelogging(acc),
-            isSwitchingToCodex: vm.isSwitchingToCodex(acc),
-            isActiveInCodex: vm.isActiveInCodex(acc),
-            showsCodexControls: vm.canShowDesktopSwitchControls,
-            isSwitchBlocked: vm.hasPendingAccountAction && !vm.isSwitchingToCodex(acc),
-            isRemoving: vm.isRemoving(acc),
-            isRemoveBlocked: vm.hasPendingAccountAction && !vm.isRemoving(acc),
-            informationMode: vm.informationMode,
-            resetTextScale: vm.resetTextScale,
-            relogin: { vm.relogin(acc) },
-            cancelRelogin: { vm.cancelRelogin() },
-            switchToCodex: { vm.switchCodex(to: acc) },
-            removeAccount: { vm.removeAccount(acc) }
-        )
+        if vm.listDensity == .expanded {
+            AccountRow(account: acc, leaseStatus: leases.status(for: acc), showResets: { resetAccount = acc })
+        } else {
+            AccountCompactRow(
+                account: acc,
+                needsRelogin: vm.needsRelogin(acc),
+                isRelogging: vm.isRelogging(acc),
+                isReloginBlocked: vm.hasPendingAccountAction && !vm.isRelogging(acc),
+                isSwitchingToCodex: vm.isSwitchingToCodex(acc),
+                isActiveInCodex: vm.isActiveInCodex(acc),
+                showsCodexControls: vm.canShowDesktopSwitchControls,
+                isSwitchBlocked: vm.hasPendingAccountAction && !vm.isSwitchingToCodex(acc),
+                isRemoving: vm.isRemoving(acc),
+                isRemoveBlocked: vm.hasPendingAccountAction && !vm.isRemoving(acc),
+                informationMode: vm.informationMode,
+                resetTextScale: vm.resetTextScale,
+                relogin: { vm.relogin(acc) },
+                cancelRelogin: { vm.cancelRelogin() },
+                switchToCodex: { vm.switchCodex(to: acc) },
+                removeAccount: { vm.removeAccount(acc) },
+                leaseStatus: leases.status(for: acc),
+                showResets: { resetAccount = acc }
+            )
+        }
     }
 }
 
@@ -230,6 +266,8 @@ enum SwapControlVisibility {
 
 struct AccountRow: View {
     let account: Account
+    var leaseStatus: AppLeaseAccount? = nil
+    var showResets: () -> Void = {}
     @State private var hovered = false
 
     private var exhausted: Bool { account.isWeeklyExhausted }
@@ -245,6 +283,7 @@ struct AccountRow: View {
                     .foregroundColor(.primary)
                     .lineLimit(1).truncationMode(.middle)
                 Spacer()
+                AccountBadges(account: account, leaseStatus: leaseStatus, compact: false)
                 WorkspaceChip(ws: account.workspace, compact: false)
             }
             .opacity(exhausted ? 0.5 : 1)
@@ -265,6 +304,9 @@ struct AccountRow: View {
         .background(hovered ? Color.primary.opacity(0.06) : .clear)
         .onHover { hovered = $0 }
         .contextMenu {
+            if account.profileKey != nil {
+                Button("Usage limit resets…", action: showResets)
+            }
             Button("Copy email") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(account.email, forType: .string)
@@ -375,13 +417,16 @@ struct AccountCompactRow: View {
     let cancelRelogin: () -> Void
     let switchToCodex: () -> Void
     let removeAccount: () -> Void
+    var leaseStatus: AppLeaseAccount? = nil
+    var showResets: () -> Void = {}
     @State private var hovered = false
 
     private var exhausted: Bool { account.isWeeklyExhausted }
     private var showsFullInformation: Bool { informationMode == .complete }
     private var showsActionControl: Bool { needsRelogin || isRelogging || isSwitchingToCodex || canShowSwapControl }
     private var resetFontSize: CGFloat { 10 * resetTextScale }
-    private var rowHeight: CGFloat { ceil((showsFullInformation ? 34 : 28) * max(1, min(resetTextScale, 1.6))) }
+    private var hasBadges: Bool { (account.resetCreditsAvailable ?? 0) > 0 || leaseStatus?.leased == true || leaseStatus?.reserved == true }
+    private var rowHeight: CGFloat { ceil((showsFullInformation ? 34 : 28) * max(1, min(resetTextScale, 1.6))) + (hasBadges ? 14 : 0) }
     private var canShowSwapControl: Bool {
         SwapControlVisibility.isAvailable(
             showsCodexControls: showsCodexControls,
@@ -406,12 +451,15 @@ struct AccountCompactRow: View {
             HStack(alignment: .center, spacing: layout.spacing) {
                 leadingAccountControl
 
-                Text(account.email)
-                    .font(.system(size: 11))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(width: layout.emailWidth, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(account.email)
+                        .font(.system(size: 11))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if hasBadges { AccountBadges(account: account, leaseStatus: leaseStatus, compact: true) }
+                }
+                .frame(width: layout.emailWidth, alignment: .leading)
 
                 if showsFullInformation {
                     WorkspaceChip(ws: account.workspace, compact: true)
@@ -459,6 +507,9 @@ struct AccountCompactRow: View {
         .contentShape(Rectangle())
         .onHover { hovered = $0 }
         .contextMenu {
+            if account.profileKey != nil {
+                Button("Usage limit resets…", action: showResets)
+            }
             Button("Copy email") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(account.email, forType: .string)
@@ -763,6 +814,7 @@ private extension AccountCompactRow {
     func compactQuota(label: String, pct: Double, gray: Bool, width: CGFloat) -> some View {
         HStack(spacing: 4) {
             Text(label)
+                .fixedSize()
                 .font(.system(size: 9, weight: .bold))
                 .foregroundColor(.secondary)
                 .frame(width: 7, alignment: .leading)
@@ -885,5 +937,31 @@ struct BarRow: View {
             }
         }
         .frame(height: 14)
+    }
+}
+
+/// Badges live inside the existing identity column; quota and action widths do not move.
+struct AccountBadges: View {
+    let account: Account
+    let leaseStatus: AppLeaseAccount?
+    let compact: Bool
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if leaseStatus?.leased == true {
+                WorkspaceChip(ws: "LEASED", compact: compact).help(leaseStatus?.leaseHolder ?? "Leased")
+            }
+            if leaseStatus?.reserved == true {
+                WorkspaceChip(ws: "RESERVED", compact: compact).help("Reserved login")
+            }
+            if let count = account.resetCreditsAvailable, count > 0 {
+                Label("\(count)", systemImage: "arrow.counterclockwise")
+                    .font(.system(size: compact ? 9 : 11, weight: .medium))
+                    .foregroundColor(Theme.workspaceTextColor(for: "Resets"))
+                    .padding(.horizontal, compact ? 4 : 6).padding(.vertical, compact ? 1 : 2)
+                    .background(Theme.workspaceColor(for: "Resets")).cornerRadius(4)
+                    .help("\(count) usage limit resets available")
+            }
+        }
     }
 }

@@ -17,6 +17,8 @@ CLI to another account when its quota runs out. The full command reference and e
 shows each reserved home's health. The Switchboard CLI shows each account's email beside its handle (`acct_` plus
 12 hex digits). Agents may print emails and handles, never tokens, account ids, profile keys or raw auth files.
 
+The owner can also return or swap a lease from the app, through the same CLI `return` and `swap-lease` commands.
+
 ## Swap the main CLI when its account runs low
 
 ```bash
