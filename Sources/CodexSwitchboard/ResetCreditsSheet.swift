@@ -6,7 +6,7 @@ struct ResetConfirmation: Equatable {
 
     func message(email: String) -> String {
         let expiry = credit.expiresAt.map { "expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "no expiry"
-        return "Use \(credit.displayTitle) (\(expiry)) on \(email)? It restores the 5-hour and weekly limits. The reset is used up."
+        return "Use \u{201C}\(credit.displayTitle)\u{201D} (\(expiry)) on \(email)? It restores the 5-hour and weekly limits. The reset is used up."
     }
 }
 
@@ -27,6 +27,8 @@ final class ResetCreditsViewModel: ObservableObject {
     private let isLeased: () -> Bool
     private let service: ResetCreditsService
     private let refreshUsage: () -> Void
+    /// Set when a consume ended without a definitive answer, so the reset may or may not have been spent.
+    private var spendUnresolved = false
 
     init(account: Account, isLeased: @escaping () -> Bool, service: ResetCreditsService = ResetCreditsService(), refreshUsage: @escaping () -> Void) {
         self.account = account
@@ -48,16 +50,22 @@ final class ResetCreditsViewModel: ObservableObject {
     }
 
     func confirm(_ credit: ResetCredit) {
-        guard !isConsuming else { return }
+        guard !isConsuming, case .loaded = state else { return }
         confirmation = ResetConfirmation(credit: credit, requestID: UUID())
         consumeError = nil
         notice = nil
     }
 
-    func cancel() {
+    func cancel() async {
         guard !isConsuming else { return }
+        let needsReload = spendUnresolved
         confirmation = nil
         consumeError = nil
+        if needsReload {
+            spendUnresolved = false
+            state = .loading
+            await reload()
+        }
     }
 
     // Retry returns to the explicit Use reset button, retaining the original idempotency key.
@@ -70,6 +78,7 @@ final class ResetCreditsViewModel: ObservableObject {
         defer { isConsuming = false }
         do {
             let result = try await service.consume(profileKey: key, isLeased: isLeased(), creditID: pending.credit.id, requestID: pending.requestID)
+            spendUnresolved = false
             confirmation = nil
             notice = result
             switch result {
@@ -80,6 +89,7 @@ final class ResetCreditsViewModel: ObservableObject {
             case .nothingToReset: break
             }
         } catch {
+            spendUnresolved = true
             consumeError = error.localizedDescription
         }
     }
@@ -95,7 +105,7 @@ struct ResetCreditsSheet: View {
         ResetCreditsContent(
             account: account, state: model.state, confirmation: model.confirmation,
             isConsuming: model.isConsuming, notice: model.notice, consumeError: model.consumeError,
-            load: { Task { await model.load() } }, confirm: model.confirm, cancel: model.cancel,
+            load: { Task { await model.load() } }, confirm: model.confirm, cancel: { Task { await model.cancel() } },
             useReset: { Task { await model.useReset() } }, tryAgain: model.tryAgain,
             close: { dismiss() }
         )

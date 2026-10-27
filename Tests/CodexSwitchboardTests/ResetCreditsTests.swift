@@ -58,6 +58,7 @@ final class ResetCreditsTests: XCTestCase {
     func testConsumeHeadersBodyRetryAndNewConfirmation() async throws {
         let recorder = ResetRequestRecorder()
         ResetMockURLProtocol.handler = { request in
+            if request.httpMethod == "GET" { return Self.response(request, json: ResetTestFixtures.listJSON) }
             recorder.append(request)
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.url?.path, "/backend-api/wham/rate-limit-reset-credits/consume")
@@ -73,6 +74,7 @@ final class ResetCreditsTests: XCTestCase {
                                  json: ["code": "nothing_to_reset", "windows_reset": 0])
         }
         let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: {})
+        await model.load()
         let credit = try XCTUnwrap(ResetTestFixtures.list().available.first)
         model.confirm(credit)
         let firstID = try XCTUnwrap(model.confirmation?.requestID)
@@ -108,6 +110,8 @@ final class ResetCreditsTests: XCTestCase {
             }
             var refreshes = 0
             let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: { refreshes += 1 })
+            await model.load()
+            recorder.clear()
             model.confirm(try XCTUnwrap(ResetTestFixtures.list().available.first))
             await model.useReset()
             if ["reset", "already_redeemed"].contains(code) {
@@ -179,15 +183,106 @@ final class ResetCreditsTests: XCTestCase {
         XCTAssertEqual(refreshes, 1)
     }
 
+    @MainActor
+    func testCancelUnresolvedConsumeReloadsBeforeNewConfirmation() async throws {
+        for status in [200, 500] {
+            let started = expectation(description: "cancel reload in flight (\(status))")
+            let release = DispatchSemaphore(value: 0)
+            defer { release.signal() }
+            let recorder = ResetRequestRecorder()
+            ResetMockURLProtocol.handler = { request in
+                recorder.append(request)
+                if request.httpMethod == "POST" {
+                    return Self.response(request, status: status, json: ["code": "unknown"])
+                }
+                if recorder.requests.count == 1 {
+                    return Self.response(request, json: ResetTestFixtures.listJSON)
+                }
+                XCTAssertEqual(request.httpMethod, "GET")
+                XCTAssertEqual(request.url?.path, "/backend-api/wham/rate-limit-reset-credits")
+                started.fulfill()
+                _ = release.wait(timeout: .now() + 5)
+                return Self.response(request, json: ["available_count": 1, "credits": [
+                    ["id": "soon", "reset_type": "both", "status": "redeemed"],
+                    ["id": "remaining", "reset_type": "both", "status": "available"]
+                ]])
+            }
+            let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: {})
+            await model.load()
+            let credit = try XCTUnwrap(ResetTestFixtures.list().available.first)
+            model.confirm(credit)
+            await model.useReset()
+            XCTAssertNotNil(model.consumeError)
+            XCTAssertNotNil(model.confirmation)
+            let cancel = Task { await model.cancel() }
+            await fulfillment(of: [started], timeout: 5)
+            XCTAssertEqual(model.state, .loading)
+            XCTAssertNil(model.consumeError)
+            XCTAssertNil(model.confirmation)
+            model.confirm(credit)
+            XCTAssertNil(model.confirmation, "Cannot start another spend while the list is stale")
+            XCTAssertEqual(recorder.requests.map(\.httpMethod), ["GET", "POST", "GET"])
+            release.signal()
+            await cancel.value
+            guard case .loaded(let list) = model.state else { return XCTFail("Expected refreshed list") }
+            XCTAssertEqual(list.available.map(\.id), ["remaining"])
+            XCTAssertEqual(list.history.map(\.id), [credit.id])
+            model.confirm(try XCTUnwrap(list.available.first))
+            XCTAssertEqual(model.confirmation?.credit.id, "remaining")
+        }
+    }
+
+    @MainActor
+    func testCancelAfterTryAgainStillReloadsUnresolvedSpend() async throws {
+        let recorder = ResetRequestRecorder()
+        ResetMockURLProtocol.handler = { request in
+            recorder.append(request)
+            if request.httpMethod == "POST" {
+                return Self.response(request, json: ["code": "unknown"])
+            }
+            return Self.response(request, json: ResetTestFixtures.listJSON)
+        }
+        let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: {})
+        await model.load()
+        model.confirm(try XCTUnwrap(ResetTestFixtures.list().available.first))
+        await model.useReset()
+        XCTAssertNotNil(model.consumeError)
+        model.tryAgain()
+        XCTAssertNil(model.consumeError)
+        await model.cancel()
+        XCTAssertNil(model.confirmation)
+        XCTAssertEqual(recorder.requests.map(\.httpMethod), ["GET", "POST", "GET"], "The spend is still unresolved, so Cancel reloads")
+        await model.cancel()
+        XCTAssertEqual(recorder.requests.map(\.httpMethod), ["GET", "POST", "GET"], "A second Cancel has nothing unresolved")
+    }
+
+    @MainActor
+    func testCancelWithoutConsumeErrorDoesNotReload() async throws {
+        let recorder = ResetRequestRecorder()
+        ResetMockURLProtocol.handler = { request in
+            recorder.append(request)
+            return Self.response(request, json: ResetTestFixtures.listJSON)
+        }
+        let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: {})
+        await model.load()
+        let loaded = model.state
+        model.confirm(try XCTUnwrap(ResetTestFixtures.list().available.first))
+        await model.cancel()
+        XCTAssertNil(model.confirmation)
+        XCTAssertNil(model.consumeError)
+        XCTAssertEqual(model.state, loaded)
+        XCTAssertEqual(recorder.requests.map(\.httpMethod), ["GET"])
+    }
+
     func testConfirmationNamesCreditAndExpiry() throws {
         let list = try ResetTestFixtures.list()
         let expiring = try XCTUnwrap(list.available.first { $0.id == "late" })
         let noExpiry = try XCTUnwrap(list.available.first { $0.id == "no-expiry" })
         let date = try XCTUnwrap(expiring.expiresAt).formatted(date: .abbreviated, time: .shortened)
         XCTAssertEqual(ResetConfirmation(credit: expiring, requestID: UUID()).message(email: "owner@example.invalid"),
-                       "Use Earned reset (expires \(date)) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
+                       "Use “Earned reset” (expires \(date)) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
         XCTAssertEqual(ResetConfirmation(credit: noExpiry, requestID: UUID()).message(email: "owner@example.invalid"),
-                       "Use Usage limit reset (no expiry) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
+                       "Use “Usage limit reset” (no expiry) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
     }
 
     func testUnauthorizedAndMissingTokenNeverRefresh() async throws {
@@ -215,6 +310,7 @@ final class ResetCreditsTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         let recorder = ResetRequestRecorder()
         ResetMockURLProtocol.handler = { request in
+            if request.httpMethod == "GET" { return Self.response(request, json: ResetTestFixtures.listJSON) }
             recorder.append(request)
             if recorder.requests.count == 1 {
                 started.fulfill()
@@ -224,6 +320,7 @@ final class ResetCreditsTests: XCTestCase {
             return Self.response(request, json: ["code": "nothing_to_reset", "windows_reset": 0])
         }
         let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: {})
+        await model.load()
         let credit = try XCTUnwrap(ResetTestFixtures.list().available.first)
         model.confirm(credit)
         let id = model.confirmation?.requestID
@@ -232,7 +329,7 @@ final class ResetCreditsTests: XCTestCase {
         XCTAssertTrue(model.isConsuming)
         await model.useReset()
         model.confirm(credit)
-        model.cancel()
+        await model.cancel()
         XCTAssertEqual(model.confirmation?.requestID, id)
         release.signal()
         await first.value
