@@ -13,9 +13,11 @@ land on one.
   codex-logins.py swap [--dry-run]                move the main CLI to the best account check-switch allows
 
 check-switch exits: 0 safe; 1 reserved; 2 the registry is missing, cannot be read, or reserves a key Switchboard does
-not list; 3 leased by Switchboard; 4 Switchboard's account or lease state cannot be read. Any nonzero means do not
-switch. K may be a profile key or a Switchboard handle (acct_ + 12 hex). An account that shares its email with a
-reserved or leased one is refused too, since Switchboard can list one seat under two keys.
+not list; 3 leased by Switchboard; 4 Switchboard's account or lease state cannot be read, or K names no account or
+several. Any nonzero means do not switch. K may be a profile key, a Switchboard handle (acct_ + 12 hex) or an email;
+`codex-switchboard resolve` resolves it by the rules lease and switch use, and on exit 0 the handle checked is printed.
+An account that shares its email with a reserved or leased one is refused too, since Switchboard can list one seat
+under two keys.
 
 swap exits: 0 switched (with --dry-run: an account passes); 2 or 4 as for check-switch; 5 no account passes;
 6 Switchboard refused or failed the switch; 7 the switch did not take or cannot be confirmed.
@@ -41,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 REG_DIR = os.path.expanduser("~/.config/codex-logins")
 REG = os.path.join(REG_DIR, "registry.json")
@@ -202,7 +205,8 @@ def handle_for(profile_key):
 
 
 def email_of(account):
-    return str(account.get("email") or "").strip().lower()
+    # NFC, as Swift compares strings by canonical equivalence.
+    return unicodedata.normalize("NFC", str(account.get("email") or "")).strip().lower()
 
 
 def switchboard_state():
@@ -244,9 +248,10 @@ def resolve_handle(given):
     Refusal(4) if Switchboard cannot answer."""
     try:
         r = cs_run("resolve", "--profile-key", given, "--json")
-        d = json.loads(r.stdout)
-    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
         raise Refusal(4, "resolve could not run or printed something that is not text (%s)" % type(e).__name__)
+    try:
+        d = json.loads(r.stdout)
     except ValueError:
         raise Refusal(4, "resolve did not print JSON (exit %d)" % r.returncode)
     if not isinstance(d, dict):
