@@ -359,13 +359,58 @@ noisy = {"version": 1, "logins": [
     {"purpose": "bench", "profile_key": RES, "codex_home": os.path.join(work, "SECRET-home"), "consumer": "SECRET-c",
      "owner": "x@example.invalid", "notes": "SECRET-notes"},
     {"purpose": "x@example.invalid", "profile_key": RES2, "codex_home": "~/SECRET-path"}]}
-got, text, _ = run(["status"], registry=noisy)
-leak = any(sec in text for sec in SECRETS)
-ok = not leak and "bench -> Switchboard #5" in text and "hidden" in text and h(LEASED) in text
+def with_account_ids(d):
+    for a in d["status"]["accounts"]:
+        a["account_id"] = "SECRET-account-id"
+    d["status"]["surfaces"][0]["active_account_id"] = "SECRET-active-id"
+
+
+got, text, _ = run(["status"], registry=noisy, fixture=mut(with_account_ids))
+leak = any(sec in text for sec in ("SECRET-", "x@example.invalid", "holder@example.invalid", "cli:"))
+accounts_shown = all(any("%s %s" % (a["handle"], a["email"]) in line for line in text.splitlines())
+                     for a in BASE["status"]["accounts"])
+ok = not leak and accounts_shown and "bench -> Switchboard #5" in text and "hidden" in text and h(LEASED) in text
 fails += not ok
 total += 1
-print("%s %-72s got %d%s\n%s" % ("PASS" if ok else "FAIL", "status shows labels and handles, never free text", got,
+print("%s %-72s got %d%s\n%s" % ("PASS" if ok else "FAIL", "status shows labels, handles and emails, never free text", got,
                                  "  LEAK" if leak else "", text))
+
+got, text, _ = run(["status"], fixture=mut(lambda d: d["status"]["accounts"][1].update(email="")))
+ok = got == 0 and any(line.split()[1:3] == [h(FREE), "-"] for line in text.splitlines())
+fails += not ok
+total += 1
+print("%s %-72s got %d" % ("PASS" if ok else "FAIL", "status shows a dash for an empty email", got))
+
+def with_unsafe_emails(d):
+    accounts = d["status"]["accounts"]
+    accounts[0].pop("email")
+    for a, email in zip(accounts[1:], (None, "   ", {"a": 1}, "a b@example.invalid",
+                                         "a|b@example.invalid", "a\nb@example.invalid")):
+        a["email"] = email
+
+
+got, text, _ = run(["status"], fixture=mut(with_unsafe_emails))
+rows = text.splitlines()
+expected_emails = ("-", "-", "-", "?", "?", "?", "?")
+safe_emails = all(any(line.split()[1:3] == [a["handle"], email] for line in rows)
+                  for a, email in zip(BASE["status"]["accounts"], expected_emails))
+allowed_starts = ("Switchboard accounts (CLI surface; numbers are Switchboard's list order):",
+                  "Reserved logins (~/.config/codex-logins/registry.json):", "  bench -> Switchboard #5") + tuple(
+                      "  #%d %s " % (i, a["handle"]) for i, a in enumerate(BASE["status"]["accounts"], 1))
+ok = (got == 0 and safe_emails and all(line.startswith(allowed_starts) for line in rows if line)
+      and all(value not in text for value in ("a b@", "a|b@", "a\nb")))
+fails += not ok
+total += 1
+print("%s %-72s got %d" % ("PASS" if ok else "FAIL", "status safely shows missing and unsafe emails", got))
+
+got, text, _ = run(["status"])
+account_lines = [line for line in text.splitlines() if line.startswith("  #")]
+plan_offsets = [line.index(a["plan"], line.index(a["email"]) + len(a["email"]))
+                for line, a in zip(account_lines, BASE["status"]["accounts"])]
+ok = got == 0 and len(account_lines) == len(BASE["status"]["accounts"]) and len(set(plan_offsets)) == 1
+fails += not ok
+total += 1
+print("%s %-72s got %d" % ("PASS" if ok else "FAIL", "status aligns the plan column after emails", got))
 
 # The CLI uses the override untrimmed; a trimmed one would put register's lock on another file.
 os.environ["CODEX_SWITCHBOARD_APP_SUPPORT"] = work + "/spaced "
