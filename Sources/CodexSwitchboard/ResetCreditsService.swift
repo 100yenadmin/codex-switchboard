@@ -70,7 +70,6 @@ enum ResetConsumeOutcome: Equatable {
 
 struct ResetCreditsError: LocalizedError {
     let message: String
-    var definitive = false
     var errorDescription: String? { message }
 }
 
@@ -97,17 +96,17 @@ final class ResetCreditsService: @unchecked Sendable {
     }
 
     func consume(profileKey: String, isLeased: Bool, creditID: String, requestID: UUID) async throws -> ResetConsumeOutcome {
-        let body = try JSONSerialization.data(withJSONObject: ["redeem_request_id": requestID.uuidString, "credit_id": creditID])
+        let body = try JSONSerialization.data(withJSONObject: ["redeem_request_id": requestID.uuidString.lowercased(), "credit_id": creditID])
         let data = try await request(profileKey: profileKey, isLeased: isLeased, suffix: "/consume", body: body)
-        struct Response: Decodable { let code: String; let windows_reset: Int }
+        struct Response: Decodable { let code: String; let windows_reset: Int? }
         guard let response = try? JSONDecoder().decode(Response.self, from: data) else {
             throw ResetCreditsError(message: "Could not read the reset response.")
         }
         switch response.code {
-        case "reset", "already_redeemed": return .reset(response.windows_reset)
+        case "reset", "already_redeemed": return .reset(response.windows_reset ?? 0)
         case "nothing_to_reset": return .nothingToReset
         case "no_credit": return .noCredit
-        default: throw ResetCreditsError(message: "Unknown usage reset response.", definitive: true)
+        default: throw ResetCreditsError(message: "Unknown usage reset response. Try again to check.")
         }
     }
 

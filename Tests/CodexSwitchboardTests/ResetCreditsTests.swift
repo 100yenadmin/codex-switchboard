@@ -85,14 +85,14 @@ final class ResetCreditsTests: XCTestCase {
         XCTAssertEqual(recorder.requests.count, 1, "Try again returns to the Use reset button")
         await model.useReset()
         XCTAssertNil(model.confirmation)
-        XCTAssertEqual(model.notice, ResetConsumeOutcome.nothingToReset.message)
+        XCTAssertEqual(model.notice, .nothingToReset)
         model.confirm(credit)
         XCTAssertNotEqual(model.confirmation?.requestID, firstID)
         await model.useReset()
         let bodies = try recorder.requests.map { try JSONSerialization.jsonObject(with: Self.body($0)) as! [String: String] }
         XCTAssertEqual(Set(bodies[0].keys), ["redeem_request_id", "credit_id"])
         XCTAssertEqual(bodies[0]["credit_id"], credit.id)
-        XCTAssertEqual(bodies[0]["redeem_request_id"], firstID.uuidString)
+        XCTAssertEqual(bodies[0]["redeem_request_id"], firstID.uuidString.lowercased())
         XCTAssertEqual(bodies[0], bodies[1])
         XCTAssertNotEqual(bodies[1]["redeem_request_id"], bodies[2]["redeem_request_id"])
     }
@@ -111,26 +111,83 @@ final class ResetCreditsTests: XCTestCase {
             model.confirm(try XCTUnwrap(ResetTestFixtures.list().available.first))
             await model.useReset()
             if ["reset", "already_redeemed"].contains(code) {
-                XCTAssertEqual(model.notice, "Usage reset (2 limits restored).")
+                XCTAssertEqual(model.notice, .reset(2))
                 XCTAssertEqual(refreshes, 1)
                 XCTAssertEqual(recorder.requests.count, 2)
             } else if code == "no_credit" {
-                XCTAssertEqual(model.notice, "That reset is no longer available.")
+                XCTAssertEqual(model.notice, .noCredit)
                 XCTAssertEqual(refreshes, 0)
                 XCTAssertEqual(recorder.requests.count, 2)
             } else if code == "nothing_to_reset" {
-                XCTAssertEqual(model.notice, ResetConsumeOutcome.nothingToReset.message)
+                XCTAssertEqual(model.notice, .nothingToReset)
                 XCTAssertEqual(recorder.requests.count, 1)
             } else {
                 XCTAssertNotNil(model.consumeError)
                 XCTAssertNil(model.notice)
             }
-            XCTAssertNil(model.confirmation)
             if code == "unknown" {
-                guard case .error = model.state else { return XCTFail("Unknown definitive code must show an error") }
-            }
+                XCTAssertNotNil(model.confirmation)
+                XCTAssertEqual(model.consumeError, "Unknown usage reset response. Try again to check.")
+            } else { XCTAssertNil(model.confirmation) }
             XCTAssertFalse(model.isConsuming)
         }
+    }
+
+    func testConsumeDefaultsMissingWindowsResetToZero() async throws {
+        let cases: [(String, ResetConsumeOutcome)] = [
+            ("reset", .reset(0)), ("already_redeemed", .reset(0)),
+            ("nothing_to_reset", .nothingToReset), ("no_credit", .noCredit)
+        ]
+        for (code, expected) in cases {
+            ResetMockURLProtocol.handler = { request in Self.response(request, json: ["code": code]) }
+            let result = try await service().consume(profileKey: "fixture", isLeased: false, creditID: "soon", requestID: UUID())
+            XCTAssertEqual(result, expected, code)
+        }
+    }
+
+    @MainActor
+    func testUnknownCodeRetryRetainsConfirmationAndRequestID() async throws {
+        let recorder = ResetRequestRecorder()
+        ResetMockURLProtocol.handler = { request in
+            recorder.append(request)
+            if request.httpMethod == "GET" { return Self.response(request, json: ResetTestFixtures.listJSON) }
+            return Self.response(request, json: ["code": recorder.requests.count == 1 ? "unknown" : "already_redeemed"])
+        }
+        var refreshes = 0
+        let model = ResetCreditsViewModel(account: ResetTestFixtures.account(), isLeased: { false }, service: service(), refreshUsage: { refreshes += 1 })
+        await model.load()
+        recorder.clear()
+        model.confirm(try XCTUnwrap(ResetTestFixtures.list().available.first))
+        let pending = model.confirmation
+        await model.useReset()
+        XCTAssertEqual(model.confirmation, pending)
+        XCTAssertEqual(model.consumeError, "Unknown usage reset response. Try again to check.")
+        guard case .loaded = model.state else { return XCTFail("Keep the list and confirmation available for retry") }
+        model.tryAgain()
+        XCTAssertNil(model.consumeError)
+        XCTAssertEqual(model.confirmation, pending)
+        XCTAssertEqual(recorder.requests.count, 1)
+        await model.useReset()
+        let bodies = try recorder.requests.filter { $0.httpMethod == "POST" }.map {
+            try JSONSerialization.jsonObject(with: Self.body($0)) as! [String: String]
+        }
+        XCTAssertEqual(bodies.count, 2)
+        XCTAssertEqual(bodies[0], bodies[1])
+        XCTAssertEqual(bodies[0]["redeem_request_id"], pending?.requestID.uuidString.lowercased())
+        XCTAssertNil(model.confirmation)
+        XCTAssertEqual(model.notice, .reset(0))
+        XCTAssertEqual(refreshes, 1)
+    }
+
+    func testConfirmationNamesCreditAndExpiry() throws {
+        let list = try ResetTestFixtures.list()
+        let expiring = try XCTUnwrap(list.available.first { $0.id == "late" })
+        let noExpiry = try XCTUnwrap(list.available.first { $0.id == "no-expiry" })
+        let date = try XCTUnwrap(expiring.expiresAt).formatted(date: .abbreviated, time: .shortened)
+        XCTAssertEqual(ResetConfirmation(credit: expiring, requestID: UUID()).message(email: "owner@example.invalid"),
+                       "Use Earned reset (expires \(date)) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
+        XCTAssertEqual(ResetConfirmation(credit: noExpiry, requestID: UUID()).message(email: "owner@example.invalid"),
+                       "Use Usage limit reset (no expiry) on owner@example.invalid? It restores the 5-hour and weekly limits. The reset is used up.")
     }
 
     func testUnauthorizedAndMissingTokenNeverRefresh() async throws {
@@ -248,6 +305,7 @@ private final class ResetRequestRecorder: @unchecked Sendable {
     private var stored: [URLRequest] = []
     var requests: [URLRequest] { lock.lock(); defer { lock.unlock() }; return stored }
     func append(_ request: URLRequest) { lock.lock(); defer { lock.unlock() }; stored.append(request) }
+    func clear() { lock.lock(); defer { lock.unlock() }; stored = [] }
 }
 
 enum ResetTestFixtures {

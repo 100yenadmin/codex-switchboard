@@ -105,12 +105,47 @@ final class SwitchboardCLIClientTests: XCTestCase {
         XCTAssertEqual(model.leases.count, 1)
         XCTAssertEqual(model.accounts.count, 1)
         await model.perform(.init(lease: lease, target: nil))
-        XCTAssertEqual(model.error, "The holder is running")
+        XCTAssertEqual(model.actionError, "The holder is running")
+        XCTAssertNil(model.error)
         XCTAssertEqual(calls.calls.map { $0[0] }, ["leases", "status", "return", "leases", "status"])
         XCTAssertFalse(model.isBusy)
         calls.clear()
         await model.perform(.init(lease: lease, target: LeaseTestFixtures.account()))
         XCTAssertEqual(calls.calls.map { $0[0] }, ["swap-lease", "leases", "status"])
+    }
+
+    @MainActor
+    func testActionRefusalSurvivesConcurrentSuccessfulRefresh() async {
+        let started = expectation(description: "lease read in flight")
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let calls = CLIRequestRecorder()
+        let client = SwitchboardCLIClient(executableURL: URL(fileURLWithPath: "/fixture/cli"), storageRoot: { URL(fileURLWithPath: "/fixture/storage") }) { _, args, _, _ in
+            calls.append(args)
+            if args.first == "leases" {
+                if calls.calls.count == 1 {
+                    started.fulfill()
+                    XCTAssertEqual(release.wait(timeout: .now() + 10), .success)
+                }
+                return .init(status: 0, stdout: LeaseTestFixtures.leasesJSON, stderr: "")
+            }
+            if args.first == "status" { return .init(status: 0, stdout: LeaseTestFixtures.statusJSON, stderr: "") }
+            return .init(status: 2, stdout: "{\"error\":\"holder_running\",\"message\":\"The holder is running\"}", stderr: "")
+        }
+        let model = LeasesViewModel(client: client)
+        let refresh = Task { await model.refresh() }
+        await fulfillment(of: [started], timeout: 5)
+        XCTAssertTrue(model.isRefreshing)
+        await model.perform(.init(lease: LeaseTestFixtures.lease(), target: nil))
+        XCTAssertEqual(model.actionError, "The holder is running")
+        release.signal()
+        await refresh.value
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.actionError, "The holder is running")
+        XCTAssertEqual(model.leases.count, 1)
+        XCTAssertEqual(model.accounts.count, 1)
+        model.dismissActionError()
+        XCTAssertNil(model.actionError)
     }
 
     @MainActor

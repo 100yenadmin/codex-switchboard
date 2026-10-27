@@ -16,6 +16,7 @@ final class LeasesViewModel: ObservableObject {
     @Published private(set) var leases: [AppLease] = []
     @Published private(set) var accounts: [AppLeaseAccount] = []
     @Published private(set) var error: String?
+    @Published private(set) var actionError: String?
     @Published private(set) var isBusy = false
     @Published private(set) var isRefreshing = false
     @Published var pendingAction: LeaseAction?
@@ -58,18 +59,18 @@ final class LeasesViewModel: ObservableObject {
         guard !isBusy else { return }
         pendingAction = nil
         isBusy = true
-        error = nil
+        actionError = nil
         do {
             try await Task.detached(priority: .utility) { [client] in
                 if let target = action.target { try client.swapLease(action.lease, to: target) }
                 else { try client.returnLease(action.lease) }
             }.value
-        } catch { self.error = error.localizedDescription }
-        let actionError = error
+        } catch { actionError = error.localizedDescription }
         await refresh()
-        if let actionError { error = actionError }
         isBusy = false
     }
+
+    func dismissActionError() { actionError = nil }
 }
 
 struct LeasesSection: View {
@@ -113,8 +114,14 @@ struct LeasesSection: View {
                 Text(lease.displayName).fontWeight(.medium).lineLimit(1)
                 Spacer()
                 Text(lease.state).foregroundStyle(.secondary)
-                Image(systemName: "ellipsis.circle")
-                    .help(disabledReason ?? "Right-click this lease for actions")
+                Menu {
+                    leaseActions(lease, disabledReason: disabledReason)
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden)
+                .fixedSize()
+                .help(disabledReason ?? "Lease actions")
             }
             HStack(spacing: 4) {
                 Text(lease.holder)
@@ -132,18 +139,23 @@ struct LeasesSection: View {
         .padding(.horizontal, 12).padding(.vertical, 8)
         .contentShape(Rectangle())
         .contextMenu {
-            Button("Return lease") { requestAction(LeaseAction(lease: lease, target: nil)) }
-                .disabled(disabledReason != nil || isBusy).help(disabledReason ?? "Return this lease")
-            Menu("Swap to") {
-                ForEach(accounts.filter(\.leasable)) { account in
-                    Button(String(format: "%@ · 5h %.0f%% / weekly %.0f%% free", account.displayName, account.sessionFreePercent, account.weeklyFreePercent)) {
-                        requestAction(LeaseAction(lease: lease, target: account))
-                    }
+            leaseActions(lease, disabledReason: disabledReason)
+        }
+    }
+
+    @ViewBuilder
+    private func leaseActions(_ lease: AppLease, disabledReason: String?) -> some View {
+        Button("Return lease") { requestAction(LeaseAction(lease: lease, target: nil)) }
+            .disabled(disabledReason != nil || isBusy).help(disabledReason ?? "Return this lease")
+        Menu("Swap to") {
+            ForEach(accounts.filter(\.leasable)) { account in
+                Button(String(format: "%@ · 5h %.0f%% / weekly %.0f%% free", account.displayName, account.sessionFreePercent, account.weeklyFreePercent)) {
+                    requestAction(LeaseAction(lease: lease, target: account))
                 }
             }
-            .disabled(disabledReason != nil || isBusy || !accounts.contains(where: \.leasable))
-            .help(disabledReason ?? "Choose a leasable account")
-            Button("Reveal home in Finder") { revealHome(lease.home) }
         }
+        .disabled(disabledReason != nil || isBusy || !accounts.contains(where: \.leasable))
+        .help(disabledReason ?? "Choose a leasable account")
+        Button("Reveal home in Finder") { revealHome(lease.home) }
     }
 }

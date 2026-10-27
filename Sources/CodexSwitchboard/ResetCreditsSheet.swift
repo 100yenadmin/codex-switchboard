@@ -3,6 +3,11 @@ import SwiftUI
 struct ResetConfirmation: Equatable {
     let credit: ResetCredit
     let requestID: UUID
+
+    func message(email: String) -> String {
+        let expiry = credit.expiresAt.map { "expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "no expiry"
+        return "Use \(credit.displayTitle) (\(expiry)) on \(email)? It restores the 5-hour and weekly limits. The reset is used up."
+    }
 }
 
 enum ResetCreditsLoadState: Equatable {
@@ -17,7 +22,7 @@ final class ResetCreditsViewModel: ObservableObject {
     @Published private(set) var confirmation: ResetConfirmation?
     @Published private(set) var isConsuming = false
     @Published private(set) var consumeError: String?
-    @Published private(set) var notice: String?
+    @Published private(set) var notice: ResetConsumeOutcome?
     let account: Account
     private let isLeased: () -> Bool
     private let service: ResetCreditsService
@@ -66,7 +71,7 @@ final class ResetCreditsViewModel: ObservableObject {
         do {
             let result = try await service.consume(profileKey: key, isLeased: isLeased(), creditID: pending.credit.id, requestID: pending.requestID)
             confirmation = nil
-            notice = result.message
+            notice = result
             switch result {
             case .reset:
                 refreshUsage()
@@ -76,10 +81,6 @@ final class ResetCreditsViewModel: ObservableObject {
             }
         } catch {
             consumeError = error.localizedDescription
-            if (error as? ResetCreditsError)?.definitive == true {
-                confirmation = nil
-                state = .error(error.localizedDescription)
-            }
         }
     }
 }
@@ -109,7 +110,7 @@ struct ResetCreditsContent: View {
     let state: ResetCreditsLoadState
     var confirmation: ResetConfirmation? = nil
     var isConsuming = false
-    var notice: String? = nil
+    var notice: ResetConsumeOutcome? = nil
     var consumeError: String? = nil
     var load: () -> Void = {}
     var confirm: (ResetCredit) -> Void = { _ in }
@@ -129,17 +130,24 @@ struct ResetCreditsContent: View {
             Text(account.email).textSelection(.enabled)
             Text(String(format: "5-hour: %.0f%% free · Weekly: %.0f%% free", account.sessionFree, account.weeklyFree))
                 .foregroundStyle(.secondary)
-            if let notice { Text(notice).foregroundStyle(.secondary) }
-            if confirmation != nil {
+            if let notice {
+                switch notice {
+                case .reset:
+                    Label(notice.message, systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                case .nothingToReset, .noCredit:
+                    Label(notice.message, systemImage: "info.circle").foregroundStyle(.secondary)
+                }
+            }
+            if let confirmation {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Use this reset on \(account.email)? It restores the 5-hour and weekly limits. The reset is used up.")
+                    Text(confirmation.message(email: account.email))
                     if let consumeError {
                         Text(consumeError).foregroundStyle(.red)
                         Button("Try again", action: tryAgain).disabled(isConsuming)
                     }
                     HStack {
-                        Button("Cancel", action: cancel).disabled(isConsuming)
-                        Button("Use reset", action: useReset).disabled(isConsuming || consumeError != nil)
+                        Button("Cancel", action: cancel).buttonStyle(.bordered).disabled(isConsuming)
+                        Button("Use reset", action: useReset).buttonStyle(.borderedProminent).disabled(isConsuming || consumeError != nil)
                         if isConsuming { ProgressView().controlSize(.small) }
                     }
                 }

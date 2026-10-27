@@ -12,8 +12,7 @@ final class SwitchboardSnapshotTests: XCTestCase {
         let directory = URL(fileURLWithPath: path, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let scenarios: [(String, Account, AppLeaseAccount?)] = [
-            ("leased-running", ResetTestFixtures.account(email: "running@example.invalid"), LeaseTestFixtures.account(leased: true)),
-            ("leased-idle", ResetTestFixtures.account(email: "idle@example.invalid"), LeaseTestFixtures.account(leased: true)),
+            ("leased", ResetTestFixtures.account(email: "leased@example.invalid"), LeaseTestFixtures.account(leased: true)),
             ("reserved", ResetTestFixtures.account(email: "reserved@example.invalid"), LeaseTestFixtures.account(reserved: true)),
             ("resets-zero", ResetTestFixtures.account(resets: 0), nil),
             ("resets-two", ResetTestFixtures.account(resets: 2), nil)
@@ -27,7 +26,7 @@ final class SwitchboardSnapshotTests: XCTestCase {
                 informationMode: .complete, resetTextScale: 1, relogin: {}, cancelRelogin: {}, switchToCodex: {}, removeAccount: {}, leaseStatus: status
             ).frame(width: 680), name: "compact-\(name)", directory: directory)
         }
-        try render(LeasesSection(leases: [LeaseTestFixtures.lease(running: true, index: 1), LeaseTestFixtures.lease(index: 2), LeaseTestFixtures.lease(quarantined: true, index: 3)],
+        try renderNativeControls(LeasesSection(leases: [LeaseTestFixtures.lease(running: true, index: 1), LeaseTestFixtures.lease(index: 2), LeaseTestFixtures.lease(quarantined: true, index: 3)],
                                 accounts: [LeaseTestFixtures.account()]).frame(width: 680), name: "leases", directory: directory)
         let fullList = try ResetTestFixtures.list()
         let list = ResetCreditsList(credits: Array(fullList.available.prefix(2)) + [fullList.history.last!], availableCount: 2, totalEarnedCount: 3)
@@ -37,8 +36,10 @@ final class SwitchboardSnapshotTests: XCTestCase {
             ("loading", .init(account: account, state: .loading)),
             ("list", .init(account: account, state: .loaded(list))),
             ("confirm", .init(account: account, state: .loaded(list), confirmation: confirmation)),
-            ("success", .init(account: account, state: .loaded(list), notice: "Usage reset (2 limits restored).")),
-            ("nothing-to-reset", .init(account: account, state: .loaded(list), notice: ResetConsumeOutcome.nothingToReset.message)),
+            ("confirm-no-expiry", .init(account: account, state: .loaded(list), confirmation: ResetConfirmation(credit: fullList.available.first { $0.id == "no-expiry" }!, requestID: UUID()))),
+            ("success", .init(account: account, state: .loaded(list), notice: .reset(2))),
+            ("nothing-to-reset", .init(account: account, state: .loaded(list), notice: .nothingToReset)),
+            ("no-credit", .init(account: account, state: .loaded(list), notice: .noCredit)),
             ("error", .init(account: account, state: .error("Usage limit resets request failed (HTTP 500).")))
         ]
         for (name, var view) in states {
@@ -46,6 +47,18 @@ final class SwitchboardSnapshotTests: XCTestCase {
             view.scrolls = false
             try render(view, name: "reset-\(name)", directory: directory)
         }
+    }
+
+    /// ImageRenderer does not capture the AppKit-backed Menu control.
+    @MainActor
+    private func renderNativeControls<V: View>(_ view: V, name: String, directory: URL) throws {
+        let hosting = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)).environment(\.colorScheme, .light))
+        hosting.setFrameSize(hosting.fittingSize)
+        hosting.layoutSubtreeIfNeeded()
+        let bitmap = try XCTUnwrap(hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds))
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        try png.write(to: directory.appendingPathComponent(name + ".png"))
     }
 
     @MainActor

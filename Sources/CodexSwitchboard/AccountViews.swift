@@ -37,6 +37,14 @@ struct AccountListView: View {
                           isCollapsed: leasesCollapsed, isBusy: leases.isBusy || leases.isRefreshing,
                           unavailableReason: leases.unavailableReason,
                           toggle: { leasesCollapsed.toggle() }, requestAction: { leases.pendingAction = $0 })
+            if let message = leases.actionError {
+                HStack {
+                    Text(message).foregroundStyle(.red)
+                    Spacer()
+                    Button("Dismiss", action: leases.dismissActionError).buttonStyle(.borderless)
+                }
+                .font(.caption).padding(.horizontal, 12).padding(.vertical, 4)
+            }
             if let message = leases.error {
                 Text(message).font(.caption).foregroundStyle(.secondary)
                     .padding(.horizontal, 12).padding(.vertical, 4)
@@ -124,30 +132,26 @@ struct AccountListView: View {
 
     @ViewBuilder
     private func accountRow(for acc: Account) -> some View {
-        if vm.listDensity == .expanded {
-            AccountRow(account: acc, leaseStatus: leases.status(for: acc), showResets: { resetAccount = acc })
-        } else {
-            AccountCompactRow(
-                account: acc,
-                needsRelogin: vm.needsRelogin(acc),
-                isRelogging: vm.isRelogging(acc),
-                isReloginBlocked: vm.hasPendingAccountAction && !vm.isRelogging(acc),
-                isSwitchingToCodex: vm.isSwitchingToCodex(acc),
-                isActiveInCodex: vm.isActiveInCodex(acc),
-                showsCodexControls: vm.canShowDesktopSwitchControls,
-                isSwitchBlocked: vm.hasPendingAccountAction && !vm.isSwitchingToCodex(acc),
-                isRemoving: vm.isRemoving(acc),
-                isRemoveBlocked: vm.hasPendingAccountAction && !vm.isRemoving(acc),
-                informationMode: vm.informationMode,
-                resetTextScale: vm.resetTextScale,
-                relogin: { vm.relogin(acc) },
-                cancelRelogin: { vm.cancelRelogin() },
-                switchToCodex: { vm.switchCodex(to: acc) },
-                removeAccount: { vm.removeAccount(acc) },
-                leaseStatus: leases.status(for: acc),
-                showResets: { resetAccount = acc }
-            )
-        }
+        AccountCompactRow(
+            account: acc,
+            needsRelogin: vm.needsRelogin(acc),
+            isRelogging: vm.isRelogging(acc),
+            isReloginBlocked: vm.hasPendingAccountAction && !vm.isRelogging(acc),
+            isSwitchingToCodex: vm.isSwitchingToCodex(acc),
+            isActiveInCodex: vm.isActiveInCodex(acc),
+            showsCodexControls: vm.canShowDesktopSwitchControls,
+            isSwitchBlocked: vm.hasPendingAccountAction && !vm.isSwitchingToCodex(acc),
+            isRemoving: vm.isRemoving(acc),
+            isRemoveBlocked: vm.hasPendingAccountAction && !vm.isRemoving(acc),
+            informationMode: vm.informationMode,
+            resetTextScale: vm.resetTextScale,
+            relogin: { vm.relogin(acc) },
+            cancelRelogin: { vm.cancelRelogin() },
+            switchToCodex: { vm.switchCodex(to: acc) },
+            removeAccount: { vm.removeAccount(acc) },
+            leaseStatus: leases.status(for: acc),
+            showResets: { resetAccount = acc }
+        )
     }
 }
 

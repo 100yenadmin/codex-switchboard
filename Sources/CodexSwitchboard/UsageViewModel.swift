@@ -231,23 +231,31 @@ final class UsageViewModel: ObservableObject {
         refreshCodexAvailability()
 
         Task {
-            async let leaseRefresh: Void = leases.refresh()
-            let result = await service.loadAll()
-            await leaseRefresh
-            accounts = result
-            let now = Date()
-            lastRefresh = now
-            AccountSnapshotStore.save(accounts: accounts, lastRefresh: now)
-            codexLoginStatus = CodexLoginStatusStore.load()
-            refreshCodexAvailability()
-            evaluateAutoSwap()
-            isLoading = false
-            startTimer()
-            if pendingRefreshAfterCurrent {
-                pendingRefreshAfterCurrent = false
-                refresh()
+            await Self.refreshUsageThenLeases(service: service, leases: leases) { result in
+                accounts = result
+                let now = Date()
+                lastRefresh = now
+                AccountSnapshotStore.save(accounts: accounts, lastRefresh: now)
+                codexLoginStatus = CodexLoginStatusStore.load()
+                refreshCodexAvailability()
+                evaluateAutoSwap()
+                isLoading = false
+                startTimer()
+                if pendingRefreshAfterCurrent {
+                    pendingRefreshAfterCurrent = false
+                    refresh()
+                }
             }
         }
+    }
+
+    /// Publish and persist usage before the CLI reads that snapshot. Lease reads never hold up usage.
+    static func refreshUsageThenLeases(
+        service: UsageService, leases: LeasesViewModel, publish: ([Account]) -> Void
+    ) async {
+        let result = await service.loadAll()
+        publish(result)
+        Task { await leases.refresh() }
     }
 
     private func schedulePostCaptureRefresh() {
