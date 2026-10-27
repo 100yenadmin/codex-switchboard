@@ -29,7 +29,8 @@ the same account is refused too), switches the CLI to it by handle, and confirms
 leases and reservations under its own store lock before it writes. It never stops running Codex processes; if
 Switchboard refuses because they are running, report it rather than adding `--stop-consumers`.
 
-To check one account before a switch someone asked for: `python3 scripts/codex-logins.py check-switch --profile-key HANDLE`.
+To check one account before a switch someone asked for: `python3 scripts/codex-logins.py check-switch --profile-key NAME`,
+where NAME is a handle, a profile key or an email. On exit 0 it prints the account's handle; switch by that handle.
 
 | Exit | Meaning |
 |------|---------|
@@ -37,7 +38,7 @@ To check one account before a switch someone asked for: `python3 scripts/codex-l
 | 1 | Reserved, or shares its email with a reserved account |
 | 2 | The registry is missing, unreadable, or reserves a key Switchboard no longer lists; if nothing is reserved, the registry is `{"version": 1, "logins": []}` |
 | 3 | Leased, or shares its email with a leased account |
-| 4 | Switchboard's account or lease state cannot be read |
+| 4 | Switchboard's account or lease state cannot be read, or the name matches no account or several |
 | 5 | `swap`: no other account passes |
 | 6 | `swap`: Switchboard refused or failed the switch (its `error` code is printed) |
 | 7 | `swap`: the switch did not take or cannot be confirmed |

@@ -61,16 +61,16 @@ Exit codes, for `check-switch` and `swap`; any nonzero means the main CLI was no
 | 1 | The account is registry-reserved, or shares its email with a reserved one. | |
 | 2 | The registry is missing, cannot be read, or reserves a key Switchboard no longer lists. | Same; nothing was switched. |
 | 3 | The account is leased (`leasing`, `active` or `returning`), or shares its email with a leased one. | |
-| 4 | Switchboard's account or lease state cannot be read. | Same; nothing was switched. |
+| 4 | Switchboard's account or lease state cannot be read, or the name matches no account or several. | Same; nothing was switched. |
 | 5 | | No paid, usable account other than the current one passes. |
 | 6 | | Switchboard refused or failed the switch; the message gives its `error` code. |
 | 7 | | The switch did not take, or cannot be confirmed. |
 
-For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys:
+For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys. `check-switch` takes a handle, a profile key or an email and, on exit 0, prints the handle it checked; switch by that handle:
 
 ```bash
 set -o pipefail
-python3 scripts/codex-logins.py check-switch --profile-key "$HANDLE" \
+HANDLE=$(python3 scripts/codex-logins.py check-switch --profile-key "$ACCOUNT") \
   && codex-switchboard switch --profile-key "$HANDLE" --surface cli --json | jq '{error}' \
   && codex-switchboard status --json --surface cli \
   | jq -e --arg h "$HANDLE" '(.surfaces[] | select(.kind == "cli") | .active_profile_key) as $k | [.accounts[] | select(.profile_key == $k) | .handle] == [$h]'
@@ -149,6 +149,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 
 | `error` | Meaning |
 |---------|---------|
+| `ambiguous_account` | The email names more than one account; `details` lists each as `handle plan workspace`. Pass one of those handles. |
 | `active_account` | The account is the active CLI or Desktop account. Pick another. |
 | `surface_identity_unknown` | A surface keeps its sign-in in a keychain or auto store, so Switchboard cannot tell which account it uses. Nothing is leased until it can. |
 | `reserved_account`, `home_reserved` | The account is registry-reserved, or the home is a registry-reserved login's home. |
@@ -189,7 +190,7 @@ Correct behavior:
 - Run `doctor --json` and `codex-logins.py status`.
 - Run `codex-logins.py swap --dry-run`, then `codex-logins.py swap`.
 - If Switchboard refuses because consumers are running (exit 6, `consumers_running`), report it, or ask before stopping consumers.
-- Report the exit code and the emails and handles the tool printed.
+- Report the exit code and the handles the tool printed.
 
 Incorrect behavior:
 

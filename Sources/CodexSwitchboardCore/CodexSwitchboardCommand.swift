@@ -122,7 +122,11 @@ private final class CommandRunner {
             }
         if options.leasableOnly {
             // Account emails and handles are approved for agent transcripts.
-            let payload = LeasableStatusPayload(generatedAt: Date(), accounts: accounts.map(LeasableAccountPayload.init))
+            let emails = accountStore.emails()
+            let payload = LeasableStatusPayload(
+                generatedAt: Date(),
+                accounts: accounts.map { LeasableAccountPayload($0, email: emails[$0.profileKey] ?? "") }
+            )
             return CommandResult(payload: .leasableStatus(payload), json: options.json, exitCode: 0)
         }
         let payload = StatusPayload(
@@ -978,16 +982,22 @@ private final class CLIAccountStore {
         }
     }
 
-    /// Names come from accounts.json, even when quota metadata is stale or incomplete.
+    /// Names come from accounts.json, even when quota metadata is stale or incomplete. An exclusion
+    /// (`allMatches`) also matches the email the app's snapshot shows, since excluding more is safe.
     func resolve(_ given: String, among candidates: [String]? = nil, allMatches: Bool = false) throws -> [String] {
         let collection = LocalProfileCollection.load(from: paths.accountsURL)
         let keys = candidates ?? Array(Set(accounts().map(\.profileKey) + collection.orderedKeys)).sorted()
         if let key = CodexAccountHandle.resolve(given, among: keys) { return [key] }
         let email = given.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !email.isEmpty else { return [] }
+        func names(_ stored: String?) -> Bool {
+            stored?.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(email) == .orderedSame
+        }
+        let snapshotEmails = allMatches
+            ? Dictionary(accounts().map { ($0.profileKey, $0.email) }, uniquingKeysWith: { first, _ in first })
+            : [:]
         let matches = keys.filter {
-            guard let stored = collection.profiles[$0]?["email"] as? String else { return false }
-            return stored.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(email) == .orderedSame
+            names(collection.profiles[$0]?["email"] as? String) || names(snapshotEmails[$0])
         }.sorted()
         if matches.count > 1 && !allMatches {
             let metadata = accounts()
@@ -1004,8 +1014,14 @@ private final class CLIAccountStore {
         return matches
     }
 
+    /// Each account's email as accounts.json stores it. Output uses this rather than the snapshot's email,
+    /// which can fall back to an account id, so a printed email is one `--profile-key` accepts.
+    func emails() -> [String: String] {
+        LocalProfileCollection.load(from: paths.accountsURL).profiles.compactMapValues { $0["email"] as? String }
+    }
+
     func email(for profileKey: String) -> String {
-        LocalProfileCollection.load(from: paths.accountsURL).profiles[profileKey]?["email"] as? String ?? ""
+        emails()[profileKey] ?? ""
     }
 
     private func snapshotAccounts() -> [AccountPayload]? {
@@ -1661,13 +1677,14 @@ private final class CLILeaseService {
         let leases = try paths.leaseStore.load()
         let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
         let accounts = accountStore.accounts()
+        let emails = accountStore.emails()
         return LeasesPayload(
             generatedAt: Date(),
             leases: leases.map { lease in
                 let account = accounts.first { $0.profileKey == lease.profileKey }
                 return LeaseStatusPayload(
                     handle: CodexAccountHandle.handle(for: lease.profileKey),
-                    email: accountStore.email(for: lease.profileKey),
+                    email: emails[lease.profileKey] ?? "",
                     leaseID: lease.leaseID,
                     state: lease.state.rawValue,
                     plan: account?.plan,
@@ -2881,9 +2898,9 @@ private struct LeasableAccountPayload: Codable {
         case nextResetAt = "next_reset_at"
     }
 
-    init(_ account: AccountPayload) {
+    init(_ account: AccountPayload, email: String) {
         handle = account.handle
-        email = account.email
+        self.email = email
         plan = account.plan
         sessionFreePercent = account.sessionFreePercent
         weeklyFreePercent = account.weeklyFreePercent

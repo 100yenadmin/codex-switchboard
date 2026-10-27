@@ -155,6 +155,14 @@ check_cases = [
     ("status account with malformed handle: fail closed", FREE,
      {"fixture": mut(lambda d: d["status"]["accounts"][1].update(handle="nope"))}, 4),
     ("key unknown to Switchboard: fail closed", "cli:nobody@example.invalid", {}, 4),
+    ("an email names its account (trimmed, any case)", " FREE@Example.invalid ", {}, 0),
+    ("an email Switchboard does not list: fail closed", "nobody@example.invalid", {}, 4),
+    ("an email two accounts share: fail closed", "LEASED@example.invalid", {}, 4),
+    ("the email of a leased account: refused", "Leased@example.invalid",
+     {"fixture": mut(lambda d: d["status"]["accounts"][3].update(email="dup@example.invalid"))}, 3),
+    ("the email of a reserved account: refused", "reserved@example.invalid",
+     {"fixture": mut(lambda d: d["status"]["accounts"][5].update(email="res2@example.invalid"))}, 1),
+    ("a blank name: fail closed", "  ", {}, 4),
 ]
 
 swap_cases = [
@@ -237,6 +245,20 @@ for name, key, kw, want in check_cases:
     fails += not ok
     total += 1
     print("%s %-72s want %d got %d%s  %s" % ("PASS" if ok else "FAIL", name, want, got, "  LEAK" if leak else "", text))
+
+# check-switch prints the handle it checked, so the switch that follows names the same account.
+for name, key, want in (("by email", "free@example.invalid", h(FREE)), ("by key", FREE, h(FREE))):
+    got, text, _ = check(key)
+    ok = got == 0 and text == want
+    fails += not ok
+    total += 1
+    print("%s %-72s got %d  %s" % ("PASS" if ok else "FAIL", "check-switch %s prints the handle" % name, got, text))
+for key in ("LEASED@example.invalid", "nobody@example.invalid"):
+    got, text, _ = check(key)
+    ok = got == 4 and "cannot be checked" not in text and not any(s in text for s in SECRETS)
+    fails += not ok
+    total += 1
+    print("%s %-72s got %d  %s" % ("PASS" if ok else "FAIL", "an unusable name is not reported as unreadable state", got, text))
 
 for name, argv, kw, want, switched_to in swap_cases:
     cl.CS_TIMEOUT = 1 if kw.get("fixture", {}).get("switch") == "!hang" else 120

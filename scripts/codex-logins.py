@@ -73,6 +73,12 @@ class Refusal(Exception):
         self.message = message
 
 
+class UnknownName(Refusal):
+    """A name that matches no account or several: exit 4, but Switchboard's state was read fine."""
+    def __init__(self, message):
+        super().__init__(4, message)
+
+
 def load_registry():
     """The registry for status and register: a missing one is empty. Refusal(2) if it cannot be read."""
     if not os.path.exists(REG):
@@ -224,12 +230,22 @@ def switchboard_state():
     return accounts, leased, active, [s for s in surfaces if isinstance(s, dict)]
 
 
-def verdict(given, reserved, accounts, leased):
-    """(exit code, reason) for switching the main CLI to `given`. Refusal(4) if Switchboard does not list it once."""
+def find_account(given, accounts):
+    """The one account `given` names: a profile key, a handle, or an email (trimmed, any case). UnknownName otherwise."""
     hits = [a for a in accounts if given in (a["profile_key"], a["handle"])]
+    if not hits and given.strip():
+        hits = [a for a in accounts if email_of(a) == given.strip().lower()]
+        if len(hits) > 1:
+            raise UnknownName("this email names %d accounts; pass one of their handles: %s"
+                              % (len(hits), ", ".join(a["handle"] for a in hits)))
     if len(hits) != 1:
-        raise Refusal(4, "Switchboard lists %d accounts for this key (need exactly 1)" % len(hits))
-    target = hits[0]
+        raise UnknownName("Switchboard lists %d accounts for this name (need exactly 1)" % len(hits))
+    return hits[0]
+
+
+def verdict(given, reserved, accounts, leased):
+    """(exit code, reason) for switching the main CLI to `given`. UnknownName unless it names exactly one account."""
+    target = find_account(given, accounts)
     handle = target["handle"]
     by_key = {a["profile_key"]: a for a in accounts}
     if target["profile_key"] in reserved:
@@ -415,9 +431,15 @@ def cmd_check_switch(a):
             return refuse(1, "this key is reserved in the registry")
         accounts, leased, _, _ = switchboard_state()
         code, why = verdict(a.profile_key, reserved, accounts, leased)
+    except UnknownName as r:
+        return refuse(r.code, r.message)
     except Refusal as r:
         return refuse(r.code, "Switchboard's state cannot be checked: %s" % r.message if r.code == 4 else r.message)
-    return refuse(code, why) if code else 0
+    if code:
+        return refuse(code, why)
+    # The handle, so the switch that follows names the same account whichever name was given.
+    print(find_account(a.profile_key, accounts)["handle"])
+    return 0
 
 
 def cmd_swap(a):
