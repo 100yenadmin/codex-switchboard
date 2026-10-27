@@ -205,8 +205,9 @@ def handle_for(profile_key):
 
 
 def norm_email(value):
-    # Lowercase, then NFC, as Swift compares strings by canonical equivalence. Every email comparison goes through this.
-    return unicodedata.normalize("NFC", str(value or "").strip().lower())
+    # Casefold, then NFC, as Swift compares emails case-insensitively by canonical equivalence. Every email comparison
+    # goes through this.
+    return unicodedata.normalize("NFC", str(value or "").strip().casefold())
 
 
 def email_of(account):
