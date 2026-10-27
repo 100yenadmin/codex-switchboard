@@ -13,9 +13,11 @@ land on one.
   codex-logins.py swap [--dry-run]                move the main CLI to the best account check-switch allows
 
 check-switch exits: 0 safe; 1 reserved; 2 the registry is missing, cannot be read, or reserves a key Switchboard does
-not list; 3 leased by Switchboard; 4 Switchboard's account or lease state cannot be read. Any nonzero means do not
-switch. K may be a profile key or a Switchboard handle (acct_ + 12 hex). An account that shares its email with a
-reserved or leased one is refused too, since Switchboard can list one seat under two keys.
+not list; 3 leased by Switchboard; 4 Switchboard's account or lease state cannot be read, K names no account or
+several, or an account the seat check compares has no stored email. Any nonzero means do not switch. K may be a profile key, a Switchboard handle (acct_ + 12 hex) or an email;
+`codex-switchboard resolve` resolves it by the rules lease and switch use, and on exit 0 the handle checked is printed.
+An account that shares its email with a reserved or leased one is refused too, since Switchboard can list one seat
+under two keys.
 
 swap exits: 0 switched (with --dry-run: an account passes); 2 or 4 as for check-switch; 5 no account passes;
 6 Switchboard refused or failed the switch; 7 the switch did not take or cannot be confirmed.
@@ -41,6 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 REG_DIR = os.path.expanduser("~/.config/codex-logins")
 REG = os.path.join(REG_DIR, "registry.json")
@@ -71,6 +74,12 @@ class Refusal(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class UnknownName(Refusal):
+    """A name that matches no account or several: exit 4, but Switchboard's state was read fine."""
+    def __init__(self, message):
+        super().__init__(4, message)
 
 
 def load_registry():
@@ -195,8 +204,14 @@ def handle_for(profile_key):
     return "acct_" + hashlib.sha256(profile_key.encode()).hexdigest()[:12]
 
 
+def norm_email(value):
+    # Casefold, then NFC, as Swift compares emails case-insensitively by canonical equivalence. Every email comparison
+    # goes through this.
+    return unicodedata.normalize("NFC", str(value or "").strip().casefold())
+
+
 def email_of(account):
-    return str(account.get("email") or "").strip().lower()
+    return norm_email(account.get("email"))
 
 
 def switchboard_state():
@@ -224,12 +239,43 @@ def switchboard_state():
     return accounts, leased, active, [s for s in surfaces if isinstance(s, dict)]
 
 
-def verdict(given, reserved, accounts, leased):
-    """(exit code, reason) for switching the main CLI to `given`. Refusal(4) if Switchboard does not list it once."""
+def find_account(given, accounts):
+    """The one account in `status` that `given` (a profile key or a handle) names. UnknownName otherwise."""
     hits = [a for a in accounts if given in (a["profile_key"], a["handle"])]
     if len(hits) != 1:
-        raise Refusal(4, "Switchboard lists %d accounts for this key (need exactly 1)" % len(hits))
-    target = hits[0]
+        raise UnknownName("Switchboard lists %d accounts for this name (need exactly 1)" % len(hits))
+    return hits[0]
+
+
+def resolve_handle(given):
+    """The handle Switchboard gives `given` (a profile key, a handle or an email) by the rules lease and switch use, over
+    its whole account list; `status` can omit or merge accounts. UnknownName if the name matches no account or several,
+    Refusal(4) if Switchboard cannot answer."""
+    try:
+        r = cs_run("resolve", "--profile-key", given, "--json")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        raise Refusal(4, "resolve could not run or printed something that is not text (%s)" % type(e).__name__)
+    try:
+        d = json.loads(r.stdout)
+    except ValueError:
+        raise Refusal(4, "resolve did not print JSON (exit %d)" % r.returncode)
+    if not isinstance(d, dict):
+        raise Refusal(4, "resolve did not print a JSON object")
+    if r.returncode == 0 and isinstance(d.get("handle"), str) and HANDLE.fullmatch(d["handle"]):
+        return d["handle"]
+    if r.returncode == 2 and d.get("error") == "ambiguous_account":
+        details = d.get("details") if isinstance(d.get("details"), list) else []
+        handles = [x.split(" ")[0] for x in details if isinstance(x, str) and HANDLE.fullmatch(x.split(" ")[0])]
+        raise UnknownName("this name matches %d accounts; pass one of their handles: %s"
+                          % (len(handles), ", ".join(handles)))
+    if r.returncode == 2 and d.get("error") == "unknown_profile":
+        raise UnknownName("Switchboard lists no account with this name")
+    raise Refusal(4, "resolve failed (exit %d)" % r.returncode)
+
+
+def verdict(given, reserved, accounts, leased):
+    """(exit code, reason) for switching the main CLI to `given`. UnknownName unless it names exactly one account."""
+    target = find_account(given, accounts)
     handle = target["handle"]
     by_key = {a["profile_key"]: a for a in accounts}
     if target["profile_key"] in reserved:
@@ -237,9 +283,16 @@ def verdict(given, reserved, accounts, leased):
     if reserved - set(by_key):
         return 2, "the registry reserves a key Switchboard does not list (a new sign-in can re-key an account); register that login again"
     email = email_of(target)
+    leased_exact = handle in leased or handle_for(target["profile_key"]) in leased
+    # The seat checks below match by email; an account without a stored email could be any seat's, so fail closed.
+    protected = [by_key[k] for k in reserved] + [a for a in accounts if a["handle"] in leased]
+    if not leased_exact and any(not email_of(a) for a in protected):
+        raise Refusal(4, "a reserved or leased account has no stored email, so the other keys of its seat cannot be found")
+    if not leased_exact and not email:
+        return 4, "%s has no stored email, so Switchboard cannot tell which seat it is" % handle
     if email and email in {email_of(by_key[k]) for k in reserved}:
         return 1, "%s shares its email with a reserved account" % handle
-    if handle in leased or handle_for(target["profile_key"]) in leased:
+    if leased_exact:
         return 3, "%s is leased to an agent lane" % handle
     if email and email in {email_of(a) for a in accounts if a["handle"] in leased}:
         return 3, "%s shares its email with a leased account" % handle
@@ -360,7 +413,7 @@ def cmd_register(a):
         sys.exit("refused: --purpose must be a lowercase label (a letter, then letters, digits or dashes; at most 48)")
     home = os.path.abspath(os.path.expanduser(a.home))
     try:
-        email = (home_email(home) or "").strip().lower()
+        email = norm_email(home_email(home))
     except (OSError, ValueError, AttributeError):
         email = ""
     if not email:
@@ -384,7 +437,7 @@ def cmd_register(a):
             sys.exit("refused: a CLI or Desktop surface keeps its sign-in in a keychain or auto store, so Switchboard "
                      "cannot tell which account it is on; register once every surface uses the file store")
         actives = {s.get("active_profile_key") for s in surfaces} - {None, ""}
-        active_emails = {str(s.get("active_email") or "").strip().lower() for s in surfaces} - {""}
+        active_emails = {norm_email(s.get("active_email")) for s in surfaces} - {""}
         if key in actives or email in active_emails or email in {email_of(x) for x in accounts if x["profile_key"] in actives}:
             sys.exit("refused: this login is Switchboard #%d, the account a CLI or Desktop surface is on; "
                      "move that surface off it first (codex-logins.py swap)" % num)
@@ -413,11 +466,18 @@ def cmd_check_switch(a):
         reserved = reserved_keys()
         if a.profile_key in reserved:
             return refuse(1, "this key is reserved in the registry")
+        handle = resolve_handle(a.profile_key)
         accounts, leased, _, _ = switchboard_state()
-        code, why = verdict(a.profile_key, reserved, accounts, leased)
+        code, why = verdict(handle, reserved, accounts, leased)
+    except UnknownName as r:
+        return refuse(r.code, r.message)
     except Refusal as r:
         return refuse(r.code, "Switchboard's state cannot be checked: %s" % r.message if r.code == 4 else r.message)
-    return refuse(code, why) if code else 0
+    if code:
+        return refuse(code, why)
+    # The handle, so the switch that follows names the same account whichever name was given.
+    print(handle)
+    return 0
 
 
 def cmd_swap(a):

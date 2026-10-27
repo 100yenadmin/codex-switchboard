@@ -96,6 +96,8 @@ private final class CommandRunner {
             return try leases(Array(arguments.dropFirst()))
         case "swap-lease":
             return try swapLease(Array(arguments.dropFirst()))
+        case "resolve":
+            return try resolveName(Array(arguments.dropFirst()))
         case "doctor":
             return try doctor(Array(arguments.dropFirst()))
         case "autoswap":
@@ -121,8 +123,12 @@ private final class CommandRunner {
                 return lhs.score > rhs.score
             }
         if options.leasableOnly {
-            // Named by handle only: this view goes into agent transcripts.
-            let payload = LeasableStatusPayload(generatedAt: Date(), accounts: accounts.map(LeasableAccountPayload.init))
+            // Account emails and handles are approved for agent transcripts.
+            let emails = accountStore.emails()
+            let payload = LeasableStatusPayload(
+                generatedAt: Date(),
+                accounts: accounts.map { LeasableAccountPayload($0, email: emails[$0.profileKey] ?? "") }
+            )
             return CommandResult(payload: .leasableStatus(payload), json: options.json, exitCode: 0)
         }
         let payload = StatusPayload(
@@ -135,8 +141,8 @@ private final class CommandRunner {
 
     private func switchProfile(_ args: [String]) throws -> CommandResult {
         let options = try SwitchOptions.parse(args)
-        // A handle names an account without its email, so callers can pass one instead of the key.
-        let profileKey = CodexAccountHandle.resolve(options.profileKey, among: accountStore.accounts().map(\.profileKey))
+        // Resolve names before the existing seat and surface safety checks.
+        let profileKey = try accountStore.resolve(options.profileKey).first
             ?? options.profileKey
         let outcome = try switchService.switchProfile(
             profileKey: profileKey,
@@ -171,6 +177,17 @@ private final class CommandRunner {
             holder: options.holder
         )
         return CommandResult(payload: .leaseSwap(outcome), json: options.json, exitCode: 0)
+    }
+
+    /// Read-only: the account a name resolves to, by the rules `lease` and `switch` use, so a tool that checks a
+    /// name first checks the account those commands would pick.
+    private func resolveName(_ args: [String]) throws -> CommandResult {
+        let options = try ResolveOptions.parse(args)
+        guard let profileKey = try accountStore.resolve(options.profileKey).first else {
+            throw CLIError.refused(code: "unknown_profile", message: "No account in Switchboard's account list has that name.", details: nil)
+        }
+        let payload = ResolvePayload(handle: CodexAccountHandle.handle(for: profileKey), email: accountStore.email(for: profileKey))
+        return CommandResult(payload: .resolve(payload), json: options.json, exitCode: 0)
     }
 
     private func leases(_ args: [String]) throws -> CommandResult {
@@ -367,12 +384,14 @@ private final class CommandRunner {
     private static let helpText = """
     codex-switchboard status --json [--surface all|desktop|cli] [--paid-only] [--usable-only] [--leasable-only]
     codex-switchboard switch --profile-key <key> --surface desktop|cli|both --json [--stop-consumers]
-        (<key> may be a profile key or a handle)
+        (<key> may be a profile key, a handle or an email)
     codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
     codex-switchboard return --profile-key <key> --home <dir> --json
     codex-switchboard leases --json
+    codex-switchboard resolve --profile-key <key> --json
+        (read-only: the handle and email of the account <key> names, as lease and switch resolve it)
     codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... --json
-        (lease commands name accounts by handle, acct_ plus 12 hex digits; <key> may be a handle or a profile key)
+        (accounts show email beside handle, acct_ plus 12 hex digits; <key> may be a profile key, a handle or an email)
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
     codex-switchboard autoswap enable --surface cli|desktop|both --json [--trigger-session-free <percent>] [--target-min-session-free <percent>]
     codex-switchboard autoswap disable --surface cli|desktop|both --json
@@ -539,6 +558,19 @@ private struct ReturnOptions {
         let home = try parser.takeRequiredValue("--home")
         try parser.finish()
         return ReturnOptions(json: json, profileKey: profileKey, home: home)
+    }
+}
+
+private struct ResolveOptions {
+    let json: Bool
+    let profileKey: String
+
+    static func parse(_ args: [String]) throws -> ResolveOptions {
+        var parser = ArgumentParser(args)
+        let json = parser.takeFlag("--json")
+        let profileKey = try parser.takeRequiredValue("--profile-key")
+        try parser.finish()
+        return ResolveOptions(json: json, profileKey: profileKey)
     }
 }
 
@@ -963,12 +995,17 @@ private final class CLIAccountStore {
     }
 
     /// Status stays readable when the lease store is not; every writer re-reads it and fails closed.
+    /// Emails come from accounts.json, the field `--profile-key` matches, so `status` and the tools that read it
+    /// name accounts the way Switchboard resolves them. An account with no stored email shows none: the snapshot's
+    /// fallback can be another account's email or an account id.
     func accounts() -> [AccountPayload] {
         let leases = (try? paths.leaseStore.load()) ?? []
         let snapshot = snapshotAccounts() ?? []
+        let emails = emails()
         return (snapshot.isEmpty ? profileFallbackAccounts() : snapshot).map { account in
             var account = account
             account.handle = CodexAccountHandle.handle(for: account.profileKey)
+            account.email = emails[account.profileKey] ?? ""
             if let lease = leases.first(where: { $0.profileKey == account.profileKey }) {
                 account.leased = true
                 account.leaseHolder = lease.holder
@@ -976,6 +1013,50 @@ private final class CLIAccountStore {
             }
             return account
         }
+    }
+
+    /// Names come from accounts.json, even when quota metadata is stale or incomplete. An exclusion
+    /// (`allMatches`) also matches the email the app's snapshot shows, since excluding more is safe.
+    func resolve(_ given: String, among candidates: [String]? = nil, allMatches: Bool = false) throws -> [String] {
+        let collection = LocalProfileCollection.load(from: paths.accountsURL)
+        let keys = candidates ?? Array(Set(accounts().map(\.profileKey) + collection.orderedKeys)).sorted()
+        if let key = CodexAccountHandle.resolve(given, among: keys) { return [key] }
+        let email = given.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty else { return [] }
+        func names(_ stored: String?) -> Bool {
+            stored?.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(email) == .orderedSame
+        }
+        let snapshotEmails = allMatches
+            ? Dictionary((snapshotAccounts() ?? []).map { ($0.profileKey, $0.email) }, uniquingKeysWith: { first, _ in first })
+            : [:]
+        let matches = keys.filter {
+            names(collection.profiles[$0]?["email"] as? String) || names(snapshotEmails[$0])
+        }.sorted()
+        if matches.count > 1 && !allMatches {
+            let metadata = accounts()
+            let details = matches.map { key in
+                let account = metadata.first { $0.profileKey == key }
+                return "\(CodexAccountHandle.handle(for: key)) \(account?.plan ?? "?") \(account?.workspace ?? "?")"
+            }
+            throw CLIError.refused(
+                code: "ambiguous_account",
+                message: "Multiple accounts match; pass one of these handles: \(details.joined(separator: "; ")).",
+                details: details
+            )
+        }
+        return matches
+    }
+
+    /// Each account's email as accounts.json stores it. Output uses this rather than the snapshot's email,
+    /// which can fall back to an account id, so a printed email is one `--profile-key` accepts.
+    func emails() -> [String: String] {
+        LocalProfileCollection.load(from: paths.accountsURL).profiles.compactMapValues { entry in
+            (entry["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        }
+    }
+
+    func email(for profileKey: String) -> String {
+        emails()[profileKey] ?? ""
     }
 
     private func snapshotAccounts() -> [AccountPayload]? {
@@ -1502,6 +1583,7 @@ private final class CLILeaseService {
                     return LeasePayload(
                         generatedAt: Date(),
                         handle: handle,
+                        email: accountStore.email(for: profileKey),
                         leaseID: lease.leaseID,
                         home: home,
                         holder: holder,
@@ -1522,7 +1604,7 @@ private final class CLILeaseService {
 
         return try withStoreLock {
             let leases = try paths.leaseStore.load()
-            let profileKey = CodexAccountHandle.resolve(given, among: leases.map(\.profileKey)) ?? given
+            let profileKey = try accountStore.resolve(given, among: leases.map(\.profileKey)).first ?? given
             guard let lease = leases.first(where: { $0.profileKey == profileKey }) else {
                 throw refused("not_leased", "\(Self.display(given)) has no active lease.")
             }
@@ -1616,6 +1698,7 @@ private final class CLILeaseService {
         return LeaseReturnPayload(
             generatedAt: Date(),
             handle: handle,
+            email: accountStore.email(for: lease.profileKey),
             leaseID: lease.leaseID,
             home: lease.home,
             holder: lease.holder,
@@ -1629,12 +1712,14 @@ private final class CLILeaseService {
         let leases = try paths.leaseStore.load()
         let activeKeys = Set(surfaceService.statuses(scope: .all).compactMap(\.activeProfileKey))
         let accounts = accountStore.accounts()
+        let emails = accountStore.emails()
         return LeasesPayload(
             generatedAt: Date(),
             leases: leases.map { lease in
                 let account = accounts.first { $0.profileKey == lease.profileKey }
                 return LeaseStatusPayload(
                     handle: CodexAccountHandle.handle(for: lease.profileKey),
+                    email: emails[lease.profileKey] ?? "",
                     leaseID: lease.leaseID,
                     state: lease.state.rawValue,
                     plan: account?.plan,
@@ -1716,7 +1801,10 @@ private final class CLILeaseService {
             if CodexLeaseHome.isQuarantined(home: current.home) {
                 throw quarantined(current.home)
             }
-            let excludedKeys = Set(try excludedGiven.map { try resolveAccount($0) })
+            let excludedKeys = Set(try excludedGiven.flatMap { given -> [String] in
+                let matches = try accountStore.resolve(given, allMatches: true)
+                return matches.isEmpty ? [try resolveAccount(given)] : matches
+            })
             // An unusable registry makes nothing leasable; say so instead of no_candidate.
             try ensureRegistryUsable()
             let candidates = annotateLeasable(accountStore.accounts())
@@ -1781,8 +1869,10 @@ private final class CLILeaseService {
                         home: leased.home,
                         holder: leased.holder,
                         returnedHandle: returned.handle,
+                        returnedEmail: returned.email,
                         returnSync: returned.sync,
                         leasedHandle: leased.handle,
+                        leasedEmail: leased.email,
                         leaseID: leased.leaseID,
                         leasedAt: leased.leasedAt
                     )
@@ -1821,7 +1911,7 @@ private final class CLILeaseService {
     }
 
     private func resolveAccount(_ given: String) throws -> String {
-        guard let profileKey = CodexAccountHandle.resolve(given, among: accountStore.accounts().map(\.profileKey)) else {
+        guard let profileKey = try accountStore.resolve(given).first else {
             throw refused("unknown_profile", "\(Self.display(given)) is not in Switchboard's account list.")
         }
         return profileKey
@@ -2444,7 +2534,7 @@ private struct QuotaWindowPayload: Codable {
 
 private struct AccountPayload: Codable {
     let profileKey: String
-    let email: String
+    var email: String
     let workspace: String
     let plan: String
     let sessionFreePercent: Double
@@ -2704,6 +2794,7 @@ private struct SwitchSurfacePayload: Codable {
 private struct LeasePayload: Codable {
     let generatedAt: Date
     let handle: String
+    let email: String
     let leaseID: String
     let home: String
     let holder: String
@@ -2715,6 +2806,7 @@ private struct LeasePayload: Codable {
     enum CodingKeys: String, CodingKey {
         case generatedAt = "generated_at"
         case handle
+        case email
         case leaseID = "lease_id"
         case home
         case holder
@@ -2728,6 +2820,7 @@ private struct LeasePayload: Codable {
 private struct LeaseReturnPayload: Codable {
     let generatedAt: Date
     let handle: String
+    let email: String
     let leaseID: String
     let home: String
     let holder: String
@@ -2738,6 +2831,7 @@ private struct LeaseReturnPayload: Codable {
     enum CodingKeys: String, CodingKey {
         case generatedAt = "generated_at"
         case handle
+        case email
         case leaseID = "lease_id"
         case home
         case holder
@@ -2749,6 +2843,7 @@ private struct LeaseReturnPayload: Codable {
 
 private struct LeaseStatusPayload: Codable {
     let handle: String
+    let email: String
     let leaseID: String
     let state: String
     let plan: String?
@@ -2769,6 +2864,7 @@ private struct LeaseStatusPayload: Codable {
 
     enum CodingKeys: String, CodingKey {
         case handle
+        case email
         case leaseID = "lease_id"
         case state
         case plan
@@ -2794,8 +2890,10 @@ private struct LeaseSwapPayload: Codable {
     let home: String
     let holder: String
     let returnedHandle: String
+    let returnedEmail: String
     let returnSync: String
     let leasedHandle: String
+    let leasedEmail: String
     let leaseID: String
     let leasedAt: Date
 
@@ -2804,16 +2902,25 @@ private struct LeaseSwapPayload: Codable {
         case home
         case holder
         case returnedHandle = "returned_handle"
+        case returnedEmail = "returned_email"
         case returnSync = "return_sync"
         case leasedHandle = "leased_handle"
+        case leasedEmail = "leased_email"
         case leaseID = "lease_id"
         case leasedAt = "leased_at"
     }
 }
 
-/// `status --leasable-only`: what an agent needs to pick an account to lease, named by handle only.
+/// `resolve`: the account a name names, by handle and email.
+private struct ResolvePayload: Codable {
+    let handle: String
+    let email: String
+}
+
+/// `status --leasable-only`: what an agent needs to pick an account to lease, named by email and handle.
 private struct LeasableAccountPayload: Codable {
     let handle: String
+    let email: String
     let plan: String
     let sessionFreePercent: Double
     let weeklyFreePercent: Double
@@ -2823,6 +2930,7 @@ private struct LeasableAccountPayload: Codable {
 
     enum CodingKeys: String, CodingKey {
         case handle
+        case email
         case plan
         case sessionFreePercent = "session_free_percent"
         case weeklyFreePercent = "weekly_free_percent"
@@ -2831,8 +2939,9 @@ private struct LeasableAccountPayload: Codable {
         case nextResetAt = "next_reset_at"
     }
 
-    init(_ account: AccountPayload) {
+    init(_ account: AccountPayload, email: String) {
         handle = account.handle
+        self.email = email
         plan = account.plan
         sessionFreePercent = account.sessionFreePercent
         weeklyFreePercent = account.weeklyFreePercent
@@ -2968,6 +3077,7 @@ private enum EncodablePayload {
     case leaseReturn(LeaseReturnPayload)
     case leases(LeasesPayload)
     case leaseSwap(LeaseSwapPayload)
+    case resolve(ResolvePayload)
     case doctor(DoctorPayload)
     case autoSwapStatus(AutoSwapStatusPayload)
     case autoSwapRun(AutoSwapRunPayload)
@@ -3085,6 +3195,8 @@ private enum Output {
                 text = encodeJSON(value)
             case let .leaseSwap(value):
                 text = encodeJSON(value)
+            case let .resolve(value):
+                text = encodeJSON(value)
             case let .doctor(value):
                 text = encodeJSON(value)
             case let .autoSwapStatus(value):
@@ -3106,19 +3218,21 @@ private enum Output {
         case let .status(value):
             text = "surfaces: \(value.surfaces.count), accounts: \(value.accounts.count)"
         case let .leasableStatus(value):
-            text = (["leasable accounts: \(value.accounts.count)"] + value.accounts.map { "\($0.handle) \($0.plan)" })
+            text = (["leasable accounts: \(value.accounts.count)"] + value.accounts.map { "\($0.handle) \($0.email) \($0.plan)" })
                 .joined(separator: "\n")
         case let .switchOutcome(value):
             text = "switched \(value.profileKey) on \(value.surfaces.map { $0.kind.rawValue }.joined(separator: ","))"
         case let .lease(value):
-            text = "leased to \(value.holder) at \(value.home)"
+            text = "leased \(value.handle) \(value.email) to \(value.holder) at \(value.home)"
         case let .leaseReturn(value):
-            text = "returned from \(value.holder) at \(value.home), sync: \(value.sync)"
+            text = "returned \(value.handle) \(value.email) from \(value.holder) at \(value.home), sync: \(value.sync)"
         case let .leases(value):
-            text = (["leases: \(value.leases.count)"] + value.leases.map { "\($0.holder) \($0.home)" })
+            text = (["leases: \(value.leases.count)"] + value.leases.map { "\($0.handle) \($0.email) \($0.holder) \($0.home)" })
                 .joined(separator: "\n")
         case let .leaseSwap(value):
-            text = "swapped the lease at \(value.home) for \(value.holder), returned sync: \(value.returnSync)"
+            text = "swapped \(value.returnedHandle) \(value.returnedEmail) for \(value.leasedHandle) \(value.leasedEmail) at \(value.home) for \(value.holder), returned sync: \(value.returnSync)"
+        case let .resolve(value):
+            text = "\(value.handle) \(value.email)"
         case let .doctor(value):
             text = "consumers_running: \(value.consumersRunning), unsupported_surfaces: \(value.unsupportedSurfaces.map(\.rawValue).joined(separator: ","))"
         case let .autoSwapStatus(value):

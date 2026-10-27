@@ -438,8 +438,8 @@ public enum CodexLeaseSyncError: LocalizedError {
     }
 }
 
-/// An opaque name for an account in leasing output. Profile keys embed the account's email, so lease
-/// commands print this instead, and `--profile-key` accepts it.
+/// An opaque name for an account in leasing output, shown beside its email. Lease commands print
+/// this instead of the profile key, and `--profile-key` accepts it.
 public enum CodexAccountHandle {
     public static func handle(for profileKey: String) -> String {
         "acct_" + digest(profileKey)

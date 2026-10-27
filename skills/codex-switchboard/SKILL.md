@@ -12,7 +12,7 @@ Use the local `codex-switchboard` CLI to inspect Codex Desktop/CLI auth surfaces
 ## Required Rules
 
 - Use only local CLI commands; do not read or print raw `~/.codex/auth.json` or captured profile auth files.
-- Name accounts by their handle (`acct_` plus 12 hex digits). Never print a profile key, email, account id, or another lane's holder name: pipe every `--json` command through a `jq` that keeps only the fields shown here.
+- Name accounts by their email and handle (`acct_` plus 12 hex digits). Agents may print emails and handles, never tokens, account ids, raw auth files, profile keys, or another lane's holder name: pipe every `--json` command through a `jq` that keeps only the fields shown here.
 - Swap the main CLI with `codex-logins.py swap`, never with a raw `switch` or a live `autoswap run-once`. Before any switch you were asked to make to one named account, run `codex-logins.py check-switch` on it and stop on any nonzero exit.
 - Never switch to a leased account or a registry-reserved account. A leased account's token chain belongs to its lease home, and a second live copy logs both out; a reserved account's quota belongs to its own consumer.
 - Do not switch to free-plan accounts unless the user explicitly requests that exact account.
@@ -61,16 +61,16 @@ Exit codes, for `check-switch` and `swap`; any nonzero means the main CLI was no
 | 1 | The account is registry-reserved, or shares its email with a reserved one. | |
 | 2 | The registry is missing, cannot be read, or reserves a key Switchboard no longer lists. | Same; nothing was switched. |
 | 3 | The account is leased (`leasing`, `active` or `returning`), or shares its email with a leased one. | |
-| 4 | Switchboard's account or lease state cannot be read. | Same; nothing was switched. |
+| 4 | Switchboard's account or lease state cannot be read, the name matches no account or several, or an account the seat check compares has no stored email. | Same; nothing was switched (a candidate with no stored email is skipped). |
 | 5 | | No paid, usable account other than the current one passes. |
 | 6 | | Switchboard refused or failed the switch; the message gives its `error` code. |
 | 7 | | The switch did not take, or cannot be confirmed. |
 
-For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys:
+For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys. `check-switch` takes a handle, a profile key or an email, asks `codex-switchboard resolve` which account that names (the same rules `lease` and `switch` use, so an email shared by several accounts exits 4), and on exit 0 prints the handle it checked; switch by that handle:
 
 ```bash
 set -o pipefail
-python3 scripts/codex-logins.py check-switch --profile-key "$HANDLE" \
+HANDLE=$(python3 scripts/codex-logins.py check-switch --profile-key "$ACCOUNT") \
   && codex-switchboard switch --profile-key "$HANDLE" --surface cli --json | jq '{error}' \
   && codex-switchboard status --json --surface cli \
   | jq -e --arg h "$HANDLE" '(.surfaces[] | select(.kind == "cli") | .active_profile_key) as $k | [.accounts[] | select(.profile_key == $k) | .handle] == [$h]'
@@ -86,16 +86,16 @@ The app's auto-swap policy (`autoswap enable|disable|status|run-once`) is the us
 
 A lease lends one account's captured auth to a separate `CODEX_HOME`, so an automated lane runs on its own account without touching the main CLI or Desktop sign-in. While a lease is active its home is the account's only live holder: `switch`, `autoswap`, and the app's own switching, sign-in, removal and token refresh all leave the account alone, and the Switchboard app writes every token rotation in the home back to the stored profile. `return` writes the latest token back and clears the lease.
 
-Lease commands name an account by an opaque **handle**, `acct_` plus 12 hex digits, never by email or profile key. `--profile-key` accepts a handle or a profile key.
+Lease commands show each account's **email beside its handle**, `acct_` plus 12 hex digits. `--profile-key` accepts a profile key, a handle or an email. Email lookup trims whitespace and ignores case. A shared email refuses with `ambiguous_account`, listing matching handles, plans and workspaces; pass one of those handles. `return` matches only leased keys. `--exclude-profile-key EMAIL` excludes every account matching that email. `codex-switchboard resolve --profile-key NAME --json` is read-only and prints the `handle` and `email` a name resolves to, or refuses `ambiguous_account` or `unknown_profile`.
 
 1. See which accounts you can lease. Every account listed is unleased, not registry-reserved, on a known paid plan, with usable quota, no re-login needed, not the active account of the CLI or Desktop surface, and not being refreshed by the app right now (`lease` refuses `refresh_in_progress` meanwhile):
 
 ```bash
 codex-switchboard status --json --leasable-only \
-  | jq '[.accounts[] | {handle, plan, session_free_percent, weekly_free_percent, score, next_reset_at}]'
+  | jq '[.accounts[] | {handle, email, plan, session_free_percent, weekly_free_percent, score, next_reset_at}]'
 ```
 
-Drop `--leasable-only` to see every account with its `handle`, `plan`, free percentages, `leased`, `lease_holder`, `lease_quarantined`, `reserved` and `leasable`. `reserved: true` means the codex-logins registry (`~/.config/codex-logins/registry.json`) sets the account aside for one consumer with its own sign-in; it is never leased or picked by auto-swap, and no lease or switch goes into a registered home. If that registry cannot be read, lists a login without a `profile_key`, or lists a key Switchboard no longer has (a stale registry entry), nothing is leasable.
+Drop `--leasable-only` to see every account with its `handle`, `email`, `plan`, free percentages, `leased`, `lease_holder`, `lease_quarantined`, `reserved` and `leasable`. `reserved: true` means the codex-logins registry (`~/.config/codex-logins/registry.json`) sets the account aside for one consumer with its own sign-in; it is never leased or picked by auto-swap, and no lease or switch goes into a registered home. If that registry cannot be read, lists a login without a `profile_key`, or lists a key Switchboard no longer has (a stale registry entry), nothing is leasable.
 
 Choose the highest `score`.
 
@@ -103,7 +103,7 @@ Choose the highest `score`.
 
 ```bash
 codex-switchboard lease --profile-key "$HANDLE" --home "$LANE_HOME" --holder "$LANE_NAME" --json \
-  | jq '{handle, lease_id, home, holder, leased_at, auth_written, config_written}'
+  | jq '{handle, email, lease_id, home, holder, leased_at, auth_written, config_written}'
 ```
 
 `lease` takes `$LANE_HOME/holder.lock` and writes only into a directory that is new, or whose `auth.json` is absent, a return's tombstone, or already exactly the stored token, never into a registry, CLI or Desktop home. It writes, in this order: `$LANE_HOME/lease.json` (the lease id, the holder and the time; no account), the lease journal entry as `leasing`, `$LANE_HOME/config.toml` when the home has none, then `auth.json` (mode `0600`), and then marks the lease `active`. The `config.toml` keeps Codex on the file store (`cli_auth_credentials_store = "file"`) and points `CODEX_HOME` for commands Codex runs at a path that does not exist, so a `codex` started by a command Codex runs, without setting `CODEX_HOME` itself, does not inherit the home's token. A command that sets `CODEX_HOME` to the home itself is not covered, nor is a process the lane's shell starts (see one Codex per lease home, below). An existing `config.toml` is kept as it is (`config_written: false`) only when it already sets both; otherwise `lease` refuses `home_config_unsafe`.
@@ -120,7 +120,7 @@ codex-switchboard lease --profile-key "$HANDLE" --home "$LANE_HOME" --holder "$L
 
 ```bash
 codex-switchboard leases --json \
-  | jq '[.leases[] | {handle, lease_id, state, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
+  | jq '[.leases[] | {handle, email, lease_id, state, home, home_auth_present, home_matches_stored_profile, holder_running, active_on_surface, quarantined, quarantined_since}]'
 ```
 
 `state` is `leasing` until the home's `auth.json` is written, then `active`, and `returning` once a return starts, until it finishes; every state counts as leased. `holder_running: true` means a process holds `holder.lock`. `home_matches_stored_profile: false` means the home holds a rotation the stored profile has not picked up yet; the running app mirrors it within seconds, and `return` always writes it back. `active_on_surface: true` means something switched a surface to the leased account outside Switchboard; stop and report it.
@@ -129,7 +129,7 @@ codex-switchboard leases --json \
 
 ```bash
 codex-switchboard swap-lease --home "$LANE_HOME" --holder "$LANE_NAME" --json \
-  | jq '{returned_handle, return_sync, leased_handle, lease_id, holder}'
+  | jq '{returned_handle, returned_email, return_sync, leased_handle, leased_email, lease_id, holder}'
 ```
 
 This returns the current account (writing its latest token back) and leases the best leasable account into the same home under the same holder, all under one hold of `holder.lock`. Pass `--profile-key HANDLE` to choose the account, or `--exclude-profile-key HANDLE` (repeatable) to skip more accounts. A refusal before the return leaves the lane as it was; `swap_incomplete` means the return happened but the new lease failed, so the home holds no account.
@@ -138,7 +138,7 @@ This returns the current account (writing its latest token back) and leases the 
 
 ```bash
 codex-switchboard return --profile-key "$HANDLE" --home "$LANE_HOME" --json \
-  | jq '{handle, lease_id, holder, sync, home_auth_tombstoned}'
+  | jq '{handle, email, lease_id, holder, sync, home_auth_tombstoned}'
 ```
 
 Return re-reads the home under both locks, writes its token into the stored profile, then replaces `auth.json` with a tombstone (`{"switchboard_returned": {"lease_id", "returned_at"}}`, no token) and removes the journal entry. `sync` is `rotated` when the home held a newer token, `unchanged` when it did not, `home_returned` when an earlier, interrupted return had already written this lease's tombstone, or `home_auth_missing` when the lease stopped while `leasing`, so it lent nothing. A tombstoned home can take a new lease.
@@ -149,6 +149,7 @@ Refusals exit with status 2 and a JSON `error` code. Report the code; never work
 
 | `error` | Meaning |
 |---------|---------|
+| `ambiguous_account` | The email names more than one account; `details` lists each as `handle plan workspace`. Pass one of those handles. |
 | `active_account` | The account is the active CLI or Desktop account. Pick another. |
 | `surface_identity_unknown` | A surface keeps its sign-in in a keychain or auto store, so Switchboard cannot tell which account it uses. Nothing is leased until it can. |
 | `reserved_account`, `home_reserved` | The account is registry-reserved, or the home is a registry-reserved login's home. |
@@ -193,7 +194,7 @@ Correct behavior:
 
 Incorrect behavior:
 
-- Reading `auth.json` into chat, or printing profile keys, emails or account JSON.
+- Reading `auth.json` into chat, or printing tokens, account ids, profile keys or raw account JSON.
 - Switching with a raw `switch` or a live `autoswap run-once` instead of `codex-logins.py swap`.
 - Switching to a leased or reserved account, or retrying around a nonzero `check-switch`.
 - Choosing a free plan because it has reset sooner.

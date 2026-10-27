@@ -48,7 +48,7 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertEqual((list.json["leases"] as? [Any])?.count, 0)
     }
 
-    func testOutputNeverCarriesTokensOrIdentity() throws {
+    func testOutputShowsEmailsButNeverTokensOrAccountIDs() throws {
         let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
         let outputs = [
             fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]),
@@ -57,9 +57,232 @@ final class CodexLeaseTests: XCTestCase {
         ]
         for output in outputs {
             XCTAssertEqual(output.exitCode, 0, output.text)
-            for secret in ["refresh-k-1", "access-k-1", "k@example.invalid", "acct-k", "sub-k"] {
+            XCTAssertTrue(output.text.contains("k@example.invalid"))
+            for secret in ["refresh-k-1", "access-k-1", "acct-k", "sub-k"] {
                 XCTAssertFalse(output.text.contains(secret), "\(secret) leaked into lease output")
             }
+        }
+    }
+
+    func testLeaseAndReturnByEmailIgnoreCaseAndWhitespace() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let leased = fixture.run(["lease", "--profile-key", "  K@EXAMPLE.INVALID\n", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(leased.exitCode, 0, leased.text)
+        XCTAssertEqual(leased.json["email"] as? String, "k@example.invalid")
+        XCTAssertEqual(leased.json["handle"] as? String, CodexAccountHandle.handle(for: "profile-k"))
+
+        // A second unleased key with this email must not make return ambiguous.
+        try fixture.addKey("another-k", sameSeatAs: "profile-k")
+        let returned = fixture.run(["return", "--profile-key", " K@EXAMPLE.INVALID ", "--home", home.path, "--json"])
+        XCTAssertEqual(returned.exitCode, 0, returned.text)
+        XCTAssertEqual(returned.json["email"] as? String, "k@example.invalid")
+        let again = fixture.run(["return", "--profile-key", "K@EXAMPLE.INVALID", "--home", home.path, "--json"])
+        XCTAssertEqual(again.json["error"] as? String, "not_leased")
+        XCTAssertFalse(again.text.lowercased().contains("example.invalid"))
+    }
+
+    func testProfileKeyAndHandleTakePrecedenceOverEmail() throws {
+        // Both values also occur as a different account's email.
+        try fixture.setEmail("profile-k", for: "profile-b")
+        let handle = CodexAccountHandle.handle(for: "profile-k")
+        try fixture.setEmail(handle, for: "profile-f")
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        for name in ["profile-k", handle] {
+            let leased = fixture.run(["lease", "--profile-key", name, "--home", home.path, "--holder", "bench", "--json"])
+            XCTAssertEqual(leased.exitCode, 0, leased.text)
+            XCTAssertEqual(leased.json["handle"] as? String, handle)
+            XCTAssertEqual(fixture.run(["return", "--profile-key", name, "--home", home.path, "--json"]).exitCode, 0)
+        }
+    }
+
+    func testSharedEmailRefusesLeaseSwapAndSwitchWithoutEchoingArgument() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-b", "--home", home.path, "--holder", "bench", "--json"]).exitCode, 0)
+        try fixture.addKey("another-k", sameSeatAs: "profile-k")
+        let given = " K@EXAMPLE.INVALID "
+        let outputs = [
+            fixture.run(["lease", "--profile-key", given, "--home", fixture.root.appendingPathComponent("other-home").path, "--holder", "bench", "--json"]),
+            fixture.run(["swap-lease", "--profile-key", given, "--home", home.path, "--holder", "bench", "--json"]),
+            fixture.run(["switch", "--profile-key", given, "--surface", "cli", "--json"]),
+        ]
+        let handles = ["profile-k", "another-k"].map { CodexAccountHandle.handle(for: $0) }
+        for output in outputs {
+            XCTAssertEqual(output.exitCode, 2, output.text)
+            XCTAssertEqual(output.json["error"] as? String, "ambiguous_account")
+            let details = try XCTUnwrap(output.json["details"] as? [String])
+            XCTAssertEqual(details.count, 2)
+            for handle in handles { XCTAssertTrue(details.contains { $0.hasPrefix(handle + " ") }) }
+            XCTAssertTrue(details.contains(CodexAccountHandle.handle(for: "profile-k") + " pro Personal"))
+            XCTAssertTrue((output.json["message"] as? String)?.contains("pass one") == true)
+            // Lowercased, so an echo of the argument in any case or without its spaces is caught too.
+            for secret in ["example.invalid", "profile-k", "another-k", "acct-k", "refresh-k"] {
+                XCTAssertFalse(output.text.lowercased().contains(secret), output.text)
+            }
+        }
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-b"])
+        XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-b-1")
+    }
+
+    func testReturnByEmailRefusesTwoLeasedKeysBeforeChangingJournal() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        try fixture.addKey("another-k", sameSeatAs: "profile-k")
+        let leases = ["profile-k", "another-k"].map {
+            CodexLease(profileKey: $0, home: home.path + "-" + $0, holder: "bench", profileDirectory: nil)
+        }
+        let store = CodexLeaseStore(appSupportURL: fixture.appSupport)
+        try store.save(leases)
+        let journalURL = fixture.appSupport.appendingPathComponent("leases.json")
+        let before = try Data(contentsOf: journalURL)
+        let output = fixture.run(["return", "--profile-key", "K@EXAMPLE.INVALID", "--home", home.path, "--json"])
+        XCTAssertEqual(output.exitCode, 2, output.text)
+        XCTAssertEqual(output.json["error"] as? String, "ambiguous_account")
+        XCTAssertEqual((output.json["details"] as? [String])?.count, 2)
+        XCTAssertFalse(output.text.lowercased().contains("example.invalid"))
+        XCTAssertEqual(try Data(contentsOf: journalURL), before)
+    }
+
+    func testSwapByEmailAndExclusionByEmail() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode, 0)
+        let excluded = fixture.run(["swap-lease", "--exclude-profile-key", " B@EXAMPLE.INVALID ", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(excluded.json["error"] as? String, "no_candidate")
+        let swapped = fixture.run(["swap-lease", "--profile-key", " B@EXAMPLE.INVALID ", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(swapped.exitCode, 0, swapped.text)
+        XCTAssertEqual(swapped.json["returned_email"] as? String, "k@example.invalid")
+        XCTAssertEqual(swapped.json["leased_email"] as? String, "b@example.invalid")
+    }
+
+    func testSharedEmailExcludesAllMatchesAndResolvedAliasConflictStillRefuses() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode, 0)
+        // B and F remain distinct seats but have the same account email.
+        try fixture.setEmail("B@EXAMPLE.INVALID", for: "profile-f")
+        let excluded = fixture.run(["swap-lease", "--exclude-profile-key", "b@example.invalid", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(excluded.json["error"] as? String, "no_candidate")
+        let conflict = fixture.run(["swap-lease", "--profile-key", CodexAccountHandle.handle(for: "profile-f"), "--exclude-profile-key", "b@example.invalid", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(conflict.exitCode, 64)
+        XCTAssertTrue(conflict.text.contains("is also excluded"))
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+    }
+
+    func testSwitchByEmailStillChecksLeasedSeat() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode, 0)
+        let output = fixture.run(["switch", "--profile-key", " K@EXAMPLE.INVALID ", "--surface", "cli", "--json"])
+        XCTAssertEqual(output.json["error"] as? String, "account_leased")
+        XCTAssertFalse(output.text.lowercased().contains("example.invalid"))
+    }
+
+    func testEmailLookupAndLeaseListUseAccountsJSONRatherThanSnapshot() throws {
+        try fixture.setEmail("new@example.invalid", for: "profile-k")
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        // The leasable list prints the email that --profile-key accepts, not the snapshot's.
+        let leasable = fixture.run(["status", "--json", "--leasable-only"])
+        let listedK = (leasable.json["accounts"] as? [[String: Any]])?
+            .first { $0["handle"] as? String == CodexAccountHandle.handle(for: "profile-k") }
+        XCTAssertEqual(listedK?["email"] as? String, "new@example.invalid")
+        XCTAssertFalse(leasable.text.contains("k@example.invalid"))
+        // So does the full status, which codex-logins.py check-switch matches emails against.
+        let status = fixture.run(["status", "--json"])
+        let fullK = (status.json["accounts"] as? [[String: Any]])?.first { $0["profile_key"] as? String == "profile-k" }
+        XCTAssertEqual(fullK?["email"] as? String, "new@example.invalid")
+        let leased = fixture.run(["lease", "--profile-key", "NEW@EXAMPLE.INVALID", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(leased.exitCode, 0, leased.text)
+        XCTAssertEqual(leased.json["email"] as? String, "new@example.invalid")
+        let listed = fixture.run(["leases", "--json"])
+        XCTAssertEqual((listed.json["leases"] as? [[String: Any]])?.first?["email"] as? String, "new@example.invalid")
+    }
+
+    func testStatusShowsOnlyStoredEmails() throws {
+        // B has no stored email and F stores B's old email, so only F may show it: --profile-key resolves it to F.
+        try fixture.setEmail("", for: "profile-b")
+        try fixture.setEmail("b@example.invalid", for: "profile-f")
+        let status = fixture.run(["status", "--json"])
+        let accounts = status.json["accounts"] as? [[String: Any]] ?? []
+        let emailOf = { (key: String) in accounts.first { $0["profile_key"] as? String == key }?["email"] as? String }
+        XCTAssertEqual(emailOf("profile-b"), "")
+        XCTAssertEqual(emailOf("profile-f"), "b@example.invalid")
+        let resolved = fixture.run(["resolve", "--profile-key", "b@example.invalid", "--json"])
+        XCTAssertEqual(resolved.json["handle"] as? String, CodexAccountHandle.handle(for: "profile-f"))
+        XCTAssertFalse(status.text.contains("acct-b"))
+    }
+
+    func testExclusionByEmailAlsoMatchesTheSnapshotEmail() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        XCTAssertEqual(fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "bench", "--json"]).exitCode, 0)
+        // accounts.json now names B differently from the snapshot; excluding the snapshot's email still skips B.
+        try fixture.setEmail("renamed@example.invalid", for: "profile-b")
+        let excluded = fixture.run(["swap-lease", "--exclude-profile-key", "b@example.invalid", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(excluded.json["error"] as? String, "no_candidate")
+        // Naming an account still takes the accounts.json email only.
+        let named = fixture.run(["swap-lease", "--profile-key", "b@example.invalid", "--home", home.path, "--holder", "bench", "--json"])
+        XCTAssertEqual(named.json["error"] as? String, "unknown_profile")
+        XCTAssertEqual(try CodexLeaseStore(appSupportURL: fixture.appSupport).load().map(\.profileKey), ["profile-k"])
+    }
+
+    func testTextOutputShowsHandleAndEmail() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        let handle = CodexAccountHandle.handle(for: "profile-k")
+        let leasable = fixture.run(["status", "--leasable-only"])
+        XCTAssertEqual(leasable.exitCode, 0, leasable.text)
+        XCTAssertTrue(leasable.text.contains("\(handle) k@example.invalid pro"), leasable.text)
+        let leased = fixture.run(["lease", "--profile-key", handle, "--home", home.path, "--holder", "bench"])
+        XCTAssertEqual(leased.exitCode, 0, leased.text)
+        XCTAssertTrue(leased.text.contains("leased \(handle) k@example.invalid to bench"), leased.text)
+        let listed = fixture.run(["leases"])
+        XCTAssertTrue(listed.text.contains("\(handle) k@example.invalid bench"), listed.text)
+        let returned = fixture.run(["return", "--profile-key", handle, "--home", home.path])
+        XCTAssertEqual(returned.exitCode, 0, returned.text)
+        XCTAssertTrue(returned.text.contains("returned \(handle) k@example.invalid from bench"), returned.text)
+        for output in [leasable, leased, listed, returned] {
+            for secret in ["refresh-k", "access-k", "acct-k", "sub-k", "profile-k"] {
+                XCTAssertFalse(output.text.contains(secret), output.text)
+            }
+        }
+    }
+
+    func testResolveNamesAccountsAsLeaseAndSwitchDo() throws {
+        let handle = CodexAccountHandle.handle(for: "profile-k")
+        for name in ["profile-k", handle, " K@EXAMPLE.INVALID "] {
+            let resolved = fixture.run(["resolve", "--profile-key", name, "--json"])
+            XCTAssertEqual(resolved.exitCode, 0, resolved.text)
+            XCTAssertEqual(resolved.json["handle"] as? String, handle)
+            XCTAssertEqual(resolved.json["email"] as? String, "k@example.invalid")
+            XCTAssertFalse(resolved.text.contains("profile-k"))
+        }
+        let text = fixture.run(["resolve", "--profile-key", handle])
+        XCTAssertEqual(text.text.trimmingCharacters(in: .whitespacesAndNewlines), "\(handle) k@example.invalid")
+
+        // A second key of the seat is in accounts.json but not the snapshot, so status lists one account for the
+        // email while resolve, like lease and switch, sees two.
+        try fixture.addKey("another-k", sameSeatAs: "profile-k")
+        let status = fixture.run(["status", "--json"])
+        let listed = (status.json["accounts"] as? [[String: Any]] ?? []).filter { $0["email"] as? String == "k@example.invalid" }
+        XCTAssertEqual(listed.count, 1)
+        let ambiguous = fixture.run(["resolve", "--profile-key", "k@example.invalid", "--json"])
+        XCTAssertEqual(ambiguous.exitCode, 2, ambiguous.text)
+        XCTAssertEqual(ambiguous.json["error"] as? String, "ambiguous_account")
+        XCTAssertEqual((ambiguous.json["details"] as? [String])?.count, 2)
+
+        let unknown = fixture.run(["resolve", "--profile-key", "Nobody@Example.invalid", "--json"])
+        XCTAssertEqual(unknown.exitCode, 2, unknown.text)
+        XCTAssertEqual(unknown.json["error"] as? String, "unknown_profile")
+        XCTAssertFalse(unknown.text.lowercased().contains("nobody"))
+    }
+
+    func testUnknownLeaseEmailIsEmptyAndUnknownEmailRefusalsAreRedacted() throws {
+        let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
+        try CodexLeaseStore(appSupportURL: fixture.appSupport).save([
+            CodexLease(profileKey: "removed", home: home.path, holder: "bench", profileDirectory: nil),
+        ])
+        let listed = fixture.run(["leases", "--json"])
+        XCTAssertEqual((listed.json["leases"] as? [[String: Any]])?.first?["email"] as? String, "")
+        for command in ["lease", "return"] {
+            var args = [command, "--profile-key", "unknown@example.invalid", "--home", home.path, "--json"]
+            if command == "lease" { args += ["--holder", "bench"] }
+            let output = fixture.run(args)
+            XCTAssertEqual(output.json["error"] as? String, command == "lease" ? "unknown_profile" : "not_leased")
+            XCTAssertFalse(output.text.lowercased().contains("example.invalid"))
         }
     }
 
@@ -444,7 +667,7 @@ final class CodexLeaseTests: XCTestCase {
         let free = leasableOnly.json["accounts"] as? [[String: Any]] ?? []
         XCTAssertEqual(free.compactMap { $0["handle"] as? String }, [CodexAccountHandle.handle(for: "profile-b")])
         XCTAssertFalse(leasableOnly.text.contains("profile-"))
-        XCTAssertFalse(leasableOnly.text.contains("@example.invalid"))
+        XCTAssertEqual(free.compactMap { $0["email"] as? String }, ["b@example.invalid"])
 
         let lease = try XCTUnwrap((fixture.run(["leases", "--json"]).json["leases"] as? [[String: Any]])?.first)
         XCTAssertEqual(lease["plan"] as? String, "pro")
@@ -465,6 +688,8 @@ final class CodexLeaseTests: XCTestCase {
 
         XCTAssertEqual(swapped.exitCode, 0, swapped.text)
         XCTAssertEqual(swapped.json["returned_handle"] as? String, CodexAccountHandle.handle(for: "profile-k"))
+        XCTAssertEqual(swapped.json["returned_email"] as? String, "k@example.invalid")
+        XCTAssertEqual(swapped.json["leased_email"] as? String, "b@example.invalid")
         XCTAssertEqual(swapped.json["return_sync"] as? String, "rotated")
         XCTAssertEqual(swapped.json["leased_handle"] as? String, CodexAccountHandle.handle(for: "profile-b"))
         XCTAssertEqual(swapped.json["holder"] as? String, "bench")
@@ -729,13 +954,15 @@ final class CodexLeaseTests: XCTestCase {
         holder.waitUntilExit()
         let swapped = fixture.run(["swap-lease", "--home", home.path, "--holder", "bench", "--json"])
         XCTAssertEqual(swapped.exitCode, 0, swapped.text)
+        XCTAssertEqual(swapped.json["returned_email"] as? String, "k@example.invalid")
+        XCTAssertEqual(swapped.json["leased_email"] as? String, "b@example.invalid")
         XCTAssertEqual(swapped.json["return_sync"] as? String, "rotated")
         XCTAssertEqual(fixture.refreshToken(in: fixture.profileAuthURL("k")), "refresh-k-3")
         XCTAssertEqual(fixture.accountListRefreshToken("profile-k"), "refresh-k-3")
         XCTAssertEqual(fixture.refreshToken(in: home.appendingPathComponent("auth.json")), "refresh-b-1")
     }
 
-    func testLeaseMarksTheHomeAndNamesTheAccountByHandleOnly() throws {
+    func testLeaseMarksTheHomeAndNamesTheAccountByHandleAndEmail() throws {
         let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
         let handle = CodexAccountHandle.handle(for: "profile-k")
         XCTAssertNotNil(handle.range(of: "^acct_[0-9a-f]{12}$", options: .regularExpression))
@@ -743,6 +970,7 @@ final class CodexLeaseTests: XCTestCase {
         let lease = fixture.run(["lease", "--profile-key", handle, "--home", home.path, "--holder", "bench", "--json"])
         XCTAssertEqual(lease.exitCode, 0, lease.text)
         XCTAssertEqual(lease.json["handle"] as? String, handle)
+        XCTAssertEqual(lease.json["email"] as? String, "k@example.invalid")
         XCTAssertEqual(lease.json["config_written"] as? Bool, true)
         XCTAssertFalse(lease.text.contains("profile-k"))
 
@@ -767,6 +995,7 @@ final class CodexLeaseTests: XCTestCase {
         let leases = fixture.run(["leases", "--json"])
         let listed = try XCTUnwrap((leases.json["leases"] as? [[String: Any]])?.first)
         XCTAssertEqual(listed["handle"] as? String, handle)
+        XCTAssertEqual(listed["email"] as? String, "k@example.invalid")
         XCTAssertEqual(listed["state"] as? String, "active")
         XCTAssertEqual(listed["holder_running"] as? Bool, false)
         XCTAssertFalse(leases.text.contains("profile-k"))
@@ -774,6 +1003,7 @@ final class CodexLeaseTests: XCTestCase {
         let returned = fixture.run(["return", "--profile-key", handle, "--home", home.path, "--json"])
         XCTAssertEqual(returned.exitCode, 0, returned.text)
         XCTAssertEqual(returned.json["handle"] as? String, handle)
+        XCTAssertEqual(returned.json["email"] as? String, "k@example.invalid")
     }
 
     func testLeaseKeepsAnExistingConfigAndReleasesIntoATombstonedHome() throws {
@@ -1431,6 +1661,8 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertTrue(help.text.contains("lease --profile-key <key> --home <dir> --holder <name> --json"))
         XCTAssertTrue(help.text.contains("return --profile-key <key> --home <dir> --json"))
         XCTAssertTrue(help.text.contains("leases --json"))
+        XCTAssertTrue(help.text.contains("<key> may be a profile key, a handle or an email"))
+        XCTAssertTrue(help.text.contains("resolve --profile-key <key> --json"))
         XCTAssertTrue(help.text.contains("swap-lease --home <dir> --holder <name> [--profile-key <key>]"))
     }
 }
@@ -1594,6 +1826,15 @@ private struct LeaseFixture {
         profiles[key] = profiles[existing]
         root["profiles"] = profiles
         try CodexAtomicFile.writeJSON(root, to: accountsURL)
+    }
+
+    func setEmail(_ email: String, for key: String) throws {
+        let url = appSupport.appendingPathComponent("accounts.json")
+        var root = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        var profiles = try XCTUnwrap(root["profiles"] as? [String: [String: Any]])
+        profiles[key]?["email"] = email
+        root["profiles"] = profiles
+        try CodexAtomicFile.writeJSON(root, to: url)
     }
 
     func writeRegistry(_ logins: [[String: Any]]) throws {
