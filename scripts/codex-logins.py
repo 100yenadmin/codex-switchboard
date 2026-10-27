@@ -205,8 +205,8 @@ def handle_for(profile_key):
 
 
 def norm_email(value):
-    # NFC, as Swift compares strings by canonical equivalence. Every email comparison goes through this.
-    return unicodedata.normalize("NFC", str(value or "")).strip().lower()
+    # Lowercase, then NFC, as Swift compares strings by canonical equivalence. Every email comparison goes through this.
+    return unicodedata.normalize("NFC", str(value or "").strip().lower())
 
 
 def email_of(account):
@@ -287,8 +287,8 @@ def verdict(given, reserved, accounts, leased):
     protected = [by_key[k] for k in reserved] + [a for a in accounts if a["handle"] in leased]
     if not leased_exact and any(not email_of(a) for a in protected):
         raise Refusal(4, "a reserved or leased account has no stored email, so the other keys of its seat cannot be found")
-    if not leased_exact and not email and protected:
-        return 4, "%s has no stored email, so it cannot be told apart from a reserved or leased account's seat" % handle
+    if not leased_exact and not email:
+        return 4, "%s has no stored email, so Switchboard cannot tell which seat it is" % handle
     if email and email in {email_of(by_key[k]) for k in reserved}:
         return 1, "%s shares its email with a reserved account" % handle
     if leased_exact:

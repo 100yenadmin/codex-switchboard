@@ -197,6 +197,12 @@ swap_cases = [
     ("swap with no registry: refused", ["swap"], {"registry": MISSING}, 2, None),
     ("swap while a leased account has no stored email: refused", ["swap"],
      {"fixture": mut(lambda d: d["status"]["accounts"][2].update(email=""))}, 4, None),
+    ("swap skips a candidate with no stored email even with nothing protected", ["swap"],
+     {"registry": {"version": 1, "logins": []},
+      "fixture": mut(lambda d: (d["status"]["accounts"][1].update(email=""), d["leases"].update(leases=[]),
+                                [a.update(leased=False) for a in d["status"]["accounts"]],
+                                [a.update(usable_for_codex=False) for a in d["status"]["accounts"] if a["profile_key"] != FREE]))},
+     5, None),
     ("swap skips a candidate with no stored email", ["swap"],
      {"fixture": mut(lambda d: d["status"]["accounts"][1].update(email=""))}, 5, None),
 ]
@@ -228,6 +234,11 @@ def reserved_after():
 register_cases = [
     # name, home, purpose, kwargs, exit, profile keys the registry must hold afterwards
     ("register a spare account", login_home("free", "free@example.invalid"), "spare-bench", {}, 0, [RES, FREE]),
+    ("register the account a surface names by an email in another case and form: refused",
+     login_home("rho", "\u03c1\u0313@example.invalid"), "spare-bench",
+     {"fixture": mut(lambda d: (d["status"]["accounts"][1].update(email="\u03c1\u0313@example.invalid"),
+                               d["status"]["surfaces"].append({"kind": "desktop", "active_email": "\u03a1\u0313@example.invalid"})))},
+     1, [RES]),
     ("register a login whose email is decomposed Unicode", login_home("cafe", "Cafe\u0301@example.invalid"), "spare-bench",
      {"fixture": mut(lambda d: d["status"]["accounts"][1].update(email="caf\u00e9@example.invalid"))}, 0, [RES, FREE]),
     ("register the main CLI account: refused", login_home("main", "main@example.invalid"), "spare-bench", {}, 1, [RES]),
