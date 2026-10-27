@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Fake codex-switchboard for the codex-logins tests. Each command's output comes from $FAKE_CS_FIXTURE:
 {"status": <obj> | "!exit" | "!garbage" | "!list", "leases": ..., "switch": "!ok" | "!exit" | "!noop" | "!hang"};
-"!badutf8" prints bytes that are not UTF-8.
+"!badutf8" prints bytes that are not UTF-8. `resolve` matches a key, a handle or an email (any case) among the status
+accounts, unless "resolve" maps the name to a reply ({"error": ...} replies exit 2) or is "!exit"/"!garbage"/"!badutf8".
 A successful switch records its --profile-key in the fixture's "switched" list and makes that account the CLI's
 active one. Exits 99 if CODEX_HOME reaches it."""
 import hashlib
@@ -18,6 +19,29 @@ cmd = sys.argv[1]
 if "--json" not in sys.argv:
     sys.exit(64)
 out = fx.get(cmd, "!exit")
+if cmd == "resolve":
+    given = sys.argv[sys.argv.index("--profile-key") + 1]
+    override = fx.get("resolve")
+    if isinstance(override, dict) and given in override:
+        reply = override[given]
+    elif isinstance(override, str):
+        out = override
+        reply = None
+    else:
+        def handle(k):
+            return "acct_" + hashlib.sha256(k.encode()).hexdigest()[:12]
+        accounts = fx["status"]["accounts"] if isinstance(fx.get("status"), dict) else []
+        hits = [a for a in accounts if given in (a["profile_key"], handle(a["profile_key"]))] or [
+            a for a in accounts if given.strip() and str(a.get("email", "")).strip().lower() == given.strip().lower()]
+        if len(hits) == 1:
+            reply = {"handle": handle(hits[0]["profile_key"]), "email": hits[0].get("email", "")}
+        elif hits:
+            reply = {"error": "ambiguous_account", "details": ["%s pro Personal" % handle(a["profile_key"]) for a in hits]}
+        else:
+            reply = {"error": "unknown_profile"}
+    if reply is not None:
+        print(json.dumps(reply))
+        sys.exit(2 if "error" in reply else 0)
 if cmd == "switch":
     given = sys.argv[sys.argv.index("--profile-key") + 1]
     if out == "!hang":

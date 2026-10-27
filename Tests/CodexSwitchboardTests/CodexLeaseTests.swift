@@ -227,6 +227,35 @@ final class CodexLeaseTests: XCTestCase {
         }
     }
 
+    func testResolveNamesAccountsAsLeaseAndSwitchDo() throws {
+        let handle = CodexAccountHandle.handle(for: "profile-k")
+        for name in ["profile-k", handle, " K@EXAMPLE.INVALID "] {
+            let resolved = fixture.run(["resolve", "--profile-key", name, "--json"])
+            XCTAssertEqual(resolved.exitCode, 0, resolved.text)
+            XCTAssertEqual(resolved.json["handle"] as? String, handle)
+            XCTAssertEqual(resolved.json["email"] as? String, "k@example.invalid")
+            XCTAssertFalse(resolved.text.contains("profile-k"))
+        }
+        let text = fixture.run(["resolve", "--profile-key", handle])
+        XCTAssertEqual(text.text.trimmingCharacters(in: .whitespacesAndNewlines), "\(handle) k@example.invalid")
+
+        // A second key of the seat is in accounts.json but not the snapshot, so status lists one account for the
+        // email while resolve, like lease and switch, sees two.
+        try fixture.addKey("another-k", sameSeatAs: "profile-k")
+        let status = fixture.run(["status", "--json"])
+        let listed = (status.json["accounts"] as? [[String: Any]] ?? []).filter { $0["email"] as? String == "k@example.invalid" }
+        XCTAssertEqual(listed.count, 1)
+        let ambiguous = fixture.run(["resolve", "--profile-key", "k@example.invalid", "--json"])
+        XCTAssertEqual(ambiguous.exitCode, 2, ambiguous.text)
+        XCTAssertEqual(ambiguous.json["error"] as? String, "ambiguous_account")
+        XCTAssertEqual((ambiguous.json["details"] as? [String])?.count, 2)
+
+        let unknown = fixture.run(["resolve", "--profile-key", "Nobody@Example.invalid", "--json"])
+        XCTAssertEqual(unknown.exitCode, 2, unknown.text)
+        XCTAssertEqual(unknown.json["error"] as? String, "unknown_profile")
+        XCTAssertFalse(unknown.text.lowercased().contains("nobody"))
+    }
+
     func testUnknownLeaseEmailIsEmptyAndUnknownEmailRefusalsAreRedacted() throws {
         let home = fixture.root.appendingPathComponent("lane-home", isDirectory: true)
         try CodexLeaseStore(appSupportURL: fixture.appSupport).save([
@@ -1619,6 +1648,7 @@ final class CodexLeaseTests: XCTestCase {
         XCTAssertTrue(help.text.contains("return --profile-key <key> --home <dir> --json"))
         XCTAssertTrue(help.text.contains("leases --json"))
         XCTAssertTrue(help.text.contains("<key> may be a profile key, a handle or an email"))
+        XCTAssertTrue(help.text.contains("resolve --profile-key <key> --json"))
         XCTAssertTrue(help.text.contains("swap-lease --home <dir> --holder <name> [--profile-key <key>]"))
     }
 }

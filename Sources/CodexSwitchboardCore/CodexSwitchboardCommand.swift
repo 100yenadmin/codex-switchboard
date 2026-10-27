@@ -96,6 +96,8 @@ private final class CommandRunner {
             return try leases(Array(arguments.dropFirst()))
         case "swap-lease":
             return try swapLease(Array(arguments.dropFirst()))
+        case "resolve":
+            return try resolveName(Array(arguments.dropFirst()))
         case "doctor":
             return try doctor(Array(arguments.dropFirst()))
         case "autoswap":
@@ -175,6 +177,17 @@ private final class CommandRunner {
             holder: options.holder
         )
         return CommandResult(payload: .leaseSwap(outcome), json: options.json, exitCode: 0)
+    }
+
+    /// Read-only: the account a name resolves to, by the rules `lease` and `switch` use, so a tool that checks a
+    /// name first checks the account those commands would pick.
+    private func resolveName(_ args: [String]) throws -> CommandResult {
+        let options = try ResolveOptions.parse(args)
+        guard let profileKey = try accountStore.resolve(options.profileKey).first else {
+            throw CLIError.refused(code: "unknown_profile", message: "No account in Switchboard's account list has that name.", details: nil)
+        }
+        let payload = ResolvePayload(handle: CodexAccountHandle.handle(for: profileKey), email: accountStore.email(for: profileKey))
+        return CommandResult(payload: .resolve(payload), json: options.json, exitCode: 0)
     }
 
     private func leases(_ args: [String]) throws -> CommandResult {
@@ -375,6 +388,8 @@ private final class CommandRunner {
     codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
     codex-switchboard return --profile-key <key> --home <dir> --json
     codex-switchboard leases --json
+    codex-switchboard resolve --profile-key <key> --json
+        (read-only: the handle and email of the account <key> names, as lease and switch resolve it)
     codex-switchboard swap-lease --home <dir> --holder <name> [--profile-key <key>] [--exclude-profile-key <key>]... --json
         (accounts show email beside handle, acct_ plus 12 hex digits; <key> may be a profile key, a handle or an email)
     codex-switchboard autoswap status --json [--surface all|desktop|cli]
@@ -543,6 +558,19 @@ private struct ReturnOptions {
         let home = try parser.takeRequiredValue("--home")
         try parser.finish()
         return ReturnOptions(json: json, profileKey: profileKey, home: home)
+    }
+}
+
+private struct ResolveOptions {
+    let json: Bool
+    let profileKey: String
+
+    static func parse(_ args: [String]) throws -> ResolveOptions {
+        var parser = ArgumentParser(args)
+        let json = parser.takeFlag("--json")
+        let profileKey = try parser.takeRequiredValue("--profile-key")
+        try parser.finish()
+        return ResolveOptions(json: json, profileKey: profileKey)
     }
 }
 
@@ -2884,6 +2912,12 @@ private struct LeaseSwapPayload: Codable {
     }
 }
 
+/// `resolve`: the account a name names, by handle and email.
+private struct ResolvePayload: Codable {
+    let handle: String
+    let email: String
+}
+
 /// `status --leasable-only`: what an agent needs to pick an account to lease, named by email and handle.
 private struct LeasableAccountPayload: Codable {
     let handle: String
@@ -3044,6 +3078,7 @@ private enum EncodablePayload {
     case leaseReturn(LeaseReturnPayload)
     case leases(LeasesPayload)
     case leaseSwap(LeaseSwapPayload)
+    case resolve(ResolvePayload)
     case doctor(DoctorPayload)
     case autoSwapStatus(AutoSwapStatusPayload)
     case autoSwapRun(AutoSwapRunPayload)
@@ -3161,6 +3196,8 @@ private enum Output {
                 text = encodeJSON(value)
             case let .leaseSwap(value):
                 text = encodeJSON(value)
+            case let .resolve(value):
+                text = encodeJSON(value)
             case let .doctor(value):
                 text = encodeJSON(value)
             case let .autoSwapStatus(value):
@@ -3195,6 +3232,8 @@ private enum Output {
                 .joined(separator: "\n")
         case let .leaseSwap(value):
             text = "swapped \(value.returnedHandle) \(value.returnedEmail) for \(value.leasedHandle) \(value.leasedEmail) at \(value.home) for \(value.holder), returned sync: \(value.returnSync)"
+        case let .resolve(value):
+            text = "\(value.handle) \(value.email)"
         case let .doctor(value):
             text = "consumers_running: \(value.consumersRunning), unsupported_surfaces: \(value.unsupportedSurfaces.map(\.rawValue).joined(separator: ","))"
         case let .autoSwapStatus(value):

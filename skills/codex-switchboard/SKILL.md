@@ -66,7 +66,7 @@ Exit codes, for `check-switch` and `swap`; any nonzero means the main CLI was no
 | 6 | | Switchboard refused or failed the switch; the message gives its `error` code. |
 | 7 | | The switch did not take, or cannot be confirmed. |
 
-For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys. `check-switch` takes a handle, a profile key or an email and, on exit 0, prints the handle it checked; switch by that handle:
+For a switch the user asked for by account, check it, switch it by handle, and confirm without printing keys. `check-switch` takes a handle, a profile key or an email, asks `codex-switchboard resolve` which account that names (the same rules `lease` and `switch` use, so an email shared by several accounts exits 4), and on exit 0 prints the handle it checked; switch by that handle:
 
 ```bash
 set -o pipefail
@@ -86,7 +86,7 @@ The app's auto-swap policy (`autoswap enable|disable|status|run-once`) is the us
 
 A lease lends one account's captured auth to a separate `CODEX_HOME`, so an automated lane runs on its own account without touching the main CLI or Desktop sign-in. While a lease is active its home is the account's only live holder: `switch`, `autoswap`, and the app's own switching, sign-in, removal and token refresh all leave the account alone, and the Switchboard app writes every token rotation in the home back to the stored profile. `return` writes the latest token back and clears the lease.
 
-Lease commands show each account's **email beside its handle**, `acct_` plus 12 hex digits. `--profile-key` accepts a profile key, a handle or an email. Email lookup trims whitespace and ignores case. A shared email refuses with `ambiguous_account`, listing matching handles, plans and workspaces; pass one of those handles. `return` matches only leased keys. `--exclude-profile-key EMAIL` excludes every account matching that email.
+Lease commands show each account's **email beside its handle**, `acct_` plus 12 hex digits. `--profile-key` accepts a profile key, a handle or an email. Email lookup trims whitespace and ignores case. A shared email refuses with `ambiguous_account`, listing matching handles, plans and workspaces; pass one of those handles. `return` matches only leased keys. `--exclude-profile-key EMAIL` excludes every account matching that email. `codex-switchboard resolve --profile-key NAME --json` is read-only and prints the `handle` and `email` a name resolves to, or refuses `ambiguous_account` or `unknown_profile`.
 
 1. See which accounts you can lease. Every account listed is unleased, not registry-reserved, on a known paid plan, with usable quota, no re-login needed, not the active account of the CLI or Desktop surface, and not being refreshed by the app right now (`lease` refuses `refresh_in_progress` meanwhile):
 

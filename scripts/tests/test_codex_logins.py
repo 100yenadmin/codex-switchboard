@@ -163,6 +163,14 @@ check_cases = [
     ("the email of a reserved account: refused", "reserved@example.invalid",
      {"fixture": mut(lambda d: d["status"]["accounts"][5].update(email="res2@example.invalid"))}, 1),
     ("a blank name: fail closed", "  ", {}, 4),
+    ("an email status shows once but Switchboard's account list has twice: fail closed", "free@example.invalid",
+     {"fixture": mut(lambda d: d.update(resolve={"free@example.invalid": {
+         "error": "ambiguous_account", "details": [h(FREE) + " pro Personal", h(MAIN) + " pro Team"]}}))}, 4),
+    ("an account Switchboard resolves but status does not list yet: fail closed", "new@example.invalid",
+     {"fixture": mut(lambda d: d.update(resolve={"new@example.invalid": {"handle": h("cli:new@example.invalid")}}))}, 4),
+    ("resolve fails: fail closed", FREE, {"fixture": mut(lambda d: d.update(resolve="!exit"))}, 4),
+    ("resolve prints garbage: fail closed", FREE, {"fixture": mut(lambda d: d.update(resolve="!garbage"))}, 4),
+    ("resolve prints non-UTF-8: fail closed", FREE, {"fixture": mut(lambda d: d.update(resolve="!badutf8"))}, 4),
 ]
 
 swap_cases = [

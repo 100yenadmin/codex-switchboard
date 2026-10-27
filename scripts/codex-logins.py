@@ -231,16 +231,36 @@ def switchboard_state():
 
 
 def find_account(given, accounts):
-    """The one account `given` names: a profile key, a handle, or an email (trimmed, any case). UnknownName otherwise."""
+    """The one account in `status` that `given` (a profile key or a handle) names. UnknownName otherwise."""
     hits = [a for a in accounts if given in (a["profile_key"], a["handle"])]
-    if not hits and given.strip():
-        hits = [a for a in accounts if email_of(a) == given.strip().lower()]
-        if len(hits) > 1:
-            raise UnknownName("this email names %d accounts; pass one of their handles: %s"
-                              % (len(hits), ", ".join(a["handle"] for a in hits)))
     if len(hits) != 1:
         raise UnknownName("Switchboard lists %d accounts for this name (need exactly 1)" % len(hits))
     return hits[0]
+
+
+def resolve_handle(given):
+    """The handle Switchboard gives `given` (a profile key, a handle or an email) by the rules lease and switch use, over
+    its whole account list; `status` can omit or merge accounts. UnknownName if the name matches no account or several,
+    Refusal(4) if Switchboard cannot answer."""
+    try:
+        r = cs_run("resolve", "--profile-key", given, "--json")
+        d = json.loads(r.stdout)
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        raise Refusal(4, "resolve could not run or printed something that is not text (%s)" % type(e).__name__)
+    except ValueError:
+        raise Refusal(4, "resolve did not print JSON (exit %d)" % r.returncode)
+    if not isinstance(d, dict):
+        raise Refusal(4, "resolve did not print a JSON object")
+    if r.returncode == 0 and isinstance(d.get("handle"), str) and HANDLE.fullmatch(d["handle"]):
+        return d["handle"]
+    if r.returncode == 2 and d.get("error") == "ambiguous_account":
+        details = d.get("details") if isinstance(d.get("details"), list) else []
+        handles = [x.split(" ")[0] for x in details if isinstance(x, str) and HANDLE.fullmatch(x.split(" ")[0])]
+        raise UnknownName("this name matches %d accounts; pass one of their handles: %s"
+                          % (len(handles), ", ".join(handles)))
+    if r.returncode == 2 and d.get("error") == "unknown_profile":
+        raise UnknownName("Switchboard lists no account with this name")
+    raise Refusal(4, "resolve failed (exit %d)" % r.returncode)
 
 
 def verdict(given, reserved, accounts, leased):
@@ -429,8 +449,9 @@ def cmd_check_switch(a):
         reserved = reserved_keys()
         if a.profile_key in reserved:
             return refuse(1, "this key is reserved in the registry")
+        handle = resolve_handle(a.profile_key)
         accounts, leased, _, _ = switchboard_state()
-        code, why = verdict(a.profile_key, reserved, accounts, leased)
+        code, why = verdict(handle, reserved, accounts, leased)
     except UnknownName as r:
         return refuse(r.code, r.message)
     except Refusal as r:
@@ -438,7 +459,7 @@ def cmd_check_switch(a):
     if code:
         return refuse(code, why)
     # The handle, so the switch that follows names the same account whichever name was given.
-    print(find_account(a.profile_key, accounts)["handle"])
+    print(handle)
     return 0
 
 

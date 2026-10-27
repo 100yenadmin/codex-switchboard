@@ -30,7 +30,8 @@ leases and reservations under its own store lock before it writes. It never stop
 Switchboard refuses because they are running, report it rather than adding `--stop-consumers`.
 
 To check one account before a switch someone asked for: `python3 scripts/codex-logins.py check-switch --profile-key NAME`,
-where NAME is a handle, a profile key or an email. On exit 0 it prints the account's handle; switch by that handle.
+where NAME is a handle, a profile key or an email. It resolves NAME with `codex-switchboard resolve`, by the rules
+`lease` and `switch` use, and on exit 0 prints the account's handle; switch by that handle.
 
 | Exit | Meaning |
 |------|---------|
