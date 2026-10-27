@@ -4,6 +4,7 @@ All notable changes to Codex Switchboard will be documented here.
 
 ## Unreleased
 
+- `codex-logins.py status` shows each account's stored email beside its handle, or `-` when absent; an email that cannot be shown safely prints `?`. Other commands still name accounts by handle only.
 - CLI lease, return, lease listings and leasable status now show account emails beside handles; swap results include `returned_email` and `leased_email`. Agents may print emails and handles, never tokens, account ids or raw auth files.
 - `--profile-key` accepts a case-insensitive, trimmed email in lease, return, swap-lease and switch. Shared emails refuse with `ambiguous_account` and list handles, plans and workspaces; return matches only leased keys, while `--exclude-profile-key EMAIL` excludes all matches, including the email the app's snapshot shows. Printed emails come from `accounts.json`, the same source `--profile-key` matches.
 - New read-only `resolve --profile-key NAME --json` prints the `handle` and `email` a name resolves to, by the rules `lease` and `switch` use, or refuses `ambiguous_account` / `unknown_profile`. `status` takes each email from `accounts.json` too, and shows none for an account that has no stored email.

@@ -35,7 +35,7 @@ codex-switchboard doctor --json \
   | jq '{consumers_running, consumer_count, unsupported_surfaces, surfaces: [.surfaces[] | {kind, detected, running, auth_store_mode, supports_file_switching, shared_auth_store}]}'
 ```
 
-3. See every account by handle, with its quota, and which are the main CLI's, leased or reserved:
+3. See every account by handle and email, with its quota, and which are the main CLI's, leased or reserved:
 
 ```bash
 python3 scripts/codex-logins.py status

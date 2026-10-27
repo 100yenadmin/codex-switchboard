@@ -13,7 +13,7 @@ CLI to another account when its quota runs out. The full command reference and e
 | Reserved | A login listed in `~/.config/codex-logins/registry.json`, with its own sign-in in its own home | Nobody. Its quota belongs to its consumer. Switchboard never leases it, and never switches or auto-swaps onto it. |
 
 `codex-switchboard leases --json` lists every lease (states `leasing`, `active` and `returning` all count as leased).
-`python3 scripts/codex-logins.py status` lists every account by handle, marks the main, leased and reserved ones, and
+`python3 scripts/codex-logins.py status` lists every account by handle and email, marks the main, leased and reserved ones, and
 shows each reserved home's health. The Switchboard CLI shows each account's email beside its handle (`acct_` plus
 12 hex digits). Agents may print emails and handles, never tokens, account ids, profile keys or raw auth files.
 

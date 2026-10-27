@@ -6,7 +6,7 @@ benchmark) so that its quota is never shared with the main CLI. The registry is 
 (dir 700, file 600). Switchboard reads it too: it never leases a reserved account, and its switch and auto-swap never
 land on one.
 
-  codex-logins.py status                          every account (redacted), the main CLI account, leases, and each reserved login's
+  codex-logins.py status                          every account's email beside its handle, the main CLI account, leases, and each reserved login's
                                                   health; exits 1 if a reserved account is the main CLI's, 2 if the registry is unreadable
   codex-logins.py register --purpose LABEL --home DIR --consumer TEXT [--owner TEXT] [--notes TEXT]
   codex-logins.py check-switch --profile-key K    exit 0 only if K may become the main CLI account
@@ -22,8 +22,9 @@ under two keys.
 swap exits: 0 switched (with --dry-run: an account passes); 2 or 4 as for check-switch; 5 no account passes;
 6 Switchboard refused or failed the switch; 7 the switch did not take or cannot be confirmed.
 
-Nothing here prints an email, account id, profile key, holder name, token, or the registry's free text (consumer,
-owner, notes, home path): accounts appear by handle and reserved logins by their purpose label. register takes
+Status shows each account's email beside its handle; other commands name accounts by handle only. Nothing here
+prints an account id, profile key, holder name, token, or the registry's free text (consumer, owner, notes, home path).
+Reserved logins appear by their purpose label; a purpose that is not a valid label stays hidden. register takes
 Switchboard's own .auth.lock, so a reservation cannot land between a switch's registry check and its write.
 Switchboard is found at $CODEX_SWITCHBOARD_CLI, else in this repository's release build, else on PATH.
 """
@@ -214,6 +215,15 @@ def email_of(account):
     return norm_email(account.get("email"))
 
 
+def shown_email(account):
+    value = account.get("email")
+    if not isinstance(value, str) or not value.strip():
+        return "-"
+    if any(c.isspace() or c == "|" or not c.isprintable() for c in value):
+        return "?"
+    return value.strip()
+
+
 def switchboard_state():
     """(accounts, leased handles, active CLI profile key or None, the surfaces). Refusal(4) on anything unexpected.
 
@@ -384,6 +394,7 @@ def cmd_status(_):
         return refuse(r.code, r.message)
     by_key = {e["profile_key"]: e for e in reg["logins"] if e.get("profile_key")}
     accounts, active = switchboard()
+    email_width = max((len(shown_email(a)) for a in accounts), default=1)
     print("Switchboard accounts (CLI surface; numbers are Switchboard's list order):")
     for i, a in enumerate(accounts, 1):
         k = a.get("profile_key")
@@ -394,8 +405,8 @@ def cmd_status(_):
             tag.append("RESERVED: " + label(by_key[k]))
         if a.get("leased"):
             tag.append("LEASED to an agent lane")
-        print("  #%d %s %-8s %-4s weekly_free %-4s session_free %-4s relogin %-5s %s" % (
-            i, a.get("handle", "?"), a.get("plan"), "free" if a.get("is_free_plan") else "paid",
+        print("  #%d %s %-*s %-8s %-4s weekly_free %-4s session_free %-4s relogin %-5s %s" % (
+            i, a.get("handle", "?"), email_width, shown_email(a), a.get("plan"), "free" if a.get("is_free_plan") else "paid",
             a.get("weekly_free_percent"), a.get("session_free_percent"), a.get("needs_relogin"), " | ".join(tag)))
     # Consumer, owner, notes and the home path are free text, so only the label and the home's health are shown.
     print("\nReserved logins (~/.config/codex-logins/registry.json):")
