@@ -13,8 +13,8 @@ land on one.
   codex-logins.py swap [--dry-run]                move the main CLI to the best account check-switch allows
 
 check-switch exits: 0 safe; 1 reserved; 2 the registry is missing, cannot be read, or reserves a key Switchboard does
-not list; 3 leased by Switchboard; 4 Switchboard's account or lease state cannot be read, or K names no account or
-several. Any nonzero means do not switch. K may be a profile key, a Switchboard handle (acct_ + 12 hex) or an email;
+not list; 3 leased by Switchboard; 4 Switchboard's account or lease state cannot be read, K names no account or
+several, or an account the seat check compares has no stored email. Any nonzero means do not switch. K may be a profile key, a Switchboard handle (acct_ + 12 hex) or an email;
 `codex-switchboard resolve` resolves it by the rules lease and switch use, and on exit 0 the handle checked is printed.
 An account that shares its email with a reserved or leased one is refused too, since Switchboard can list one seat
 under two keys.
@@ -204,9 +204,13 @@ def handle_for(profile_key):
     return "acct_" + hashlib.sha256(profile_key.encode()).hexdigest()[:12]
 
 
+def norm_email(value):
+    # NFC, as Swift compares strings by canonical equivalence. Every email comparison goes through this.
+    return unicodedata.normalize("NFC", str(value or "")).strip().lower()
+
+
 def email_of(account):
-    # NFC, as Swift compares strings by canonical equivalence.
-    return unicodedata.normalize("NFC", str(account.get("email") or "")).strip().lower()
+    return norm_email(account.get("email"))
 
 
 def switchboard_state():
@@ -278,9 +282,16 @@ def verdict(given, reserved, accounts, leased):
     if reserved - set(by_key):
         return 2, "the registry reserves a key Switchboard does not list (a new sign-in can re-key an account); register that login again"
     email = email_of(target)
+    leased_exact = handle in leased or handle_for(target["profile_key"]) in leased
+    # The seat checks below match by email; an account without a stored email could be any seat's, so fail closed.
+    protected = [by_key[k] for k in reserved] + [a for a in accounts if a["handle"] in leased]
+    if not leased_exact and any(not email_of(a) for a in protected):
+        raise Refusal(4, "a reserved or leased account has no stored email, so the other keys of its seat cannot be found")
+    if not leased_exact and not email and protected:
+        return 4, "%s has no stored email, so it cannot be told apart from a reserved or leased account's seat" % handle
     if email and email in {email_of(by_key[k]) for k in reserved}:
         return 1, "%s shares its email with a reserved account" % handle
-    if handle in leased or handle_for(target["profile_key"]) in leased:
+    if leased_exact:
         return 3, "%s is leased to an agent lane" % handle
     if email and email in {email_of(a) for a in accounts if a["handle"] in leased}:
         return 3, "%s shares its email with a leased account" % handle
@@ -401,7 +412,7 @@ def cmd_register(a):
         sys.exit("refused: --purpose must be a lowercase label (a letter, then letters, digits or dashes; at most 48)")
     home = os.path.abspath(os.path.expanduser(a.home))
     try:
-        email = (home_email(home) or "").strip().lower()
+        email = norm_email(home_email(home))
     except (OSError, ValueError, AttributeError):
         email = ""
     if not email:
@@ -425,7 +436,7 @@ def cmd_register(a):
             sys.exit("refused: a CLI or Desktop surface keeps its sign-in in a keychain or auto store, so Switchboard "
                      "cannot tell which account it is on; register once every surface uses the file store")
         actives = {s.get("active_profile_key") for s in surfaces} - {None, ""}
-        active_emails = {str(s.get("active_email") or "").strip().lower() for s in surfaces} - {""}
+        active_emails = {norm_email(s.get("active_email")) for s in surfaces} - {""}
         if key in actives or email in active_emails or email in {email_of(x) for x in accounts if x["profile_key"] in actives}:
             sys.exit("refused: this login is Switchboard #%d, the account a CLI or Desktop surface is on; "
                      "move that surface off it first (codex-logins.py swap)" % num)

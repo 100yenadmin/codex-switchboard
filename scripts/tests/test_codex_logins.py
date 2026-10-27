@@ -171,6 +171,14 @@ check_cases = [
     ("resolve fails: fail closed", FREE, {"fixture": mut(lambda d: d.update(resolve="!exit"))}, 4),
     ("resolve prints garbage: fail closed", FREE, {"fixture": mut(lambda d: d.update(resolve="!garbage"))}, 4),
     ("resolve prints non-UTF-8: fail closed", FREE, {"fixture": mut(lambda d: d.update(resolve="!badutf8"))}, 4),
+    ("a leased account with no stored email: fail closed", FREE,
+     {"fixture": mut(lambda d: d["status"]["accounts"][2].update(email=""))}, 4),
+    ("a reserved account with no stored email: fail closed", FREE,
+     {"fixture": mut(lambda d: d["status"]["accounts"][4].update(email=""))}, 4),
+    ("the target has no stored email: fail closed", FREE,
+     {"fixture": mut(lambda d: d["status"]["accounts"][1].update(email=""))}, 4),
+    ("a leased account with no stored email is still exit 3", LEASED,
+     {"fixture": mut(lambda d: d["status"]["accounts"][2].update(email=""))}, 3),
 ]
 
 swap_cases = [
@@ -187,6 +195,10 @@ swap_cases = [
      {"registry": {"version": 1, "logins": [{"purpose": "p", "profile_key": "cli:gone@example.invalid"}]}}, 2, None),
     ("swap with an unreadable lease store: refused", ["swap"], {"fixture": mut(lambda d: d.update(leases="!exit"))}, 4, None),
     ("swap with no registry: refused", ["swap"], {"registry": MISSING}, 2, None),
+    ("swap while a leased account has no stored email: refused", ["swap"],
+     {"fixture": mut(lambda d: d["status"]["accounts"][2].update(email=""))}, 4, None),
+    ("swap skips a candidate with no stored email", ["swap"],
+     {"fixture": mut(lambda d: d["status"]["accounts"][1].update(email=""))}, 5, None),
 ]
 
 
@@ -216,6 +228,8 @@ def reserved_after():
 register_cases = [
     # name, home, purpose, kwargs, exit, profile keys the registry must hold afterwards
     ("register a spare account", login_home("free", "free@example.invalid"), "spare-bench", {}, 0, [RES, FREE]),
+    ("register a login whose email is decomposed Unicode", login_home("cafe", "Cafe\u0301@example.invalid"), "spare-bench",
+     {"fixture": mut(lambda d: d["status"]["accounts"][1].update(email="caf\u00e9@example.invalid"))}, 0, [RES, FREE]),
     ("register the main CLI account: refused", login_home("main", "main@example.invalid"), "spare-bench", {}, 1, [RES]),
     ("register the account Desktop is on: refused", login_home("free", "free@example.invalid"), "spare-bench",
      {"fixture": mut(lambda d: d["status"]["surfaces"].append({"kind": "desktop", "active_profile_key": FREE}))}, 1, [RES]),

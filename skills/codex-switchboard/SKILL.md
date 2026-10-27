@@ -61,7 +61,7 @@ Exit codes, for `check-switch` and `swap`; any nonzero means the main CLI was no
 | 1 | The account is registry-reserved, or shares its email with a reserved one. | |
 | 2 | The registry is missing, cannot be read, or reserves a key Switchboard no longer lists. | Same; nothing was switched. |
 | 3 | The account is leased (`leasing`, `active` or `returning`), or shares its email with a leased one. | |
-| 4 | Switchboard's account or lease state cannot be read, or the name matches no account or several. | Same; nothing was switched. |
+| 4 | Switchboard's account or lease state cannot be read, the name matches no account or several, or an account the seat check compares has no stored email. | Same; nothing was switched (a candidate with no stored email is skipped). |
 | 5 | | No paid, usable account other than the current one passes. |
 | 6 | | Switchboard refused or failed the switch; the message gives its `error` code. |
 | 7 | | The switch did not take, or cannot be confirmed. |

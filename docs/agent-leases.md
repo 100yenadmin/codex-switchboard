@@ -39,7 +39,7 @@ where NAME is a handle, a profile key or an email. It resolves NAME with `codex-
 | 1 | Reserved, or shares its email with a reserved account |
 | 2 | The registry is missing, unreadable, or reserves a key Switchboard no longer lists; if nothing is reserved, the registry is `{"version": 1, "logins": []}` |
 | 3 | Leased, or shares its email with a leased account |
-| 4 | Switchboard's account or lease state cannot be read, or the name matches no account or several |
+| 4 | Switchboard's account or lease state cannot be read, the name matches no account or several, or an account the seat check compares has no stored email |
 | 5 | `swap`: no other account passes |
 | 6 | `swap`: Switchboard refused or failed the switch (its `error` code is printed) |
 | 7 | `swap`: the switch did not take or cannot be confirmed |
