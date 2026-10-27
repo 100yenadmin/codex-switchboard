@@ -164,7 +164,7 @@ private final class CommandRunner {
 
     private func returnLease(_ args: [String]) throws -> CommandResult {
         let options = try ReturnOptions.parse(args)
-        let outcome = try leaseService.returnLease(profileKey: options.profileKey, home: options.home)
+        let outcome = try leaseService.returnLease(profileKey: options.profileKey, home: options.home, expectedLeaseID: options.expectedLeaseID)
         return CommandResult(payload: .leaseReturn(outcome), json: options.json, exitCode: 0)
     }
 
@@ -387,7 +387,8 @@ private final class CommandRunner {
     codex-switchboard switch --profile-key <key> --surface desktop|cli|both --json [--stop-consumers]
         (<key> may be a profile key, a handle or an email)
     codex-switchboard lease --profile-key <key> --home <dir> --holder <name> --json
-    codex-switchboard return --profile-key <key> --home <dir> --json
+    codex-switchboard return --profile-key <key> --home <dir> [--expect-lease-id <id>] --json
+        (--expect-lease-id refuses if the home no longer holds the lease confirmed by the owner)
     codex-switchboard leases --json
     codex-switchboard resolve --profile-key <key> --json
         (read-only: the handle and email of the account <key> names, as lease and switch resolve it)
@@ -558,14 +559,19 @@ private struct ReturnOptions {
     let json: Bool
     let profileKey: String
     let home: String
+    let expectedLeaseID: String?
 
     static func parse(_ args: [String]) throws -> ReturnOptions {
         var parser = ArgumentParser(args)
         let json = parser.takeFlag("--json")
         let profileKey = try parser.takeRequiredValue("--profile-key")
         let home = try parser.takeRequiredValue("--home")
+        let expectedLeaseID = parser.takeOptionalValue("--expect-lease-id")
         try parser.finish()
-        return ReturnOptions(json: json, profileKey: profileKey, home: home)
+        if let expectedLeaseID, expectedLeaseID.isEmpty || expectedLeaseID.hasPrefix("--") {
+            throw CLIError.usage("Missing value for --expect-lease-id.", jsonPreferred: false)
+        }
+        return ReturnOptions(json: json, profileKey: profileKey, home: home, expectedLeaseID: expectedLeaseID)
     }
 }
 
@@ -1607,7 +1613,7 @@ private final class CLILeaseService {
 
     /// Return is also the only recovery path: it always re-reads the home, so repeating a return that
     /// crashed brings back any rotation made since.
-    func returnLease(profileKey given: String, home rawHome: String) throws -> LeaseReturnPayload {
+    func returnLease(profileKey given: String, home rawHome: String, expectedLeaseID: String? = nil) throws -> LeaseReturnPayload {
         let requestedHome = Self.standardized(rawHome)
 
         return try withStoreLock {
@@ -1621,6 +1627,9 @@ private final class CLILeaseService {
                     "home_mismatch",
                     "\(CodexAccountHandle.handle(for: profileKey)) is leased at \(lease.home), not \(requestedHome)."
                 )
+            }
+            if let expectedLeaseID, lease.leaseID != expectedLeaseID {
+                throw refused("lease_changed", "\(requestedHome) now holds a different lease than the one confirmed; review it again.")
             }
             // From here until the entry is removed the lease is returning, which every reader treats as
             // leased. A return that stops on any refusal, a busy holder included, is redone later from a

@@ -18,6 +18,7 @@ shows each reserved home's health. The Switchboard CLI shows each account's emai
 12 hex digits). Agents may print emails and handles, never tokens, account ids, profile keys or raw auth files.
 
 The owner can also return or swap a lease from the app, through the same CLI `return` and `swap-lease` commands.
+`return --expect-lease-id <id>` refuses with `lease_changed` if the home no longer holds the confirmed lease; omit it for the existing agent behaviour.
 `swap-lease --expect-lease-id <id>` refuses with `lease_changed` if the home no longer holds the confirmed lease; omit it for the existing agent behaviour.
 
 ## Swap the main CLI when its account runs low

@@ -301,9 +301,9 @@ final class ResetCreditsTests: XCTestCase {
         let noExpiry = try XCTUnwrap(list.available.first { $0.id == "no-expiry" })
         let date = try XCTUnwrap(expiring.expiresAt).formatted(date: .abbreviated, time: .shortened)
         XCTAssertEqual(ResetConfirmation(credit: expiring, requestID: UUID()).message(email: "owner@example.invalid"),
-                       "Use “Earned reset” (expires \(date)) on owner@example.invalid? It restores the 5-hour limit, the weekly limit or both. The reset is used up.")
+                       "Use “Earned reset” (expires \(date)) on owner@example.invalid? It restores this account's usage limits. The reset is used up.")
         XCTAssertEqual(ResetConfirmation(credit: noExpiry, requestID: UUID()).message(email: "owner@example.invalid"),
-                       "Use “Usage limit reset” (no expiry) on owner@example.invalid? It restores the 5-hour limit, the weekly limit or both. The reset is used up.")
+                       "Use “Usage limit reset” (no expiry) on owner@example.invalid? It restores this account's usage limits. The reset is used up.")
     }
 
     func testUnauthorizedAndMissingTokenNeverRefresh() async throws {

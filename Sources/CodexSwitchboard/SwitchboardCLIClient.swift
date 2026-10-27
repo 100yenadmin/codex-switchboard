@@ -46,6 +46,7 @@ struct AppLeaseAccount: Decodable, Identifiable, Equatable {
     let email: String
     let sessionFreePercent: Double
     let weeklyFreePercent: Double
+    let quotaWindows: [AppLeaseQuotaWindow]?
     let leased: Bool
     let leaseHolder: String?
     let reserved: Bool
@@ -53,10 +54,33 @@ struct AppLeaseAccount: Decodable, Identifiable, Equatable {
 
     var id: String { profileKey }
     var displayName: String { email.isEmpty ? handle : email }
+    var swapMenuLabel: String {
+        let windows = (quotaWindows ?? []).map {
+            "\($0.window.displayLabel) \(String(format: "%.0f", $0.freePercent))% free"
+        }
+        return windows.isEmpty ? displayName : displayName + " · " + windows.joined(separator: " / ")
+    }
     enum CodingKeys: String, CodingKey {
         case profileKey = "profile_key", handle, email, leased, reserved, leasable
         case sessionFreePercent = "session_free_percent", weeklyFreePercent = "weekly_free_percent"
         case leaseHolder = "lease_holder"
+        case quotaWindows = "quota_windows"
+    }
+}
+
+struct AppLeaseQuotaWindow: Decodable, Equatable {
+    let kind: QuotaWindow.Kind
+    let freePercent: Double
+    let resetSeconds: Double
+    let durationSeconds: Double?
+
+    var window: QuotaWindow {
+        QuotaWindow(kind: kind, usedPercent: 100 - freePercent, resetSeconds: resetSeconds, durationSeconds: durationSeconds)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case freePercent = "free_percent", resetSeconds = "reset_seconds", durationSeconds = "duration_seconds"
     }
 }
 
@@ -111,7 +135,7 @@ struct SwitchboardCLIClient: @unchecked Sendable {
     func leases() throws -> AppLeasesPayload { try read(AppLeasesPayload.self, arguments: ["leases", "--json"]) }
     func status() throws -> AppLeaseStatusPayload { try read(AppLeaseStatusPayload.self, arguments: ["status", "--json"]) }
     func returnLease(_ lease: AppLease) throws {
-        let _: ActionReceipt = try read(ActionReceipt.self, arguments: ["return", "--profile-key", lease.handle, "--home", lease.home, "--json"])
+        let _: ActionReceipt = try read(ActionReceipt.self, arguments: ["return", "--profile-key", lease.handle, "--home", lease.home, "--expect-lease-id", lease.leaseID, "--json"])
     }
     func swapLease(_ lease: AppLease, to account: AppLeaseAccount) throws {
         let _: ActionReceipt = try read(ActionReceipt.self, arguments: ["swap-lease", "--home", lease.home, "--holder", lease.holder, "--profile-key", account.handle, "--expect-lease-id", lease.leaseID, "--json"])

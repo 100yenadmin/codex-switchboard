@@ -30,9 +30,35 @@ final class SwitchboardCLIClientTests: XCTestCase {
         try client.swapLease(lease, to: target)
         XCTAssertEqual(calls, [
             ["leases", "--json"], ["status", "--json"],
-            ["return", "--profile-key", lease.handle, "--home", lease.home, "--json"],
+            ["return", "--profile-key", lease.handle, "--home", lease.home, "--expect-lease-id", lease.leaseID, "--json"],
             ["swap-lease", "--home", lease.home, "--holder", lease.holder, "--profile-key", target.handle, "--expect-lease-id", lease.leaseID, "--json"]
         ])
+    }
+
+    func testSwapMenuLabelShowsOnlyRealQuotaWindows() throws {
+        var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(LeaseTestFixtures.statusJSON.utf8)) as? [String: Any])
+        var account = try XCTUnwrap((payload["accounts"] as? [[String: Any]])?.first)
+        func decode() throws -> AppLeaseAccount {
+            payload["accounts"] = [account]
+            let json = String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)
+            return try XCTUnwrap(SwitchboardCLIClient.decode(AppLeaseStatusPayload.self, from: json).accounts.first)
+        }
+        // Compatibility percentages cannot establish which windows the account has.
+        XCTAssertEqual(try decode().swapMenuLabel, "target@example.invalid")
+        account["quota_windows"] = []
+        XCTAssertEqual(try decode().swapMenuLabel, "target@example.invalid")
+        account["quota_windows"] = [["kind": "weekly", "free_percent": 27, "reset_seconds": 86400]]
+        let weekly = try decode()
+        XCTAssertEqual(weekly.quotaWindows?.count, 1)
+        XCTAssertNil(weekly.quotaWindows?.first?.durationSeconds)
+        XCTAssertEqual(weekly.swapMenuLabel, "target@example.invalid · Weekly 27% free")
+        account["quota_windows"] = [
+            ["kind": "fiveHour", "free_percent": 75, "reset_seconds": 3600],
+            ["kind": "daily", "free_percent": 60, "reset_seconds": 7200],
+            ["kind": "monthly", "free_percent": 40, "reset_seconds": 86400],
+            ["kind": "other", "free_percent": 20, "reset_seconds": 86400, "duration_seconds": 259200],
+        ]
+        XCTAssertEqual(try decode().swapMenuLabel, "target@example.invalid · 5 hours 75% free / Daily 60% free / Monthly 40% free / 3 days 20% free")
     }
 
     func testErrorsAndMissingCLIHideRawOutput() throws {
@@ -59,6 +85,15 @@ final class SwitchboardCLIClientTests: XCTestCase {
 
     func testRealCommandJSONContractUsesFixtureStorageOnly() throws {
         let fixture = try LeaseFixture(testCase: self)
+        let snapshotURL = fixture.appSupport.appendingPathComponent("accounts-snapshot.json")
+        var snapshot = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: snapshotURL)) as? [String: Any])
+        var snapshotAccounts = try XCTUnwrap(snapshot["accounts"] as? [[String: Any]])
+        let index = try XCTUnwrap(snapshotAccounts.firstIndex { $0["profileKey"] as? String == "profile-k" })
+        snapshotAccounts[index]["quotaWindows"] = [
+            ["kind": "weekly", "usedPercent": 73, "resetSeconds": 86400, "durationSeconds": 604800],
+        ]
+        snapshot["accounts"] = snapshotAccounts
+        try CodexAtomicFile.writeJSON(snapshot, to: snapshotURL)
         let home = fixture.root.appendingPathComponent("app-lane", isDirectory: true)
         let leased = fixture.run(["lease", "--profile-key", "profile-k", "--home", home.path, "--holder", "app-fixture", "--json"])
         XCTAssertEqual(leased.exitCode, 0, leased.text)
@@ -81,6 +116,11 @@ final class SwitchboardCLIClientTests: XCTestCase {
         XCTAssertTrue(account.leased)
         XCTAssertFalse(account.leasable)
         XCTAssertEqual(account.leaseHolder, "app-fixture")
+        let rawAccount = try XCTUnwrap(fixture.account("profile-k", in: status.json))
+        let rawWindows = try XCTUnwrap(rawAccount["quota_windows"] as? [[String: Any]])
+        XCTAssertEqual(account.quotaWindows?.map { $0.kind.rawValue }, rawWindows.compactMap { $0["kind"] as? String })
+        XCTAssertEqual(account.quotaWindows?.map(\.freePercent), rawWindows.compactMap { $0["free_percent"] as? Double })
+        XCTAssertEqual(account.swapMenuLabel, "k@example.invalid · Weekly 27% free")
         XCTAssertTrue(accounts.contains { $0.profileKey == "profile-b" && $0.leasable })
         try fixture.writeRegistry([["purpose": "bench", "profile_key": "profile-b", "codex_home": "~/reserved-home"]])
         let reserved = try SwitchboardCLIClient.decode(AppLeaseStatusPayload.self, from: fixture.run(["status", "--json"]).text)
@@ -197,6 +237,7 @@ enum LeaseTestFixtures {
     }
     static func account(leased: Bool = false, reserved: Bool = false) -> AppLeaseAccount {
         AppLeaseAccount(profileKey: "fixture", handle: "handle-new", email: "target@example.invalid", sessionFreePercent: 75, weeklyFreePercent: 90,
+                        quotaWindows: nil,
                         leased: leased, leaseHolder: leased ? "bench-fixture" : nil, reserved: reserved, leasable: !leased && !reserved)
     }
 }

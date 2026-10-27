@@ -6,7 +6,7 @@ struct ResetConfirmation: Equatable {
 
     func message(email: String) -> String {
         let expiry = credit.expiresAt.map { "expires \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "no expiry"
-        return "Use \u{201C}\(credit.displayTitle)\u{201D} (\(expiry)) on \(email)? It restores the 5-hour limit, the weekly limit or both. The reset is used up."
+        return "Use \u{201C}\(credit.displayTitle)\u{201D} (\(expiry)) on \(email)? It restores this account's usage limits. The reset is used up."
     }
 }
 

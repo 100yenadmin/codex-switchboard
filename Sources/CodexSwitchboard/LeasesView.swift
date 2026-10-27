@@ -149,7 +149,7 @@ struct LeasesSection: View {
             .disabled(disabledReason != nil || isBusy).help(disabledReason ?? "Return this lease")
         Menu("Swap to") {
             ForEach(accounts.filter(\.leasable)) { account in
-                Button(String(format: "%@ · 5h %.0f%% / weekly %.0f%% free", account.displayName, account.sessionFreePercent, account.weeklyFreePercent)) {
+                Button(account.swapMenuLabel) {
                     requestAction(LeaseAction(lease: lease, target: account))
                 }
             }
