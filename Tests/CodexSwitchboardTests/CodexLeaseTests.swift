@@ -182,6 +182,10 @@ final class CodexLeaseTests: XCTestCase {
             .first { $0["handle"] as? String == CodexAccountHandle.handle(for: "profile-k") }
         XCTAssertEqual(listedK?["email"] as? String, "new@example.invalid")
         XCTAssertFalse(leasable.text.contains("k@example.invalid"))
+        // So does the full status, which codex-logins.py check-switch matches emails against.
+        let status = fixture.run(["status", "--json"])
+        let fullK = (status.json["accounts"] as? [[String: Any]])?.first { $0["profile_key"] as? String == "profile-k" }
+        XCTAssertEqual(fullK?["email"] as? String, "new@example.invalid")
         let leased = fixture.run(["lease", "--profile-key", "NEW@EXAMPLE.INVALID", "--home", home.path, "--holder", "bench", "--json"])
         XCTAssertEqual(leased.exitCode, 0, leased.text)
         XCTAssertEqual(leased.json["email"] as? String, "new@example.invalid")

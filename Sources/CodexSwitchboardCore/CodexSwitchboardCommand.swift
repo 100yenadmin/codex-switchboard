@@ -967,12 +967,18 @@ private final class CLIAccountStore {
     }
 
     /// Status stays readable when the lease store is not; every writer re-reads it and fails closed.
+    /// Emails come from accounts.json, the field `--profile-key` matches, so `status` and the tools that read it
+    /// name accounts the way Switchboard resolves them.
     func accounts() -> [AccountPayload] {
         let leases = (try? paths.leaseStore.load()) ?? []
         let snapshot = snapshotAccounts() ?? []
+        let emails = emails()
         return (snapshot.isEmpty ? profileFallbackAccounts() : snapshot).map { account in
             var account = account
             account.handle = CodexAccountHandle.handle(for: account.profileKey)
+            if let email = emails[account.profileKey] {
+                account.email = email
+            }
             if let lease = leases.first(where: { $0.profileKey == account.profileKey }) {
                 account.leased = true
                 account.leaseHolder = lease.holder
@@ -994,7 +1000,7 @@ private final class CLIAccountStore {
             stored?.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(email) == .orderedSame
         }
         let snapshotEmails = allMatches
-            ? Dictionary(accounts().map { ($0.profileKey, $0.email) }, uniquingKeysWith: { first, _ in first })
+            ? Dictionary((snapshotAccounts() ?? []).map { ($0.profileKey, $0.email) }, uniquingKeysWith: { first, _ in first })
             : [:]
         let matches = keys.filter {
             names(collection.profiles[$0]?["email"] as? String) || names(snapshotEmails[$0])
@@ -1017,7 +1023,9 @@ private final class CLIAccountStore {
     /// Each account's email as accounts.json stores it. Output uses this rather than the snapshot's email,
     /// which can fall back to an account id, so a printed email is one `--profile-key` accepts.
     func emails() -> [String: String] {
-        LocalProfileCollection.load(from: paths.accountsURL).profiles.compactMapValues { $0["email"] as? String }
+        LocalProfileCollection.load(from: paths.accountsURL).profiles.compactMapValues { entry in
+            (entry["email"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        }
     }
 
     func email(for profileKey: String) -> String {
@@ -2499,7 +2507,7 @@ private struct QuotaWindowPayload: Codable {
 
 private struct AccountPayload: Codable {
     let profileKey: String
-    let email: String
+    var email: String
     let workspace: String
     let plan: String
     let sessionFreePercent: Double
