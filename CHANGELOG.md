@@ -4,6 +4,7 @@ All notable changes to Codex Switchboard will be documented here.
 
 ## Unreleased
 
+- Codex processes in their own lease or reserved `CODEX_HOME` no longer block main-surface switches; main-home, unreadable and Desktop-app consumers still block.
 - The app shows earned usage-limit reset counts and lets the owner inspect and explicitly use a reset, with confirmation and safe retries; agents never spend resets.
 - The app lists leases, marks leased and reserved accounts, and lets the owner return or swap an idle lease through the bundled CLI, using the app’s own storage; `--expect-lease-id` refuses a swap if the lease changed after confirmation.
 

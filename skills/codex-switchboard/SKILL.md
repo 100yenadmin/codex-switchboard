@@ -191,6 +191,7 @@ Correct behavior:
 
 - Run `doctor --json` and `codex-logins.py status`.
 - Run `codex-logins.py swap --dry-run`, then `codex-logins.py swap`.
+- Codex processes in their own lease or reserved `CODEX_HOME` no longer block main-surface switches; main-home, unreadable and Desktop-app consumers still block.
 - If Switchboard refuses because consumers are running (exit 6, `consumers_running`), report it, or ask before stopping consumers.
 - Report the exit code and the handles the tool printed.
 

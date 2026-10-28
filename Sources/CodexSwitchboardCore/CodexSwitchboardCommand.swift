@@ -17,10 +17,11 @@ public enum CodexSwitchboardCommand {
     static func execute(
         arguments: [String],
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeURL: URL = FileManager.default.homeDirectoryForCurrentUser
+        homeURL: URL = FileManager.default.homeDirectoryForCurrentUser,
+        processes: CodexConsumerProcesses = CodexConsumerProcesses()
     ) -> CommandOutput {
         do {
-            let runner = CommandRunner(arguments: arguments, environment: environment, homeURL: homeURL)
+            let runner = CommandRunner(arguments: arguments, environment: environment, homeURL: homeURL, processes: processes)
             let result = try runner.run()
             return Output.render(result.payload, json: result.json, exitCode: result.exitCode)
         } catch let error as CLIError {
@@ -60,9 +61,9 @@ private final class CommandRunner {
     private let autoSwapAuditStore: AutoSwapAuditStore
     private let leaseService: CLILeaseService
 
-    init(arguments: [String], environment: [String: String], homeURL: URL) {
+    init(arguments: [String], environment: [String: String], homeURL: URL, processes: CodexConsumerProcesses) {
         self.arguments = arguments
-        paths = SwitchboardPaths(homeURL: homeURL, environment: environment)
+        paths = SwitchboardPaths(homeURL: homeURL, environment: environment, processes: processes)
         surfaceService = CLISurfaceService(paths: paths)
         accountStore = CLIAccountStore(paths: paths)
         switchService = CLISwitchService(paths: paths, surfaceService: surfaceService)
@@ -755,6 +756,7 @@ private struct ArgumentParser {
 }
 
 private struct SwitchboardPaths {
+    let processes: CodexConsumerProcesses
     let fileManager = FileManager.default
     let homeURL: URL
     let environment: [String: String]
@@ -772,8 +774,10 @@ private struct SwitchboardPaths {
 
     init(
         homeURL: URL = FileManager.default.homeDirectoryForCurrentUser,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        processes: CodexConsumerProcesses = CodexConsumerProcesses()
     ) {
+        self.processes = processes
         self.homeURL = homeURL
         self.environment = environment
         // Set at all, even empty, means the caller asked for separate storage: only a usable name gets it.
@@ -968,12 +972,15 @@ private final class CLISurfaceService {
     }
 
     private func running(_ kind: SurfaceKind) -> Bool {
-        let lines = processLines()
         switch kind {
         case .desktop:
-            return lines.contains { isCodexDesktopProcessCommand($0.lowercased()) }
+            return processLines().contains { isCodexDesktopProcessCommand($0.lowercased()) }
         case .cli:
-            return lines.contains { isCodexExecutableCommand($0.lowercased()) }
+            return !paths.processes.consumers(
+                surfaceHomes: [paths.codexHome(for: .cli).path],
+                includeDesktop: false,
+                executableOnly: true
+            ).isEmpty
         }
     }
 
@@ -1348,22 +1355,22 @@ private final class CLISwitchService {
     }
 
     func consumerProcesses() -> [ProcessInfoPayload] {
-        let currentPID = Darwin.getpid()
-        return processLinesWithPID().compactMap { pid, command in
-            guard pid != currentPID else { return nil }
-            guard isCodexConsumerCommand(command.lowercased()) else { return nil }
-            return ProcessInfoPayload(pid: pid, command: command)
-        }
+        paths.processes.consumers(
+            surfaceHomes: [paths.codexHome(for: .cli).path, paths.codexHome(for: .desktop).path]
+        ).map { ProcessInfoPayload(pid: $0.pid, command: $0.command) }
     }
 
     func consumerProcesses(for surfaces: [SurfaceStatusPayload]) -> [ProcessInfoPayload] {
         let targetKinds = consumerTargetKinds(for: surfaces)
-        let currentPID = Darwin.getpid()
-        return processLinesWithPID().compactMap { pid, command in
-            guard pid != currentPID else { return nil }
-            guard isCodexConsumerCommand(command.lowercased(), for: targetKinds) else { return nil }
-            return ProcessInfoPayload(pid: pid, command: command)
+        var homes = surfaces.map { URL(fileURLWithPath: $0.authStorePath).deletingLastPathComponent().path }
+        for surface in surfaces where surface.sharedAuthStore {
+            if let partner = surface.sharedWith { homes.append(paths.codexHome(for: partner).path) }
         }
+        return paths.processes.consumers(
+            surfaceHomes: homes,
+            includeDesktop: targetKinds.contains(.desktop),
+            includeCLI: targetKinds.contains(.cli)
+        ).map { ProcessInfoPayload(pid: $0.pid, command: $0.command) }
     }
 
     private func consumerTargetKinds(for surfaces: [SurfaceStatusPayload]) -> Set<SurfaceKind> {
@@ -3296,6 +3303,37 @@ private enum Output {
 func readJSON(_ url: URL) -> [String: Any]? {
     guard let data = try? Data(contentsOf: url) else { return nil }
     return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+}
+
+/// Injectable process snapshot and home reader for surface consumer checks.
+struct CodexConsumerProcesses {
+    var listing: () -> [(pid: Int32, command: String)] = { processLinesWithPID() }
+    var homeReading: (Int32) -> CodexHomeReading = CodexProcessHome.reading
+    var isDesktop: (String) -> Bool = isCodexDesktopProcessCommand
+
+    func consumers(
+        surfaceHomes: [String],
+        includeDesktop: Bool = true,
+        includeCLI: Bool = true,
+        executableOnly: Bool = false
+    ) -> [(pid: Int32, command: String)] {
+        var targetKinds = Set<SurfaceKind>()
+        if includeDesktop { targetKinds.insert(.desktop) }
+        if includeCLI { targetKinds.insert(.cli) }
+        return listing().filter { pid, command in
+            guard pid != Darwin.getpid() else { return false }
+            let lowercased = command.lowercased()
+            // Desktop processes are never excluded based on their environment.
+            if isDesktop(lowercased) {
+                return includeDesktop || (includeCLI && (executableOnly
+                    ? isCodexExecutableCommand(lowercased)
+                    : isCodexConsumerCommand(lowercased, for: [.cli])))
+            }
+            guard executableOnly ? (includeCLI && isCodexExecutableCommand(lowercased))
+                : isCodexConsumerCommand(command.lowercased(), for: targetKinds) else { return false }
+            return !CodexProcessHome.usesOtherHome(homeReading(pid), surfaceHomes: surfaceHomes)
+        }
+    }
 }
 
 private func processLines() -> [String] {

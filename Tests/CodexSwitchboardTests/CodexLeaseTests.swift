@@ -1862,7 +1862,8 @@ struct LeaseFixture {
 
     func run(
         _ arguments: [String],
-        environment extra: [String: String] = [:]
+        environment extra: [String: String] = [:],
+        processes: CodexConsumerProcesses = CodexConsumerProcesses(listing: { [] }, homeReading: { _ in .unreadable })
     ) -> (exitCode: Int32, text: String, json: [String: Any]) {
         let output = CodexSwitchboardCommand.execute(
             arguments: arguments,
@@ -1870,7 +1871,8 @@ struct LeaseFixture {
                 "CODEX_SWITCHBOARD_APP_SUPPORT": appSupport.path,
                 "PATH": "\(bin.path):/usr/bin:/bin",
             ].merging(extra) { _, new in new },
-            homeURL: home
+            homeURL: home,
+            processes: processes
         )
         let text = output.stdout ?? output.stderr ?? ""
         let json = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] ?? [:]

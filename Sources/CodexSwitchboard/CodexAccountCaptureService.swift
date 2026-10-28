@@ -1231,25 +1231,42 @@ final class CodexAccountSwitchService: @unchecked Sendable {
     }
 
     private func codexProcessDescriptions(includeDesktopConsumers: Bool = true) -> [String] {
-        let output = runBestEffort("/bin/ps", ["-axo", "pid=,command="])
+        Self.codexProcessDescriptions(
+            cliHome: cliAuthURL.deletingLastPathComponent().path,
+            desktopHome: defaultAuthURL.deletingLastPathComponent().path,
+            includeDesktopConsumers: includeDesktopConsumers,
+            processListing: { self.runBestEffort("/bin/ps", ["-axo", "pid=,command="]) }
+        )
+    }
+
+    static func codexProcessDescriptions(
+        cliHome: String,
+        desktopHome: String,
+        includeDesktopConsumers: Bool,
+        processListing: () -> String,
+        homeReading: (Int32) -> CodexHomeReading = CodexProcessHome.reading,
+        isDesktop: (String) -> Bool = { CodexDesktopApp.isDesktopProcessCommand($0) }
+    ) -> [String] {
+        let homes = [cliHome] + (includeDesktopConsumers ? [desktopHome] : [])
         let currentPID = Darwin.getpid()
-        return output.split(separator: "\n").compactMap { line in
+        return processListing().split(separator: "\n").compactMap { line in
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             guard let split = trimmed.firstIndex(where: { $0 == " " || $0 == "\t" }),
-                  let pid = Int32(trimmed[..<split]),
-                  pid != currentPID else {
-                return nil
-            }
+                  let pid = Int32(trimmed[..<split]), pid != currentPID else { return nil }
             let command = trimmed[split...].trimmingCharacters(in: .whitespaces)
-            guard isCodexAuthConsumer(
-                command.lowercased(),
-                includeDesktopConsumers: includeDesktopConsumers
-            ) else { return nil }
+            let lowercased = command.lowercased()
+            if isDesktop(lowercased) {
+                guard includeDesktopConsumers || isCodexAuthConsumer(lowercased, includeDesktopConsumers: false)
+                else { return nil }
+                return "\(pid) \(command)"
+            }
+            guard isCodexAuthConsumer(lowercased, includeDesktopConsumers: false),
+                  !CodexProcessHome.usesOtherHome(homeReading(pid), surfaceHomes: homes) else { return nil }
             return "\(pid) \(command)"
         }
     }
 
-    private func isCodexAuthConsumer(
+    private static func isCodexAuthConsumer(
         _ lowercasedCommand: String,
         includeDesktopConsumers: Bool
     ) -> Bool {
