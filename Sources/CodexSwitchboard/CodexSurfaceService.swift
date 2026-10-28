@@ -144,7 +144,7 @@ final class CodexSurfaceService {
     private func cliStatus() -> CodexSurfaceStatus {
         let codexHome = cliCodexHome()
         let activeAuth = activeAuth(in: codexHome)
-        let running = isCLIRunning
+        let running = Self.isCLIRunning(in: codexHome.path, processListing: processLines)
         return CodexSurfaceStatus(
             kind: .cli,
             detected: cliExecutablePath() != nil || running,
@@ -169,14 +169,25 @@ final class CodexSurfaceService {
             .isEmpty
     }
 
-    private var isCLIRunning: Bool {
-        processLines().contains { line in
-            let lowercased = line.lowercased()
-            return lowercased == "codex"
+    static func isCLIRunning(
+        in home: String,
+        processListing: () -> [String],
+        homeReading: (Int32) -> CodexHomeReading = CodexProcessHome.reading,
+        isDesktop: (String) -> Bool = { CodexDesktopApp.isDesktopProcessCommand($0) }
+    ) -> Bool {
+        processListing().contains { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard let split = trimmed.firstIndex(where: { $0 == " " || $0 == "\t" }),
+                  let pid = Int32(trimmed[..<split]) else { return false }
+            let lowercased = trimmed[split...].trimmingCharacters(in: .whitespaces).lowercased()
+            let matches = lowercased == "codex"
                 || lowercased.hasPrefix("codex ")
                 || lowercased.contains("/codex ")
                 || lowercased.hasSuffix("/codex")
                 || lowercased.contains(" codex ")
+            guard matches else { return false }
+            return isDesktop(lowercased)
+                || !CodexProcessHome.usesOtherHome(homeReading(pid), surfaceHomes: [home])
         }
     }
 
@@ -280,7 +291,7 @@ final class CodexSurfaceService {
     private func processLines() -> [String] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-axo", "command="]
+        process.arguments = ["-axo", "pid=,command="]
 
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexSwitchboardSurface-\(UUID().uuidString).log")

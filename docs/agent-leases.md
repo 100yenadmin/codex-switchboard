@@ -21,6 +21,8 @@ The owner can also return or swap a lease from the app, through the same CLI `re
 `return --expect-lease-id <id>` refuses with `lease_changed` if the home no longer holds the confirmed lease; omit it for the existing agent behaviour.
 `swap-lease --expect-lease-id <id>` refuses with `lease_changed` if the home no longer holds the confirmed lease; omit it for the existing agent behaviour.
 
+A lane running with `CODEX_HOME` set to its own existing lease or reserved home no longer blocks a main-surface switch. A Codex process using the main home still blocks it, as do a process whose environment cannot be read and the Codex desktop app.
+
 ## Swap the main CLI when its account runs low
 
 ```bash

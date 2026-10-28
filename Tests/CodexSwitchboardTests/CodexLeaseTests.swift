@@ -1565,8 +1565,8 @@ final class CodexLeaseTests: XCTestCase {
     }
 
     func testLeaseSeesAChainASwitchWroteIntoAnotherCodexHome() throws {
-        // A switch run with CODEX_HOME=other records that home, then writes profile-b's chain there. A real switch
-        // refuses consumers_running while any Codex app runs on the test machine, so the test does both steps.
+        // A switch run with CODEX_HOME=other records that home, then writes profile-b's chain there. The test does
+        // both steps itself, so it does not depend on the switch command.
         let other = fixture.root.appendingPathComponent("other-codex-home", isDirectory: true)
         let defaultHome = fixture.home.appendingPathComponent(".codex").path
         try CodexSwitchHomes.record(other.path, appSupportURL: fixture.appSupport, defaultHome: defaultHome)
@@ -1862,7 +1862,8 @@ struct LeaseFixture {
 
     func run(
         _ arguments: [String],
-        environment extra: [String: String] = [:]
+        environment extra: [String: String] = [:],
+        processes: CodexConsumerProcesses = CodexConsumerProcesses(listing: { [] }, homeReading: { _ in .unreadable })
     ) -> (exitCode: Int32, text: String, json: [String: Any]) {
         let output = CodexSwitchboardCommand.execute(
             arguments: arguments,
@@ -1870,7 +1871,8 @@ struct LeaseFixture {
                 "CODEX_SWITCHBOARD_APP_SUPPORT": appSupport.path,
                 "PATH": "\(bin.path):/usr/bin:/bin",
             ].merging(extra) { _, new in new },
-            homeURL: home
+            homeURL: home,
+            processes: processes
         )
         let text = output.stdout ?? output.stderr ?? ""
         let json = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] ?? [:]
