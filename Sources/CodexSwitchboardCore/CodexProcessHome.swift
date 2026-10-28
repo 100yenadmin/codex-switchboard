@@ -69,6 +69,19 @@ public enum CodexProcessHome {
               let resolved = Darwin.realpath(path, nil) else { return false }
         defer { free(resolved) }
         let home = String(cString: resolved)
-        return !surfaceHomes.contains { CodexLease.sameHome(home, $0) }
+        // A firmlinked spelling (/System/Volumes/Data/...) survives realpath, so directories are also matched by identity.
+        guard let identity = fileIdentity(home) else { return false }
+        return !surfaceHomes.contains { CodexLease.sameHome(home, $0) || fileIdentity($0) == identity }
+    }
+
+    private struct FileIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+    }
+
+    private static func fileIdentity(_ path: String) -> FileIdentity? {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        return FileIdentity(device: info.st_dev, inode: info.st_ino)
     }
 }

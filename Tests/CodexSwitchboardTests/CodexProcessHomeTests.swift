@@ -67,6 +67,17 @@ final class CodexProcessHomeTests: XCTestCase {
         XCTAssertFalse(CodexProcessHome.usesOtherHome(.path(main.path), surfaceHomes: [CodexLease.normalizedHome(main.path)]))
     }
 
+    func testUsesOtherHomeMatchesAFirmlinkedSpellingOfTheSameDirectory() throws {
+        let root = try temporaryDirectory()
+        let main = try directory("main", in: root)
+        let firmlinked = "/System/Volumes/Data" + CodexLease.normalizedHome(main.path)
+        guard FileManager.default.fileExists(atPath: firmlinked) else {
+            throw XCTSkip("No /System/Volumes/Data firmlink for the temporary directory")
+        }
+        XCTAssertFalse(CodexProcessHome.usesOtherHome(.path(firmlinked), surfaceHomes: [main.path]))
+        XCTAssertFalse(CodexProcessHome.usesOtherHome(.path(main.path), surfaceHomes: [firmlinked]))
+    }
+
     func testCoreConsumerFilterKeepsFailClosedAndDesktopConsumers() throws {
         let root = try temporaryDirectory()
         let main = try directory("main", in: root)
